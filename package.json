@@ -1,0 +1,32 @@
+{
+  "name": "@zmzai/agent-framework",
+  "version": "0.1.0",
+  "description": "PI-based agent framework — sessions, permissions, tools, runner, events (OpenCode-style).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "zmzai-agent": "./dist/cli.js"
+  },
+  "files": ["dist", "openapi.yaml"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

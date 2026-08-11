@@ -1,0 +1,239 @@
+openapi: 3.0.3
+info:
+  title: ZMZAI Agent Framework
+  description: |
+    PI-based agent framework HTTP surface (M5 spec §3). Session lifecycle,
+    prompt, permission replies and the SSE event stream. All endpoints are
+    auth-agnostic — the product binds its own auth middleware.
+  version: 0.1.0
+paths:
+  /sessions:
+    post:
+      summary: Create a session (optionally starting a run)
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workspaceId, model]
+              properties:
+                workspaceId: { type: string }
+                agent: { type: string, default: "default" }
+                model:
+                  type: object
+                  required: [providerId, modelId]
+                  properties:
+                    providerId: { type: string }
+                    modelId: { type: string }
+                prompt: { type: string, description: "Initial prompt; starts the run immediately." }
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionInfo"
+    get:
+      summary: List sessions
+      operationId: listSessions
+      parameters:
+        - name: workspaceId
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Session list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions: { type: array, items: { $ref: "#/components/schemas/SessionInfo" } }
+  /sessions/{sessionId}:
+    get:
+      summary: Session detail (info + messages + parts)
+      operationId: getSession
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Session snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { $ref: "#/components/schemas/SessionInfo" }
+                  messages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        info: { $ref: "#/components/schemas/MessageInfo" }
+                        parts: { type: array, items: { $ref: "#/components/schemas/Part" } }
+  /sessions/{sessionId}/prompt:
+    post:
+      summary: Submit a prompt (queued when the session is busy)
+      operationId: prompt
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+                agent: { type: string }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  queued: { type: boolean }
+  /sessions/{sessionId}/abort:
+    post:
+      summary: Abort the active run and clear the prompt queue
+      operationId: abort
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Aborted
+  /sessions/{sessionId}/permissions/{requestId}:
+    post:
+      summary: Reply to a permission request (once/always/reject)
+      operationId: replyPermission
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reply]
+              properties:
+                reply: { type: string, enum: [once, always, reject] }
+                feedback: { type: string }
+      responses:
+        "200":
+          description: Resolved
+  /sessions/{sessionId}/events:
+    get:
+      summary: SSE event stream (replay via ?since=<seq>)
+      operationId: sessionEvents
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: text/event-stream of framework events
+          content:
+            text/event-stream:
+              schema:
+                type: object
+components:
+  schemas:
+    SessionInfo:
+      type: object
+      required: [id, workspaceId, userId, title, agent, model, permission, queuedPrompts, time]
+      properties:
+        id: { type: string }
+        workspaceId: { type: string }
+        userId: { type: string }
+        parentId: { type: string }
+        title: { type: string }
+        agent: { type: string }
+        model:
+          type: object
+          properties:
+            providerId: { type: string }
+            modelId: { type: string }
+        permission:
+          type: array
+          items:
+            type: object
+            properties:
+              permission: { type: string }
+              pattern: { type: string }
+              action: { type: string, enum: [allow, deny, ask] }
+        queuedPrompts:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              agent: { type: string }
+              enqueuedAt: { type: string }
+        time:
+          type: object
+          properties:
+            created: { type: string }
+            updated: { type: string }
+    MessageInfo:
+      type: object
+      required: [id, sessionId, role, agent, model, time]
+      properties:
+        id: { type: string }
+        sessionId: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        parentId: { type: string }
+        agent: { type: string }
+        model: { type: object }
+        tokens: { type: object }
+        error: { type: object }
+        time: { type: object }
+    Part:
+      type: object
+      required: [id, sessionId, messageId, type]
+      properties:
+        id: { type: string }
+        sessionId: { type: string }
+        messageId: { type: string }
+        type: { type: string, enum: [text, reasoning, tool, step-start, step-finish, subtask, file, compaction] }
+        text: { type: string }
+        callId: { type: string }
+        tool: { type: string }
+        state: { type: object }
+        summary: { type: string }
+        childSessionId: { type: string }
+    PermissionRequest:
+      type: object
+      properties:
+        id: { type: string }
+        sessionId: { type: string }
+        permission: { type: string }
+        patterns: { type: array, items: { type: string } }
+        metadata: { type: object }
+        always: { type: array, items: { type: string } }
+        tool: { type: object }
