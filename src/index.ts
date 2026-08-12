@@ -24,6 +24,9 @@ export { PermissionEngine, RejectedError } from "./core/permission/engine.js";
 export type { AgentInfo, AgentDefinition } from "./core/agent/registry.js";
 export { AgentRegistry, builtinAgents, builtinDefaults } from "./core/agent/registry.js";
 export { loadCustomAgents } from "./core/agent/loader.js";
+export type { AgentResolver, ResolvedAgent } from "./core/agent/resolver.js";
+export { parseAgentPlugin, parsePluginManifest, parsePluginMcp } from "./core/agent/plugin.js";
+export type { ParsedAgentPlugin, PluginFileSystem, PluginManifest, PluginMcpServer, PluginSkill } from "./core/agent/plugin.js";
 
 // core: tools
 export type { ToolDef } from "./core/tools/def.js";

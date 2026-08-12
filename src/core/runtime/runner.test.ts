@@ -205,6 +205,37 @@ describe("SessionRunner", () => {
     expect(assistant!.parts.some((part) => part.type === "step-finish")).toBe(true);
   });
 
+  it("runs from the immutable Agent Version when a resolver is configured", async () => {
+    const { runner, store, published: harness, deps } = makeHarness([fauxAssistantMessage("版本代理完成。")]);
+    const resolve = vi.fn().mockResolvedValue({
+      agent: {
+        name: "versioned-agent",
+        description: "版本快照",
+        mode: "primary",
+        steps: 1,
+        prompt: "你是版本快照代理。",
+        permission: [],
+      },
+    });
+    deps.agentResolver = { resolve };
+    const session = await createFrameworkSession({
+      store,
+      userId: "user_1",
+      workspaceId: "ws_1",
+      agent: "default",
+      agentId: "agt_1",
+      agentVersionId: "agtver_1",
+      model: { providerId: "faux", modelId: "test-model" },
+    });
+
+    await runner.prompt(session.id, { text: "按版本执行" });
+    await waitFor(() => lastStatus(harness) === "idle");
+
+    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ agentId: "agt_1", agentVersionId: "agtver_1" }));
+    const assistant = [...store.messages.values()].find((message) => message.role === "assistant");
+    expect(assistant?.agent).toBe("versioned-agent");
+  });
+
   it("bash run: permission.asked → once reply → sandbox executes → tool part completes", async () => {
     const { runner, store, toolContext, published: harness } = makeHarness([
       fauxAssistantMessage([fauxToolCall("bash", { program: "npm", args: ["run", "build"] })]),

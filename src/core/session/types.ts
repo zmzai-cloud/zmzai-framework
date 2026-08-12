@@ -14,6 +14,10 @@ export type SessionInfo = {
   parentId?: string; // child session spawned by the task tool
   title: string; // prompt truncation initially; replaced async by cheap-model title (§13.2)
   agent: string; // current primary agent preset name
+  /** Product control plane identity. Absent on M1-M5 sessions created before
+   *  versioned agents; new cloud sessions should pin both fields. */
+  agentId?: string;
+  agentVersionId?: string;
   model: ModelRef;
   permission: Ruleset; // session-scoped rules ("always" replies land here)
   queuedPrompts: QueuedPrompt[]; // FIFO for prompts submitted while running (§13.3)

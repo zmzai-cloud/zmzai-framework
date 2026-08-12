@@ -2,6 +2,7 @@ import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 import { AgentRegistry, type AgentInfo } from "../agent/registry.js";
+import type { AgentResolver, ResolvedAgent } from "../agent/resolver.js";
 import { leaseDurationMs } from "../../adapters/index.js";
 import { notifyEventLogListeners, type EventLog } from "../events/bus.js";
 import type { FrameworkEvent } from "../events/manifest.js";
@@ -47,6 +48,8 @@ export type RunnerDeps = {
   buildToolContext?: (input: { session: SessionInfo; engine: PermissionEngine }) => ToolContext;
   /** Loads workspace custom agents (spec §6.3). */
   loadWorkspaceAgents?: (session: SessionInfo) => Promise<AgentInfo[]>;
+  /** Optional control-plane lookup for an immutable Agent Version. */
+  agentResolver?: AgentResolver;
   /** Max subagent nesting depth (spec §6.4, default 1). */
   subagentDepth: number;
   /** Auto-compaction (spec §8.3). Disabled when summaryModel is null. */
@@ -215,14 +218,28 @@ export class SessionRunner {
     }
   }
 
+  /** Versioned agents are resolved from the product control plane. A missing
+   *  version intentionally falls back to the M1-M5 registry so old sessions
+   *  and standalone consumers remain valid. */
+  private async resolvedAgentFor(session: SessionInfo): Promise<ResolvedAgent | null> {
+    if (!session.agentVersionId || !this.deps.agentResolver) return null;
+    try {
+      return await this.deps.agentResolver.resolve(session);
+    } catch {
+      return null;
+    }
+  }
+
   private async runLoop(session: SessionInfo, input: { text: string; agent?: string; model?: ModelRef }): Promise<void> {
     this.currentSessionId = session.id;
     const registry = await this.registryFor(session);
-    const agentName = input.agent ?? session.agent;
-    const agentInfo = registry.get(agentName) ?? registry.get("default");
+    const resolved = await this.resolvedAgentFor(session);
+    const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
+    const agentInfo = resolved?.agent ?? registry.get(agentName) ?? registry.get("default");
     const model = input.model ?? agentInfo?.model ?? session.model;
 
-    const engine = new PermissionEngine(session.id, registry.rulesetsFor(agentInfo?.name ?? "default"), session.permission, {
+    const agentRulesets = resolved ? [registry.rulesetsFor("default")[0]!, resolved.agent.permission] : registry.rulesetsFor(agentInfo?.name ?? "default");
+    const engine = new PermissionEngine(session.id, agentRulesets, session.permission, {
       onAsked: async (request) => {
         await this.publish({ type: "session.status", data: { status: "waiting_permission" } }, session.id);
         await this.publish({ type: "permission.asked", data: { request } }, session.id);
@@ -244,7 +261,7 @@ export class SessionRunner {
 
     const projector = new PartProjector({ sessionId: session.id, agent: agentInfo?.name ?? "default", model });
     // Exclude task from contexts that can't nest; include for primary runs.
-    const baseTools = this.deps.tools ?? builtinTools;
+    const baseTools = [...(this.deps.tools ?? builtinTools), ...(resolved?.tools ?? [])];
     const toolList = session.parentId ? baseTools.filter((def) => def.id !== "task") : baseTools;
     const toolDefs = new Map<string, ToolDef>(toolList.map((def) => [def.id, def]));
     const sandbox = this.deps.sandbox ?? noopSandboxExecutor();
@@ -500,6 +517,8 @@ export async function createFrameworkSession(input: {
   userId: string;
   workspaceId: string;
   agent?: string;
+  agentId?: string;
+  agentVersionId?: string;
   model: ModelRef;
   prompt?: string;
   parentId?: string;    // subagent child: links to the spawning session (§6.4)
@@ -513,6 +532,8 @@ export async function createFrameworkSession(input: {
     ...(input.parentId ? { parentId: input.parentId } : {}),
     title: (input.title ?? input.prompt ?? "新会话").slice(0, 40),
     agent: input.agent ?? "default",
+    ...(input.agentId ? { agentId: input.agentId } : {}),
+    ...(input.agentVersionId ? { agentVersionId: input.agentVersionId } : {}),
     model: input.model,
     permission: input.permission ?? [],
     queuedPrompts: [],
@@ -529,4 +550,3 @@ export function isSessionActive(sessionId: string): boolean {
 // The package runner is storage-agnostic: stores (Mongo/JSONL), event logs,
 // workspace backends and sandbox executors are all injected via RunnerDeps.
 // Products assemble them in createServer(); the CLI uses JSONL + subprocess.
-
