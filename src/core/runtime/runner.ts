@@ -348,7 +348,7 @@ export class SessionRunner {
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
 
     try {
-      projector.onUserPrompt(emit);
+      projector.onUserPrompt(emit, input.text);
       await agent.prompt(input.text);
       await settled();
       const failed = agent.state.errorMessage;

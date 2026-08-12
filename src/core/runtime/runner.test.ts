@@ -195,7 +195,9 @@ describe("SessionRunner", () => {
     expect(types).toContain("session.status");
 
     const messages = await store.getMessages(session.id);
-    expect(messages.some((entry) => entry.info.role === "user")).toBe(true);
+    const user = messages.find((entry) => entry.info.role === "user");
+    expect(user).toBeDefined();
+    expect(user!.parts).toEqual([expect.objectContaining({ type: "text", text: "读取代码" })]);
     const assistant = messages.find((entry) => entry.info.role === "assistant");
     expect(assistant).toBeDefined();
     const textPart = assistant!.parts.find((part) => part.type === "text");

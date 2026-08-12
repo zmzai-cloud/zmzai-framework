@@ -94,7 +94,7 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit): MessageInfo {
+  onUserPrompt(emit: Emit, text: string): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
@@ -105,6 +105,18 @@ export class PartProjector {
     };
     this.userMessageId = message.id;
     emit({ type: "message.updated", data: { message } });
+    const normalizedText = text.trim();
+    if (normalizedText) {
+      const part: Part = {
+        id: newPartId(),
+        sessionId: this.identity.sessionId,
+        messageId: message.id,
+        type: "text",
+        text: normalizedText,
+      };
+      this.parts.set(part.id, part);
+      emit({ type: "message.part.updated", data: { part } });
+    }
     return message;
   }
 
