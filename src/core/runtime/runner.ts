@@ -283,6 +283,10 @@ export class SessionRunner {
       initialState: {
         systemPrompt: agentInfo?.prompt ?? "",
         model: this.deps.modelFor(model),
+        // Relay-compatible reasoning models return their execution rationale
+        // through the standard PI thinking stream. Keep this deliberately low:
+        // it provides useful live context without consuming the response budget.
+        thinkingLevel: "low",
         tools: piTools,
         messages: await this.rebuildMessages(session.id),
       },

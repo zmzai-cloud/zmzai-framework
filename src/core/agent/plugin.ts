@@ -68,6 +68,15 @@ function validateRelativePath(root: string, value: string | undefined): string |
   return value;
 }
 
+/** Agent Plugins 1.0 reserves these values for the hosting client. Parsing
+ * validates their placement but deliberately does not expand them: expansion
+ * happens only when a trusted host launches an authorized stdio connector. */
+function validatePluginPath(root: string, value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value === "${PLUGIN_ROOT}" || value.startsWith("${PLUGIN_ROOT}/") || value === "${PLUGIN_DATA}" || value.startsWith("${PLUGIN_DATA}/")) return value;
+  return validateRelativePath(root, value);
+}
+
 export function parsePluginManifest(value: unknown): PluginManifest | null {
   const raw = object(value);
   if (!raw || typeof raw.name !== "string" || !NAME_RE.test(raw.name)) return null;
@@ -97,7 +106,7 @@ export function parsePluginMcp(root: string, value: unknown): { servers: Record<
       const command = typeof server.command === "string" ? server.command : "";
       const commandValid = /^[^\s]+$/.test(command) && (!command.startsWith(".") || Boolean(validateRelativePath(root, command)));
       const args = Array.isArray(server.args) && server.args.every((arg) => typeof arg === "string") ? server.args as string[] : undefined;
-      const cwd = server.cwd === undefined ? undefined : validateRelativePath(root, typeof server.cwd === "string" ? server.cwd : undefined);
+      const cwd = server.cwd === undefined ? undefined : validatePluginPath(root, typeof server.cwd === "string" ? server.cwd : undefined);
       const env = stringMap(server.env);
       if (!commandValid || (server.args !== undefined && !args) || (server.cwd !== undefined && !cwd) || (server.env !== undefined && !env) || env?.PLUGIN_ROOT !== undefined || env?.PLUGIN_DATA !== undefined) {
         errors.push(`MCP ${name} 的 stdio 配置无效`);

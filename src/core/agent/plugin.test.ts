@@ -36,4 +36,20 @@ describe("Agent Plugins 1.0 parser", () => {
     expect(result.servers).toEqual({});
     expect(result.errors).toHaveLength(1);
   });
+
+  it("accepts host-owned plugin path placeholders without expanding them", () => {
+    const result = parsePluginMcp("/plugin", {
+      mcpServers: {
+        validator: {
+          type: "stdio",
+          command: "./bin/validator",
+          args: ["--data", "${PLUGIN_DATA}/validator"],
+          env: { CONFIG: "${PLUGIN_ROOT}/config.json" },
+          cwd: "${PLUGIN_ROOT}",
+        },
+      },
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.servers.validator).toEqual(expect.objectContaining({ cwd: "${PLUGIN_ROOT}", env: { CONFIG: "${PLUGIN_ROOT}/config.json" } }));
+  });
 });
