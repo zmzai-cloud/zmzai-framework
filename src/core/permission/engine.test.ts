@@ -94,4 +94,27 @@ describe("PermissionEngine.ask", () => {
     await expect(promise).rejects.toThrow("服务重启");
     await expect(engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["ls"] })).rejects.toThrow(RejectedError);
   });
+
+  it("once reply skips the same command within the run, and dispose resets it", async () => {
+    const { engine, asked, replied, ruleAdded } = makeEngine();
+    const first = engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["python3 -c print(1)"] });
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
+    engine.reply(asked.mock.calls[0]![0].id, "once");
+    await expect(first).resolves.toBe("once");
+
+    // Same command again: no ask, resolves immediately.
+    await expect(engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["python3 -c print(1)"] })).resolves.toBe("once");
+    expect(asked).toHaveBeenCalledTimes(1);
+
+    // A different command still asks.
+    const other = engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["python3 -c print(2)"] });
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
+
+    // After dispose (run ended), a fresh engine asks for the same command again.
+    engine.dispose();
+    await expect(other).rejects.toThrow(RejectedError);
+    const engine2 = new PermissionEngine("ses_1", [defaults], [], { onAsked: asked, onReplied: replied, onSessionRuleAdded: ruleAdded });
+    void engine2.ask({ sessionId: "ses_1", permission: "bash", patterns: ["python3 -c print(1)"] });
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(3));
+  });
 });

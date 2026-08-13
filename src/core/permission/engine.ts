@@ -63,6 +63,10 @@ export class PermissionEngine {
   private readonly sessionRules: Ruleset = [];
   private readonly pending = new Map<string, PendingEntry>();
   private disposed = false;
+  /** 临时允许缓存：once 批准后同一 run 内相同模式直接放行（F1，避免 Agent
+   *  二次调用相同命令时重复打断用户）。run 结束（dispose）时清空，下次 run
+   *  重新询问。键 = permission + pattern（bash 的 pattern 即命令原文）。 */
+  private readonly onceAllowed = new Set<string>();
 
   constructor(
     private readonly sessionId: string,
@@ -72,6 +76,10 @@ export class PermissionEngine {
   ) {
     this.rulesets = [...baseRulesets, this.sessionRules];
     this.sessionRules.push(...sessionRules);
+  }
+
+  private onceKey(permission: string, pattern: string): string {
+    return `${permission}\u0000${pattern}`;
   }
 
   evaluate(permission: string, pattern: string): Action {
@@ -90,7 +98,10 @@ export class PermissionEngine {
   async ask(input: AskInput): Promise<Reply> {
     if (this.disposed) throw new RejectedError("权限引擎已关闭（服务重启或会话结束），请重试");
     const patterns = input.patterns.length ? input.patterns : ["*"];
-    const undecided = patterns.filter((pattern) => this.evaluate(input.permission, pattern) !== "allow");
+    // 已 once 批准的相同模式直接放行，不重复询问。
+    const undecided = patterns.filter(
+      (pattern) => this.evaluate(input.permission, pattern) !== "allow" && !this.onceAllowed.has(this.onceKey(input.permission, pattern)),
+    );
     if (undecided.length === 0) return "once";
 
     const request: PermissionRequest = {
@@ -113,6 +124,10 @@ export class PermissionEngine {
 
     if (reply === "reject") {
       throw new RejectedError(`权限被拒绝：${input.permission} ${undecided.join(", ")}`, feedback);
+    }
+    if (reply === "once") {
+      // F1：本 run 内相同命令/模式不再询问。
+      for (const pattern of request.patterns) this.onceAllowed.add(this.onceKey(input.permission, pattern));
     }
     if (reply === "always") {
       for (const pattern of request.always) {
@@ -144,12 +159,14 @@ export class PermissionEngine {
   }
 
   /** Rejects everything still pending — used on abort and process teardown so
-   *  tool calls never hang forever (spec §5.4: restart semantics). */
+   *  tool calls never hang forever (spec §5.4: restart semantics). Also clears
+   *  the once-allowed cache so the next run asks again. */
   dispose(reason = "会话已中止或服务重启，请重试"): void {
     this.disposed = true;
     for (const [, entry] of [...this.pending]) {
       entry.resolve({ reply: "reject", feedback: reason });
     }
     this.pending.clear();
+    this.onceAllowed.clear();
   }
 }
