@@ -238,7 +238,7 @@ export class SessionRunner {
    *  version intentionally falls back to the M1-M5 registry so old sessions
    *  and standalone consumers remain valid. */
   private async resolvedAgentFor(session: SessionInfo): Promise<ResolvedAgent | null> {
-    if (!session.agentVersionId || !this.deps.agentResolver) return null;
+    if (!this.deps.agentResolver) return null;
     try {
       return await this.deps.agentResolver.resolve(session);
     } catch {
