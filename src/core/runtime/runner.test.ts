@@ -207,6 +207,40 @@ describe("SessionRunner", () => {
     expect(assistant!.parts.some((part) => part.type === "step-finish")).toBe(true);
   });
 
+  it("retries once on a retryable upstream failure and still delivers the reply", async () => {
+    const { runner, store, faux, published: harness } = makeHarness([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+      fauxAssistantMessage("重试后的回复"),
+    ]);
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "生成回复" });
+    await waitFor(() => faux.state.callCount >= 2);
+    await waitFor(() => publishedTypes(harness).filter((type) => type === "session.status").length >= 2);
+
+    // 重试成功：不发 session.error，状态 idle，回复文本来自第二次生成。
+    expect(harness.filter((event) => event.type === "session.error")).toHaveLength(0);
+    expect(lastStatus(harness)).toBe("idle");
+    const messages = await store.getMessages(session.id);
+    const assistant = messages.filter((entry) => entry.info.role === "assistant");
+    // 第一条是失败占位（空文本），第二条是重试回复。
+    const textPart = assistant.flatMap((entry) => entry.parts).find((part) => part.type === "text" && (part as { text?: string }).text);
+    expect((textPart as Extract<Part, { type: "text" }> | undefined)?.text).toContain("重试后的回复");
+  });
+
+  it("does not retry deterministic errors (auth/billing)", async () => {
+    const { runner, store, faux, published: harness } = makeHarness([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "余额不足" }),
+    ]);
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "生成回复" });
+    await waitFor(() => publishedTypes(harness).includes("session.error"));
+
+    expect(faux.state.callCount).toBe(1);
+    expect(lastStatus(harness)).toBe("idle");
+  });
+
   it("runs from the immutable Agent Version when a resolver is configured", async () => {
     const { runner, store, published: harness, deps } = makeHarness([fauxAssistantMessage("版本代理完成。")]);
     const resolve = vi.fn().mockResolvedValue({

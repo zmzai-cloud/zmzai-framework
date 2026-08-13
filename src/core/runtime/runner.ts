@@ -67,6 +67,22 @@ const globalRunners = globalThis as typeof globalThis & { __zmzaiFrameworkRuns?:
 const activeRuns = globalRunners.__zmzaiFrameworkRuns ?? new Map<string, ActiveRun>();
 globalRunners.__zmzaiFrameworkRuns = activeRuns;
 
+/** 上游中断类错误（F6）：模型流偶发终止/连接断开时自动重试一次，避免
+ *  偶发中断直接结束任务（实测 relay 透传 "terminated"）。余额/鉴权等
+ *  确定性错误不重试。 */
+export function isRetryableError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("terminated") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("socket hang up") ||
+    normalized.includes("etimedout") ||
+    normalized.includes("api connection error") ||
+    normalized.includes("overloaded") ||
+    normalized.includes("timeout")
+  );
+}
+
 /** Default ToolContext built from injected workspace + sandbox. emitX events
  *  are routed through the runner's eventLog at call time. */
 function defaultToolContext(input: { session: SessionInfo; engine: PermissionEngine; workspace: WorkspaceFiles; sandbox: SandboxExecutor; emit: (event: FrameworkEvent) => Promise<void> }): ToolContext {
@@ -355,7 +371,28 @@ export class SessionRunner {
       projector.onUserPrompt(emit, input.text);
       await agent.prompt(input.text);
       await settled();
-      const failed = agent.state.errorMessage;
+      let failed = agent.state.errorMessage;
+      // 自动重试（F6）：上游中断类错误重试一次。PI 失败时会注入一条
+      // assistant failure 占位消息（last 是 assistant → continue() 被拒），
+      // 换成合成 user 消息驱动 continue 重新生成；store 里同步的 failure
+      // 消息保留展示（UI 显示"出错了"有诊断价值）。
+      if (failed && isRetryableError(failed)) {
+        const messages = agent.state.messages;
+        const last = messages[messages.length - 1];
+        if (last?.role === "assistant" && "errorMessage" in last && last.errorMessage) {
+          agent.state.messages = [
+            ...messages.slice(0, -1),
+            { role: "user", content: [{ type: "text", text: "（上轮回复生成中断，请继续完成回复。）" }], timestamp: Date.now() },
+          ];
+        }
+        try {
+          await agent.continue();
+          await settled();
+          failed = agent.state.errorMessage;
+        } catch (retryError) {
+          failed = retryError instanceof Error ? retryError.message : "Agent 重试失败";
+        }
+      }
       if (failed) {
         await this.publish({ type: "session.error", data: { name: "APIError", message: failed } }, session.id);
       }
