@@ -26,6 +26,8 @@ export type SandboxExecResult = {
   outputText: string;
   durationMs: number;
   artifacts: { path: string; bytes: number; contentType: string; downloadUrl: string; previewUrl?: string }[];
+  /** 沙箱请求失败（连接/认证/配置）时的真实原因；命令失败时为 null。 */
+  errorMessage?: string | null;
 };
 
 export type SandboxExecInput = {

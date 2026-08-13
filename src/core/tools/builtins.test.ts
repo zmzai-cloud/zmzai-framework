@@ -171,4 +171,40 @@ describe("bash tool", () => {
       always: ["npm run build", "npm *"],
     });
   });
+
+  it("splits a full command stuffed into program (model behavior) and still runs it", async () => {
+    const ctx = fakeContext();
+    const result = await bashTool.execute({ program: "python3 --version" }, ctx);
+    expect(ctx.runSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({ command: { program: "python3", args: ["--version"] } }),
+    );
+    expect(result.output).toContain("$ python3 --version");
+    // permission mapping uses the same split so the pattern matches execution.
+    const mapped = bashTool.permission({ program: "ls -la" });
+    expect(mapped).toMatchObject({ patterns: ["ls -la"], always: ["ls -la", "ls *"] });
+  });
+
+  it("routes shell pipelines stuffed into program through sh -c", async () => {
+    const ctx = fakeContext();
+    await bashTool.execute({ program: "pip list 2>/dev/null | grep -i pptx" }, ctx);
+    expect(ctx.runSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({ command: { program: "sh", args: ["-c", "pip list 2>/dev/null | grep -i pptx"] } }),
+    );
+  });
+
+  it("surfaces the sandbox error message instead of a bare exit code", async () => {
+    const ctx = fakeContext({
+      runSandbox: vi.fn().mockResolvedValue({
+        ok: false,
+        exitCode: 1,
+        outputText: "",
+        durationMs: 562,
+        sandboxRunId: null,
+        errorMessage: "无法连接 Sandbox 服务",
+        artifacts: [],
+      }),
+    });
+    const result = await bashTool.execute({ program: "echo", args: ["hello"] }, ctx);
+    expect(result.output).toContain("沙箱错误：无法连接 Sandbox 服务");
+  });
 });

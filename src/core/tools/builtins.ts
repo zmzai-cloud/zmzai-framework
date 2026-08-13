@@ -138,6 +138,24 @@ function allowedPrograms(): Set<string> {
   return new Set(configured.split(",").map((item) => item.trim()).filter(Boolean));
 }
 
+/** 模型有时把完整命令直接塞进 program 参数（deepseek 行为，实测出现
+ *  "python3 --version"、"pip list 2>/dev/null | grep -i pptx" 等）：
+ *  - 普通命令：拆出程序名与内联参数（引号感知，保留引号内空格）；
+ *  - 管道/重定向/复合命令：交给 sh -c 整串执行，保留 shell 语义。
+ *  避免白名单整串匹配误拒、以及把带空格字符串当程序名执行导致 exit 127。
+ *  permission 与 execute 共用同一归一化。 */
+function splitProgram(program: string): { program: string; args: string[] } {
+  const trimmed = program.trim();
+  if (/[|><;&]/.test(trimmed)) return { program: "sh", args: ["-c", trimmed] };
+  const tokens: string[] = [];
+  const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(trimmed)) !== null) {
+    tokens.push(match[1] ?? match[2] ?? match[3]!);
+  }
+  return { program: tokens[0] ?? "", args: tokens.slice(1) };
+}
+
 export const bashTool: ToolDef = {
   id: "bash",
   label: "在沙箱中执行命令",
@@ -150,17 +168,20 @@ export const bashTool: ToolDef = {
     env: z.record(z.string(), z.string().max(2048)).optional(),
   }),
   permission: (args) => {
-    const command = [args.program, ...(args.args ?? [])].join(" ");
-    return { permission: "bash", patterns: [command], always: [command, `${args.program} *`], metadata: { command } };
+    const { program, args: inlineArgs } = splitProgram(args.program);
+    const allArgs = [...inlineArgs, ...(args.args ?? [])];
+    const command = [program, ...allArgs].join(" ");
+    return { permission: "bash", patterns: [command], always: [command, `${program} *`], metadata: { command } };
   },
   executionMode: "sequential",
   async execute(args, ctx) {
-    const program = args.program.trim();
+    const { program, args: inlineArgs } = splitProgram(args.program);
+    const allArgs = [...inlineArgs, ...(args.args ?? [])];
     if (!allowedPrograms().has(program)) throw new Error(`程序 "${program}" 不在允许列表`);
     const snapshot = await ctx.buildSnapshot();
     const result = await ctx.runSandbox({
       toolCallId: `fwcall_${Date.now()}`,
-      command: { program, args: args.args ?? [], ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.env ? { env: args.env } : {}) },
+      command: { program, args: allArgs, ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.env ? { env: args.env } : {}) },
       snapshot,
     });
     for (const artifact of result.artifacts) {
@@ -174,7 +195,9 @@ export const bashTool: ToolDef = {
       });
     }
     const artifactLine = result.artifacts.length ? `\n已交付产物：${result.artifacts.map((item) => `${item.path}（${item.bytes} B）`).join("、")}` : "";
-    const output = [`$ ${[program, ...(args.args ?? [])].join(" ")}`, `退出码 ${result.exitCode ?? "未知"} · ${result.durationMs}ms`, result.outputText || "（无输出）"].join("\n") + artifactLine;
+    // 沙箱请求失败（连接/认证/配置）时透出真实原因，而不是只有"退出码 1 无输出"。
+    const errorLine = result.errorMessage ? `\n沙箱错误：${result.errorMessage}` : "";
+    const output = [`$ ${[program, ...allArgs].join(" ")}`, `退出码 ${result.exitCode ?? "未知"} · ${result.durationMs}ms`, result.outputText || "（无输出）"].join("\n") + artifactLine + errorLine;
     return {
       title: `${program} ${result.ok ? "完成" : "失败"}`,
       output,
