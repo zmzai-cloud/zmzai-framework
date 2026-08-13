@@ -39,7 +39,7 @@ export { taskTool } from "./core/tools/task.js";
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";
 export { buildCompactionTransform, createCompactionTransform, streamOneText } from "./core/runtime/compaction.js";
-export { startLeaseRecovery, reclaimExpiredLeases, type LeaseRecoveryStore } from "./core/runtime/lease-recovery.js";
+export { startLeaseRecovery, reclaimExpiredLeases, finalizeInterruptedRun, type LeaseRecoveryStore } from "./core/runtime/lease-recovery.js";
 
 // adapters
 export type { ModelProvider, SandboxExecutor, LeaseStore } from "./adapters/index.js";
