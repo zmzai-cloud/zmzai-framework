@@ -130,7 +130,8 @@ export const todoTool: ToolDef = {
   },
 };
 
-const defaultAllowedPrograms = ["node", "npm", "npx", "python3", "bash", "sh", "git", "ls", "cat", "grep", "find", "mkdir", "cp", "mv", "rm", "echo", "printf", "unzip", "tar", "curl", "wget", "env"];
+// python/py：模型常调用 python 而非 python3（多数镜像里是同一解释器符号链接）。
+const defaultAllowedPrograms = ["node", "npm", "npx", "python3", "python", "py", "bash", "sh", "git", "ls", "cat", "grep", "find", "mkdir", "cp", "mv", "rm", "echo", "printf", "unzip", "tar", "curl", "wget", "env"];
 
 function allowedPrograms(): Set<string> {
   const configured = process.env.EXEC_ALLOWED_PROGRAMS?.trim();
