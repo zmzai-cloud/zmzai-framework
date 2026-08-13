@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createMemoryEventLog } from "../events/bus.js";
-import type { Part, SessionInfo, ToolState } from "../session/types.js";
+import type { Part, ToolState } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
 import { finalizeInterruptedRun } from "./lease-recovery.js";
 

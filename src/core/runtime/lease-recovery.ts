@@ -1,6 +1,6 @@
 import type { EventLog } from "../events/bus.js";
 import { notifyEventLogListeners } from "../events/bus.js";
-import type { FrameworkEvent, TodoItem } from "../events/manifest.js";
+import type { FrameworkEvent } from "../events/manifest.js";
 import type { Part } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
 
