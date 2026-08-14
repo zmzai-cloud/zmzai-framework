@@ -63,6 +63,15 @@ type ActiveRun = {
   abort: () => void;
 };
 
+/** 事件的 sessionId 提取：能自带的自带（message/part/session），其余
+ *  （message.part.delta 等）用发起 run 的会话 id 兜底。 */
+function sessionIdOf(event: FrameworkEvent, fallbackSessionId: string): string {
+  if (event.type === "message.updated") return event.data.message.sessionId;
+  if (event.type === "message.part.updated") return event.data.part.sessionId;
+  if (event.type === "session.updated") return event.data.session.id;
+  return fallbackSessionId;
+}
+
 const globalRunners = globalThis as typeof globalThis & { __zmzaiFrameworkRuns?: Map<string, ActiveRun> };
 const activeRuns = globalRunners.__zmzaiFrameworkRuns ?? new Map<string, ActiveRun>();
 globalRunners.__zmzaiFrameworkRuns = activeRuns;
@@ -122,7 +131,10 @@ function defaultToolContext(input: { session: SessionInfo; engine: PermissionEng
 export class SessionRunner {
   constructor(private readonly deps: RunnerDeps) {}
 
-  private async persist(event: FrameworkEvent): Promise<void> {
+  /** fallbackSessionId 由 runLoop 闭包传入（而非实例字段）：runner 是进程级
+   *  单例，两个会话并发时实例字段会互相覆盖，导致 message.part.delta 等
+   *  无自带 sessionId 的事件落到错误的会话事件流里（串台）。 */
+  private async persist(event: FrameworkEvent, fallbackSessionId: string): Promise<void> {
     if (event.type === "message.updated") {
       const message = event.data.message;
       const exists = await this.deps.store.getMessages(message.sessionId).then((entries) => entries.some((entry) => entry.info.id === message.id));
@@ -133,19 +145,9 @@ export class SessionRunner {
     } else if (event.type === "session.updated") {
       await this.deps.store.updateSession(event.data.session.id, event.data.session);
     }
-    const persisted = await this.deps.eventLog.append({ sessionId: this.sessionIdOf(event), ...event });
+    const persisted = await this.deps.eventLog.append({ sessionId: sessionIdOf(event, fallbackSessionId), ...event });
     notifyEventLogListeners(persisted);
   }
-
-  private sessionIdOf(event: FrameworkEvent): string {
-    if (event.type === "message.updated") return event.data.message.sessionId;
-    if (event.type === "message.part.updated") return event.data.part.sessionId;
-    if (event.type === "message.part.delta") return this.currentSessionId;
-    if (event.type === "session.updated") return event.data.session.id;
-    return this.currentSessionId;
-  }
-
-  private currentSessionId = "";
 
   private async publish(event: FrameworkEvent, sessionId: string): Promise<void> {
     const persisted = await this.deps.eventLog.append({ sessionId, ...event });
@@ -249,7 +251,6 @@ export class SessionRunner {
   }
 
   private async runLoop(session: SessionInfo, input: { text: string; agent?: string; model?: ModelRef }): Promise<void> {
-    this.currentSessionId = session.id;
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -274,7 +275,7 @@ export class SessionRunner {
     });
 
     const { emit, settled } = serializeEmit(async (event) => {
-      await this.persist(event);
+      await this.persist(event, session.id);
     });
 
     const projector = new PartProjector({ sessionId: session.id, agent: agentInfo?.name ?? "default", model });
