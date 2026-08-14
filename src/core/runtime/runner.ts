@@ -68,8 +68,8 @@ const activeRuns = globalRunners.__zmzaiFrameworkRuns ?? new Map<string, ActiveR
 globalRunners.__zmzaiFrameworkRuns = activeRuns;
 
 /** 上游中断类错误（F6）：模型流偶发终止/连接断开时自动重试一次，避免
- *  偶发中断直接结束任务（实测 relay 透传 "terminated"）。余额/鉴权等
- *  确定性错误不重试。 */
+ *  偶发中断直接结束任务（实测 relay 透传 "terminated"、上游断流
+ *  "upstream_http2_stream_error" 等）。余额/鉴权等确定性错误不重试。 */
 export function isRetryableError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -79,7 +79,9 @@ export function isRetryableError(message: string): boolean {
     normalized.includes("etimedout") ||
     normalized.includes("api connection error") ||
     normalized.includes("overloaded") ||
-    normalized.includes("timeout")
+    normalized.includes("timeout") ||
+    normalized.includes("upstream") ||
+    normalized.includes("stream failed")
   );
 }
 
