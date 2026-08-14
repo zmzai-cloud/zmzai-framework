@@ -207,7 +207,7 @@ describe("SessionRunner", () => {
     expect(assistant!.parts.some((part) => part.type === "step-finish")).toBe(true);
   });
 
-  it("retries once on a retryable upstream failure and still delivers the reply", async () => {
+  it("retries on a retryable upstream failure and still delivers the reply", async () => {
     const { runner, store, faux, published: harness } = makeHarness([
       fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
       fauxAssistantMessage("重试后的回复"),
@@ -226,6 +226,27 @@ describe("SessionRunner", () => {
     // 第一条是失败占位（空文本），第二条是重试回复。
     const textPart = assistant.flatMap((entry) => entry.parts).find((part) => part.type === "text" && (part as { text?: string }).text);
     expect((textPart as Extract<Part, { type: "text" }> | undefined)?.text).toContain("重试后的回复");
+  });
+
+  it("retries up to 3 times on repeated retryable failures before giving up", async () => {
+    const { runner, store, faux, published: harness } = makeHarness([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+    ]);
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "生成回复" });
+    // 首次 + 最多 3 次重试 = 4 次调用。
+    await waitFor(() => faux.state.callCount >= 4);
+    await waitFor(() => publishedTypes(harness).includes("session.error"));
+
+    expect(faux.state.callCount).toBe(4);
+    expect(lastStatus(harness)).toBe("idle");
+    const errors = harness.filter((event) => event.type === "session.error");
+    expect(errors).toHaveLength(1);
+    expect((errors[0]!.data as { message?: string }).message).toContain("terminated");
   });
 
   it("does not retry deterministic errors (auth/billing)", async () => {

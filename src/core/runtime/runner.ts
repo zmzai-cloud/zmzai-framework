@@ -372,11 +372,14 @@ export class SessionRunner {
       await agent.prompt(input.text);
       await settled();
       let failed = agent.state.errorMessage;
-      // 自动重试（F6）：上游中断类错误重试一次。PI 失败时会注入一条
-      // assistant failure 占位消息（last 是 assistant → continue() 被拒），
-      // 换成合成 user 消息驱动 continue 重新生成；store 里同步的 failure
-      // 消息保留展示（UI 显示"出错了"有诊断价值）。
-      if (failed && isRetryableError(failed)) {
+      // 自动重试（F6）：上游中断类错误（terminated/econnreset/timeout 等）
+      // 带退避重试，最多 3 次。PI 失败时会注入一条 assistant failure 占位
+      // 消息（last 是 assistant → continue() 被拒），换成合成 user 消息驱动
+      // continue 重新生成；store 里同步的 failure 消息保留展示（UI 显示
+      // "出错了"有诊断价值）。退避 500ms→1s→2s 避免对上游施压。
+      const MAX_RETRIES = 3;
+      for (let attempt = 0; attempt < MAX_RETRIES && failed && isRetryableError(failed); attempt += 1) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
         const messages = agent.state.messages;
         const last = messages[messages.length - 1];
         if (last?.role === "assistant" && "errorMessage" in last && last.errorMessage) {
