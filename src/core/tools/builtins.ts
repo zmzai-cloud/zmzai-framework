@@ -161,7 +161,7 @@ export const bashTool: ToolDef = {
   id: "bash",
   label: "在沙箱中执行命令",
   description:
-    "在当前 Workspace 的快照中执行一条命令（隔离沙箱）。程序必须在允许列表内；stdout/stderr 会返回，生成的产物文件可下载。",
+    "在当前 Workspace 的快照中执行一条命令（隔离沙箱）。程序必须在允许列表内；stdout/stderr 会返回。新生成的产物文件会自动出现在用户的产物面板（可预览/下载）——回复中不要自己编造下载链接（如 sandbox: 伪协议或沙箱路径），引用产物时使用工具结果里给出的真实 URL。",
   parameters: z.object({
     program: z.string().min(1).max(64),
     args: z.array(z.string().max(512)).max(32).optional(),
@@ -195,7 +195,11 @@ export const bashTool: ToolDef = {
         ...(artifact.previewUrl ? { previewUrl: artifact.previewUrl } : {}),
       });
     }
-    const artifactLine = result.artifacts.length ? `\n已交付产物：${result.artifacts.map((item) => `${item.path}（${item.bytes} B）`).join("、")}` : "";
+    const artifactLine = result.artifacts.length
+      ? `\n已交付产物（已自动出现在用户的产物面板，用户可直接预览/下载；回复中不要编造下载链接，如需引用请使用下列真实 URL，不要使用 sandbox:/ 等伪协议）：${result.artifacts
+          .map((item) => `${item.path}（${item.bytes} B，下载 ${item.downloadUrl}${item.previewUrl ? `，预览 ${item.previewUrl}` : ""}）`)
+          .join("、")}`
+      : "";
     // 沙箱请求失败（连接/认证/配置）时透出真实原因，而不是只有"退出码 1 无输出"。
     const errorLine = result.errorMessage ? `\n沙箱错误：${result.errorMessage}` : "";
     const output = [`$ ${[program, ...allArgs].join(" ")}`, `退出码 ${result.exitCode ?? "未知"} · ${result.durationMs}ms`, result.outputText || "（无输出）"].join("\n") + artifactLine + errorLine;
