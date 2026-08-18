@@ -20,7 +20,7 @@ type ProjectablePart =
   | { type: "reasoning"; text: string }
   | { type: "tool"; callId: string; tool: string; state: ToolState }
   | { type: "step-start" }
-  | { type: "step-finish"; tokens?: { input: number; output: number } };
+  | { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } };
 
 /** Serializes the emitted events through an async sink while preserving order:
  *  handler calls stay sync, persistence/publish fan-out happens in a chained
@@ -264,11 +264,16 @@ function extractResult(result: unknown): { output: string; title: string | null;
   return { output: output || "（无输出）", title, metadata: metadata && Object.keys(metadata).length ? metadata : null };
 }
 
-function extractUsage(message: AgentMessage): { input: number; output: number } | null {
+function extractUsage(message: AgentMessage): { input: number; output: number; cacheRead?: number; cacheWrite?: number } | null {
   if (message.role !== "assistant") return null;
-  const usage = (message as { usage?: { input?: number; output?: number; totalTokens?: number } }).usage;
+  const usage = (message as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } }).usage;
   if (!usage) return null;
-  return { input: usage.input ?? 0, output: usage.output ?? 0 };
+  return {
+    input: usage.input ?? 0,
+    output: usage.output ?? 0,
+    ...(usage.cacheRead ? { cacheRead: usage.cacheRead } : {}),
+    ...(usage.cacheWrite ? { cacheWrite: usage.cacheWrite } : {}),
+  };
 }
 
 function extractError(message: AgentMessage): { name: string; message: string } | null {

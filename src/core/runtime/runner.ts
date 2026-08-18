@@ -548,7 +548,7 @@ export class SessionRunner {
           api: "openai-completions",
           provider: info.model.providerId,
           model: info.model.modelId,
-          usage: { input: info.tokens?.input ?? 0, output: info.tokens?.output ?? 0, cacheRead: 0, cacheWrite: 0, totalTokens: (info.tokens?.input ?? 0) + (info.tokens?.output ?? 0) },
+          usage: { input: info.tokens?.input ?? 0, output: info.tokens?.output ?? 0, cacheRead: info.tokens?.cacheRead ?? 0, cacheWrite: info.tokens?.cacheWrite ?? 0, totalTokens: (info.tokens?.input ?? 0) + (info.tokens?.output ?? 0) + (info.tokens?.cacheRead ?? 0) + (info.tokens?.cacheWrite ?? 0) },
           stopReason: info.error ? "error" : "stop",
           ...(info.error ? { errorMessage: info.error.message } : {}),
           timestamp: Date.parse(info.time.created) || Date.now(),

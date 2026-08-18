@@ -41,7 +41,7 @@ export type MessageInfo =
       agent: string;
       model: ModelRef;
       error?: { name: string; message: string };
-      tokens?: { input: number; output: number };
+      tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
       time: { created: string; completed?: string };
     };
 
@@ -66,7 +66,7 @@ export type Part = PartBase &
     | { type: "reasoning"; text: string }
     | { type: "tool"; callId: string; tool: string; state: ToolState }
     | { type: "step-start" }
-    | { type: "step-finish"; tokens?: { input: number; output: number } }
+    | { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } }
     | { type: "subtask"; prompt: string; description: string; agent: string; childSessionId: string }
     | { type: "file"; mime: string; filename: string; url: string }
     | { type: "compaction"; summary: string }
