@@ -9,6 +9,7 @@ import type { FrameworkEvent } from "../events/manifest.js";
 import { PermissionEngine, RejectedError, type Reply } from "../permission/engine.js";
 import type { Ruleset } from "../permission/ruleset.js";
 import { PartProjector, serializeEmit } from "./pi-bridge.js";
+import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
 import { newPartId, newSessionId } from "../session/ids.js";
 import type { ModelRef, Part, SessionInfo } from "../session/types.js";
@@ -323,7 +324,27 @@ export class SessionRunner {
     activeRuns.set(session.id, { agent, engine, settled, abort });
     await this.stampLease(session.id);
 
+    const loopGuard = new LoopGuard();
     agent.beforeToolCall = async ({ toolCall, args }) => {
+      // 重复失败守卫（edit）：同一 (path, oldText) 已连续失败多次时，
+      // 重试前先复查文件状态——oldText 已唯一存在则放行清记录，
+      // 否则直接拦截（避免无意义空转烧步数）。
+      const editDef = toolCall.name === "edit" ? toolDefs.get("edit") : undefined;
+      const editArgs = editDef ? editDef.parameters.safeParse(args) : undefined;
+      if (editDef && editArgs?.success && loopGuard.needsEditRecheck(editArgs.data.path, editArgs.data.oldText)) {
+        const file = await workspace.read(editArgs.data.path);
+        const occurrences = file ? file.content.split(editArgs.data.oldText).length - 1 : 0;
+        if (occurrences === 1) loopGuard.clearEditFailure(editArgs.data.path, editArgs.data.oldText);
+        else {
+          return {
+            block: true,
+            reason:
+              `[循环防护] 同一 edit（${editArgs.data.path}）已连续失败 ${REPEAT_EDIT_FAILURE_THRESHOLD} 次以上，且文件内容没有变化。` +
+              `不要继续重试：先用 read 读取 ${editArgs.data.path} 的最新内容，按实际内容重新选择 oldText。`,
+            terminate: false,
+          };
+        }
+      }
       const mapped = permissionForCall(toolDefs, toolCall.name, args);
       if (!mapped) return undefined;
       try {
@@ -337,9 +358,39 @@ export class SessionRunner {
         });
         return undefined;
       } catch (error) {
-        if (error instanceof RejectedError) return { block: true, reason: error.message, terminate: false };
+        if (error instanceof RejectedError) {
+          // 连续被拒 streak：拼入改变策略指令，阻止模型硬闯不允许的操作
+          const advisory = loopGuard.onBlocked(toolCall.name);
+          return { block: true, reason: advisory ? `${error.message}\n\n${advisory}` : error.message, terminate: false };
+        }
         throw error;
       }
+    };
+
+    // storm 断路器：同一工具连续以相同响应失败 3 次（签名不含 args，
+    // 防"化妆参数"重试），在第 3 次的结果里注入改变策略指令。
+    // 只碰工具结果，不碰 F6 模型级重试路径。
+    agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+      const resultText = (result.content ?? [])
+        .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+        .map((block) => block.text)
+        .join("\n");
+      let advisory = loopGuard.onToolResult({ toolName: toolCall.name, isError, errorText: resultText });
+      if (toolCall.name === "edit") {
+        const parsed = toolDefs.get("edit")?.parameters.safeParse(args);
+        if (parsed?.success) {
+          if (isError) {
+            loopGuard.noteEditFailure(parsed.data.path, parsed.data.oldText);
+            if (!advisory && loopGuard.needsEditRecheck(parsed.data.path, parsed.data.oldText)) {
+              advisory = `[循环防护] 同一 edit 已连续失败 ${REPEAT_EDIT_FAILURE_THRESHOLD} 次（oldText 不存在或不唯一）。停止重试：先 read 该文件获取最新内容，再按实际内容重新选择 oldText。`;
+            }
+          } else {
+            loopGuard.clearEditFailure(parsed.data.path, parsed.data.oldText);
+          }
+        }
+      }
+      if (!advisory) return undefined;
+      return { content: [{ type: "text" as const, text: `${advisory}\n\n--- 原始工具结果 ---\n${resultText}` }] };
     };
 
     agent.subscribe((event) => {

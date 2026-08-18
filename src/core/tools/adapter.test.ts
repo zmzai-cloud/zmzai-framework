@@ -63,7 +63,8 @@ describe("adaptTool", () => {
       parameters: z.object({}),
       permission: () => null,
       async execute() {
-        return { title: "大输出", output: "x".repeat(60 * 1024) };
+        // 头部/尾部可辨识，验证 head+tail 裁剪而非硬截断
+        return { title: "大输出", output: `HEAD${"x".repeat(60 * 1024)}TAIL` };
       },
     };
     const tool = adaptTool(bigTool, fakeContext());
@@ -71,6 +72,10 @@ describe("adaptTool", () => {
     const text = (result.content[0] as { text: string }).text;
     expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(48 * 1024);
     expect(result.details).toMatchObject({ truncated: true });
+    // head+tail：文首文末都保留，中间换成裁剪标记（尾部常带报错信息，不能切掉）
+    expect(text.startsWith("HEAD")).toBe(true);
+    expect(text.endsWith("TAIL")).toBe(true);
+    expect(text).toContain("输出过长已裁剪");
   });
 
   it("propagates tool execution errors", async () => {

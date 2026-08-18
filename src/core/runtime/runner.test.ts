@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
 import { AgentRegistry } from "../agent/registry.js";
@@ -6,6 +7,7 @@ import { SessionRunner, createFrameworkSession, type RunnerDeps } from "../runti
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
+import type { ToolDef } from "../tools/def.js";
 import { createMemoryEventLog } from "../events/bus.js";
 
 // ---- in-memory SessionStore ----
@@ -440,5 +442,62 @@ describe("SessionRunner", () => {
     await expect(
       (runner as unknown as { spawnSubagent: SpawnFn }).spawnSubagent(childSession, { description: "x", prompt: "y", subagentType: "general" }, registry, { ask: async () => "once" } as never),
     ).rejects.toThrow("深度超过限制");
+  });
+
+  it("循环防护：edit 同一 (path, oldText) 反复失败时先注入指令再拦截重试", async () => {
+    const editArgs = { path: "a.ts", oldText: "missing", newText: "x" };
+    const { runner, store, toolContext, published: harness } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("edit", editArgs)]),
+      fauxAssistantMessage([fauxToolCall("edit", editArgs)]),
+      fauxAssistantMessage([fauxToolCall("edit", editArgs)]),
+      fauxAssistantMessage("完成。"),
+    ]);
+    (toolContext.workspace.edit as ReturnType<typeof vi.fn>).mockResolvedValue({ error: "oldText 不存在" });
+    (toolContext.workspace.read as ReturnType<typeof vi.fn>).mockResolvedValue({ path: "a.ts", content: "const a = 1;" });
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "改代码" });
+    await waitFor(() => lastStatus(harness) === "idle");
+
+    // 第 3 次被 beforeToolCall 拦截，真正执行的只有前两次
+    expect(toolContext.workspace.edit).toHaveBeenCalledTimes(2);
+    const errors = [...store.parts.values()]
+      .filter((part): part is Extract<Part, { type: "tool" }> => part.type === "tool")
+      .flatMap((part) => (part.state.status === "error" ? [part.state.error ?? ""] : []));
+    // 第 2 次失败注入策略指令，第 3 次拦截理由也带循环防护前缀
+    expect(errors.filter((error) => error.includes("循环防护")).length).toBeGreaterThanOrEqual(2);
+    expect(errors.some((error) => error.includes("先用 read 读取"))).toBe(true);
+  });
+
+  it("循环防护：同一工具连续 3 次同响应失败，第 3 次注入改变策略指令", async () => {
+    const flakyTool: ToolDef = {
+      id: "flaky",
+      label: "总是失败",
+      description: "测试用：永远失败",
+      parameters: z.object({ attempt: z.number() }),
+      permission: () => null,
+      async execute() {
+        throw new Error("upstream rejected");
+      },
+    };
+    const { runner, store, published: harness, deps } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("flaky", { attempt: 1 })]),
+      fauxAssistantMessage([fauxToolCall("flaky", { attempt: 2 })]),
+      fauxAssistantMessage([fauxToolCall("flaky", { attempt: 3 })]),
+      fauxAssistantMessage("完成。"),
+    ]);
+    deps.tools = [flakyTool];
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "调 flaky" });
+    await waitFor(() => lastStatus(harness) === "idle");
+
+    const errors = [...store.parts.values()]
+      .filter((part): part is Extract<Part, { type: "tool" }> => part.type === "tool")
+      .flatMap((part) => (part.state.status === "error" ? [part.state.error ?? ""] : []));
+    expect(errors).toHaveLength(3);
+    // 前两次是原始错误，第 3 次被断路器覆写为策略指令
+    expect(errors.filter((error) => error.includes("循环防护"))).toHaveLength(1);
+    expect(errors[0]!).not.toContain("循环防护");
   });
 });
