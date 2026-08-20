@@ -95,8 +95,8 @@ export async function reclaimExpiredLeases(input: { store: LeaseRecoveryStore; l
     const reclaimed = await input.store.clearLeaseIfExpired(session.sessionId);
     if (!reclaimed) continue; // another scanner won the race
     const events: Array<{ type: "session.status" | "session.error"; data: { status?: "idle"; name?: string; message?: string } }> = [
-      { type: "session.status", data: { status: "idle" } },
       { type: "session.error", data: { name: "LeaseExpired", message: "运行因服务重启中断，可在同一会话继续。" } },
+      { type: "session.status", data: { status: "idle" } },
     ];
     for (const event of events) {
       const persisted = await input.log.append({

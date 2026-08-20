@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryEventLog } from "../events/bus.js";
 import type { Part, ToolState } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
-import { finalizeInterruptedRun } from "./lease-recovery.js";
+import { finalizeInterruptedRun, reclaimExpiredLeases } from "./lease-recovery.js";
 
 /** Minimal in-memory store: only the parts surface finalization touches. */
 function memoryStore() {
@@ -126,5 +126,27 @@ describe("finalizeInterruptedRun", () => {
     expect(events.some((event) => event.type === "permission.replied")).toBe(false);
     const todo = events.find((event) => event.type === "todo.updated")!;
     expect(todo.data.todos.map((item) => item.status)).toEqual(["completed"]);
+  });
+});
+
+describe("reclaimExpiredLeases", () => {
+  it("publishes the lease failure before the legacy idle settle event", async () => {
+    const events: Array<{ type: string }> = [];
+    const log = {
+      async append(event: { type: string }) {
+        events.push(event);
+        return { ...event, id: `evt_${events.length}`, sessionId: "ses_expired", seq: events.length, at: new Date().toISOString() } as never;
+      },
+      async read() { return []; },
+      async count() { return 0; },
+    };
+    await reclaimExpiredLeases({
+      store: {
+        async listExpiredLeases() { return [{ sessionId: "ses_expired" }]; },
+        async clearLeaseIfExpired() { return true; },
+      },
+      log,
+    });
+    expect(events.map((event) => event.type)).toEqual(["session.error", "session.status"]);
   });
 });
