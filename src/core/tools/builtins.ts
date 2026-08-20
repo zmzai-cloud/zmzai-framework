@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { ToolDef } from "../tools/def.js";
+import { qaCheckTool } from "./qa-check.js";
 import { wildcardMatch } from "../permission/ruleset.js";
 
 /** Built-in tools (spec §7.2). These operate on the WorkspaceFiles facade, so
@@ -213,4 +214,4 @@ export const bashTool: ToolDef = {
 
 import { taskTool } from "../tools/task.js";
 
-export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, taskTool];
+export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, qaCheckTool, taskTool];

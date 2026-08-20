@@ -612,6 +612,7 @@ export class SessionRunner {
 
 export async function createFrameworkSession(input: {
   store: SessionStore;
+  id?: string;
   userId: string;
   workspaceId: string;
   agent?: string;
@@ -624,7 +625,7 @@ export async function createFrameworkSession(input: {
   permission?: Ruleset; // pre-stamped session rules (subagent inherits parent's)
 }): Promise<SessionInfo> {
   const session: SessionInfo = {
-    id: newSessionId(),
+    id: input.id ?? newSessionId(),
     workspaceId: input.workspaceId,
     userId: input.userId,
     ...(input.parentId ? { parentId: input.parentId } : {}),
