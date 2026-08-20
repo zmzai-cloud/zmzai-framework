@@ -163,7 +163,7 @@ export class PartProjector {
     if (Buffer.byteLength(track.buffer, "utf8") >= 2 * 1024) this.flushText(emit, track, "reasoning");
   }
 
-  onToolExecutionStart(emit: Emit, toolCallId: string, toolName: string, args: unknown): void {
+  onToolExecutionStart(emit: Emit, toolCallId: string, toolName: string, args: unknown, label?: string): void {
     this.flushAllText(emit);
     const part = this.assistantPart(
       emit,
@@ -171,7 +171,7 @@ export class PartProjector {
         type: "tool",
         callId: toolCallId,
         tool: toolName,
-        state: { status: "running", input: args, time: { start: new Date().toISOString() } },
+        state: { status: "running", input: args, ...(label ? { title: label } : {}), time: { start: new Date().toISOString() } },
       },
       this.toolAnchorMessageId ?? undefined,
     );

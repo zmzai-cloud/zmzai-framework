@@ -408,7 +408,7 @@ export class SessionRunner {
           if (event.message.role === "assistant") projector.onAssistantEnd(emit, event.message);
           break;
         case "tool_execution_start":
-          projector.onToolExecutionStart(emit, event.toolCallId, event.toolName, event.args);
+          projector.onToolExecutionStart(emit, event.toolCallId, event.toolName, event.args, toolDefs.get(event.toolName)?.label);
           break;
         case "tool_execution_update":
           projector.onToolExecutionUpdate(emit, event.toolCallId, event.partialResult);
