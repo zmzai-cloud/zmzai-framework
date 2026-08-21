@@ -7,7 +7,7 @@
 
 export type Action = "allow" | "deny" | "ask";
 
-export type Rule = { permission: string; pattern: string; action: Action };
+export type Rule = { permission: string; pattern: string; action: Action; expiresAt?: string };
 export type Ruleset = Rule[];
 
 export type PermissionConfig = Action | Record<string, Action | Record<string, Action>>;
@@ -23,6 +23,7 @@ export const PERMISSIONS = [
   "grep",
   "list",
   "webfetch",
+  "connector",
   "task",
   "todo",
   "external_directory",
@@ -77,6 +78,7 @@ export function evaluateRules(rulesets: Ruleset[], permission: string, pattern: 
   let result: Action = "ask";
   for (const ruleset of rulesets) {
     for (const rule of ruleset) {
+      if (rule.expiresAt && Date.parse(rule.expiresAt) <= Date.now()) continue;
       if (wildcardMatch(rule.permission, permission) && wildcardMatch(rule.pattern, pattern)) {
         result = rule.action;
       }

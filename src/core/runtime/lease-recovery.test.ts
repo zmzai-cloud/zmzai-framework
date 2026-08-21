@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createMemoryEventLog } from "../events/bus.js";
 import type { Part, ToolState } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
-import { finalizeInterruptedRun, reclaimExpiredLeases } from "./lease-recovery.js";
+import { finalizeInterruptedRun, reclaimExpiredLeases, startLeaseRecovery } from "./lease-recovery.js";
 
 /** Minimal in-memory store: only the parts surface finalization touches. */
 function memoryStore() {
@@ -148,5 +148,32 @@ describe("reclaimExpiredLeases", () => {
       log,
     });
     expect(events.map((event) => event.type)).toEqual(["session.error", "session.status"]);
+  });
+
+  it("scans immediately on process startup instead of waiting for the first interval", async () => {
+    const recovery = globalThis as typeof globalThis & { __zmzaiFrameworkLeaseTimer?: ReturnType<typeof setInterval> };
+    if (recovery.__zmzaiFrameworkLeaseTimer) clearInterval(recovery.__zmzaiFrameworkLeaseTimer);
+    recovery.__zmzaiFrameworkLeaseTimer = undefined;
+    const events: string[] = [];
+    try {
+      startLeaseRecovery({
+        store: {
+          async listExpiredLeases() { return [{ sessionId: "ses_startup_expired" }]; },
+          async clearLeaseIfExpired() { return true; },
+        },
+        log: {
+          async append(event: { type: string }) {
+            events.push(event.type);
+            return { ...event, id: `evt_${events.length}`, sessionId: "ses_startup_expired", seq: events.length, at: new Date().toISOString() } as never;
+          },
+          async read() { return []; },
+          async count() { return 0; },
+        },
+      });
+      await vi.waitFor(() => expect(events).toEqual(["session.error", "session.status"]));
+    } finally {
+      if (recovery.__zmzaiFrameworkLeaseTimer) clearInterval(recovery.__zmzaiFrameworkLeaseTimer);
+      recovery.__zmzaiFrameworkLeaseTimer = undefined;
+    }
   });
 });

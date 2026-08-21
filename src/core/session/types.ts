@@ -56,7 +56,7 @@ export type ToolState =
       metadata?: Record<string, unknown>;
       time: { start: string; end: string };
     }
-  | { status: "error"; input: unknown; error: string; time: { start: string; end: string } };
+  | { status: "error"; input: unknown; error: string; metadata?: Record<string, unknown>; time: { start: string; end: string } };
 
 type PartBase = { id: string; sessionId: string; messageId: string };
 
@@ -74,4 +74,4 @@ export type Part = PartBase &
 
 export type MessageWithParts = { info: MessageInfo; parts: Part[] };
 
-export type SessionStatus = "idle" | "running" | "waiting_permission";
+export type SessionStatus = "idle" | "running" | "waiting_permission" | "waiting_input";

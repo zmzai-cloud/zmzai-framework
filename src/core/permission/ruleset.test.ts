@@ -75,4 +75,9 @@ describe("evaluateRules", () => {
     expect(evaluateRules([mcp], "mymcp_delete", "*")).toBe("deny");
     expect(evaluateRules([mcp], "other_tool", "*")).toBe("ask");
   });
+
+  it("ignores expired persisted session rules", () => {
+    expect(evaluateRules([[{ permission: "bash", pattern: "npm *", action: "allow", expiresAt: "2000-01-01T00:00:00.000Z" }]], "bash", "npm test")).toBe("ask");
+    expect(evaluateRules([[{ permission: "bash", pattern: "npm *", action: "allow", expiresAt: new Date(Date.now() + 60_000).toISOString() }]], "bash", "npm test")).toBe("allow");
+  });
 });

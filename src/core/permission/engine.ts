@@ -91,6 +91,14 @@ export class PermissionEngine {
     return [...this.sessionRules];
   }
 
+  revoke(permission: string, patterns: string[]): boolean {
+    const before = this.sessionRules.length;
+    const patternSet = new Set(patterns);
+    const retained = this.sessionRules.filter((rule) => !(rule.permission === permission && patternSet.has(rule.pattern)));
+    this.sessionRules.splice(0, this.sessionRules.length, ...retained);
+    return retained.length !== before;
+  }
+
   get pendingRequests(): PermissionRequest[] {
     return [...this.pending.values()].map((entry) => entry.request);
   }
@@ -149,12 +157,23 @@ export class PermissionEngine {
   }
 
   /** Resolves a pending request. Returns false when the id is unknown (already
-   *  resolved or session restarted — callers map that to a 404/conflict). */
+   *  resolved or session restarted — callers map that to a 404/conflict).
+   *
+   *  Harness-course retrofit（tutorial-harness 08，OpenCode 拒绝级联）：用户拒绝一个
+   *  请求时，同会话排队中的其他待批请求一并拒绝——用户说“不”的时候，
+   *  不该让后面的请求继续敲门。批准不连坐，拒绝连坐。 */
   reply(requestId: string, reply: Reply, feedback?: string): boolean {
     const entry = this.pending.get(requestId);
     if (!entry) return false;
     this.pending.delete(requestId);
     entry.resolve({ reply, feedback });
+    if (reply === "reject") {
+      for (const [id, other] of [...this.pending]) {
+        this.pending.delete(id);
+        // 级联拒绝不复用原反馈：这些请求没被单独审过，理由必须如实说是连坐
+        other.resolve({ reply: "reject", feedback: "用户已拒绝同会话的另一个请求，本次一并拒绝" });
+      }
+    }
     return true;
   }
 

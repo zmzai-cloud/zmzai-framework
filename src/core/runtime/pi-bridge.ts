@@ -194,8 +194,11 @@ export class PartProjector {
     const { output, title, metadata } = extractResult(result);
     this.patchPart(emit, partId, (part) => {
       if (part.type !== "tool" || part.state.status !== "running") return part;
-      const state: ToolState = isError
-        ? { status: "error", input: part.state.input, error: output, time: { start: part.state.time.start, end: new Date().toISOString() } }
+      const unknown = metadata?.outcome === "unknown";
+      const state: ToolState = unknown
+        ? { status: "error", input: part.state.input, error: output, metadata: { ...(metadata ?? {}), outcome: "unknown" }, time: { start: part.state.time.start, end: new Date().toISOString() } }
+        : isError
+        ? { status: "error", input: part.state.input, error: output, ...(metadata ? { metadata } : {}), time: { start: part.state.time.start, end: new Date().toISOString() } }
         : {
             status: "completed",
             input: part.state.input,

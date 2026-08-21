@@ -79,6 +79,9 @@ export const builtinDefaults: Ruleset = rulesetFromConfig({
   external_directory: { "*": "ask" },
   read: { "*": "allow", "*.env": "ask", "*.env.*": "ask" },
   bash: "ask",
+  // A connector holds an external-system credential. Even read-only calls
+  // cross a trust boundary and must be approved unless a user grants it.
+  connector: "ask",
   edit: "allow",
 });
 

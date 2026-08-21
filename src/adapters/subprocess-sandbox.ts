@@ -67,6 +67,7 @@ export function createSubprocessSandbox(): SandboxExecutor {
         const deliverables = artifacts.filter((a) => !snapshotPaths.has(a.path));
         return {
           ok: result.code === 0,
+          outcome: result.code === 0 ? "succeeded" : "failed",
           exitCode: result.code,
           outputText: result.output,
           durationMs: 0,

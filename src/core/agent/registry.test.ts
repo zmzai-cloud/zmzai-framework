@@ -26,10 +26,11 @@ describe("AgentRegistry", () => {
 describe("preset permission semantics (replaces the plan/build toggle)", () => {
   const registry = new AgentRegistry();
 
-  it("default preset: edit allowed directly, bash requires one approval", () => {
+  it("default preset: edit allowed directly, bash and connectors require approval", () => {
     const rulesets = registry.rulesetsFor("default");
     expect(evaluateRules(rulesets, "edit", "src/index.ts")).toBe("allow");
     expect(evaluateRules(rulesets, "bash", "npm run build")).toBe("ask");
+    expect(evaluateRules(rulesets, "connector", "DeepWiki/read_wiki_structure")).toBe("ask");
     expect(evaluateRules(rulesets, "read", "src/index.ts")).toBe("allow");
     expect(evaluateRules(rulesets, "read", "config/.env")).toBe("ask");
   });

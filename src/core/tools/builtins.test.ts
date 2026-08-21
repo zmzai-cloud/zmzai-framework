@@ -157,6 +157,24 @@ describe("bash tool", () => {
     expect(result.metadata).toMatchObject({ exitCode: 0 });
   });
 
+  it("syncs text deliverables into the task workspace for later tools", async () => {
+    const ctx = fakeContext({
+      runSandbox: vi.fn().mockResolvedValue({
+        ok: true,
+        exitCode: 0,
+        outputText: "generated",
+        durationMs: 12,
+        artifacts: [{ artifactId: "art_real", path: "index.html", bytes: 35, contentType: "text/html", downloadUrl: "/dl/index", workspaceContent: "<html><body>Revenue</body></html>" }],
+      }),
+    });
+
+    await bashTool.execute({ program: "node", args: ["generate.js"] }, ctx);
+
+    expect(ctx.workspace.write).toHaveBeenCalledWith(expect.objectContaining({ path: "index.html", content: "<html><body>Revenue</body></html>", author: "agent" }));
+    expect(ctx.emitted.files).toEqual([expect.objectContaining({ path: "index.html", revisionId: "rev_1" })]);
+    expect(ctx.emitted.artifacts).toEqual([expect.objectContaining({ artifactId: "art_real", path: "index.html", downloadUrl: "/dl/index" })]);
+  });
+
   it("rejects programs outside the allow list before touching the sandbox", async () => {
     const ctx = fakeContext();
     await expect(bashTool.execute({ program: "sudo" }, ctx)).rejects.toThrow("不在允许列表");

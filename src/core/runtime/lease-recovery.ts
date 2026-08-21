@@ -114,6 +114,9 @@ export async function reclaimExpiredLeases(input: { store: LeaseRecoveryStore; l
 
 export function startLeaseRecovery(input: { store: LeaseRecoveryStore; log: EventLog; finalizeStore?: SessionStore }): void {
   if (globalRecovery.__zmzaiFrameworkLeaseTimer) return;
+  // A process may restart immediately after a lease has expired. Do one scan
+  // on startup so those sessions do not remain stale until the first interval.
+  void reclaimExpiredLeases(input).catch(() => undefined);
   globalRecovery.__zmzaiFrameworkLeaseTimer = setInterval(() => {
     void reclaimExpiredLeases(input).catch(() => undefined);
   }, scanIntervalMs);

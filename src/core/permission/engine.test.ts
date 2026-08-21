@@ -61,6 +61,14 @@ describe("PermissionEngine.ask", () => {
     expect(asked).toHaveBeenCalledTimes(1);
   });
 
+  it("revokes a session rule before the next tool call", () => {
+    const { engine } = makeEngine({ sessionRules: rulesetFromConfig({ bash: { "npm *": "allow" } }) });
+    expect(engine.evaluate("bash", "npm test")).toBe("allow");
+    expect(engine.revoke("bash", ["npm *"])).toBe(true);
+    expect(engine.evaluate("bash", "npm test")).toBe("ask");
+    expect(engine.revoke("bash", ["npm *"])).toBe(false);
+  });
+
   it("always auto-resolves other pending requests now covered", async () => {
     const { engine, asked } = makeEngine();
     const first = engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["npm run build"], always: ["npm *"] });
@@ -79,6 +87,19 @@ describe("PermissionEngine.ask", () => {
     engine.reply(asked.mock.calls[0]![0].id, "reject", "先备份再删");
     await expect(promise).rejects.toThrow(RejectedError);
     await expect(promise).rejects.toThrow("先备份再删");
+  });
+
+  it("reject cascades to other pending requests in the session (harness-course 08 retrofit)", async () => {
+    const { engine, asked } = makeEngine();
+    const first = engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["rm -rf dist"] });
+    const second = engine.ask({ sessionId: "ses_1", permission: "bash", patterns: ["curl example.com"] });
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
+    engine.reply(asked.mock.calls[0]![0].id, "reject", "不行");
+    await expect(first).rejects.toThrow("不行");
+    // 用户说“不”时，排队的其他请求不再继续敲门
+    await expect(second).rejects.toThrow(RejectedError);
+    await expect(second).rejects.toThrow("一并拒绝");
+    expect(engine.pendingRequests).toHaveLength(0);
   });
 
   it("reply returns false for unknown ids", async () => {

@@ -22,10 +22,24 @@ export interface WorkspaceFiles {
 
 export type SandboxExecResult = {
   ok: boolean;
+  /** Unknown means the sandbox may have applied a side effect, but its
+   * terminal outcome could not be established. Callers must not retry it. */
+  outcome?: "succeeded" | "failed" | "unknown";
   exitCode: number | null;
   outputText: string;
   durationMs: number;
-  artifacts: { path: string; bytes: number; contentType: string; downloadUrl: string; previewUrl?: string }[];
+  artifacts: {
+    /** Stable persisted artifact id used by download/preview and checkpoints. */
+    artifactId?: string;
+    path: string;
+    bytes: number;
+    contentType: string;
+    downloadUrl: string;
+    previewUrl?: string;
+    /** Text deliverables are copied into the task workspace after the
+     * sandbox succeeds, so later tools such as qa-check see the same files. */
+    workspaceContent?: string;
+  }[];
   /** 沙箱请求失败（连接/认证/配置）时的真实原因；命令失败时为 null。 */
   errorMessage?: string | null;
 };
@@ -43,6 +57,8 @@ export interface ToolContext {
   userId: string;
   workspaceId: string;
   agent: string;
+  /** Stable PI tool-call id for the current invocation. */
+  toolCallId?: string;
   abort: AbortSignal;
   /** Permission escalation from inside a tool (rare; prefer the declarative
    *  `permission` field on ToolDef, which the runner evaluates first). */

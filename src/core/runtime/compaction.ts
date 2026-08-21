@@ -21,6 +21,9 @@ export type CompactionOptions = {
   streamSummary: (messages: AgentMessage[]) => Promise<string>;
   /** Called when a compaction happens so the runner can emit the part. */
   onCompacted?: (summary: string, tokensBefore: number) => void;
+  /** Called when a compaction attempt fails ("summary-empty" | "summary-inflated");
+   *  after any failure the transform stops retrying for this run (失败记忆). */
+  onCompactionFailed?: (reason: "summary-empty" | "summary-inflated") => void | Promise<void>;
 };
 
 /** Rough token estimate (chars/4) — good enough for a threshold trigger; the
@@ -54,14 +57,23 @@ function estimateTokens(messages: AgentMessage[]): number {
 const SUMMARY_INSTRUCTION =
   "把以下对话压缩成一份中文工作摘要，保留：任务目标、已完成的关键步骤与工具结果、当前进度、待办事项、重要的文件路径/命令/产物。不要续写对话，只输出结构化摘要。";
 
-/** Returns a transformContext that compacts when over threshold. */
+/** Returns a transformContext that compacts when over threshold.
+ *
+ * Harness-course retrofits (tutorial-harness 05/07):
+ *  - 膨胀拒绝（Gemini chatCompressionService）：摘要比被压区还长时作废本次压缩，
+ *    宁可用全量上下文也不换一份负收益的摘要。
+ *  - 失败记忆（Gemini hasFailedCompressionAttempt）：摘要调用失败或膨胀后记住这次
+ *    失败，后续不再反复烧摘要 token；失败不静默，通过 onCompactionFailed 上报。
+ */
 export function createCompactionTransform(options: CompactionOptions): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
   const reserve = options.reserveTokens ?? 4096;
   const keepRecent = options.keepRecentMessages ?? 8;
+  let hasFailed = false;
   return async (messages, signal) => {
     void signal;
     const tokens = estimateTokens(messages);
     if (tokens + reserve < options.contextWindow) return messages;
+    if (hasFailed) return messages; // 失败记忆：不再反复尝试摘要
     if (messages.length <= keepRecent + 1) return messages; // nothing worth compacting
 
     const tail = messages.slice(-keepRecent);
@@ -71,7 +83,18 @@ export function createCompactionTransform(options: CompactionOptions): (messages
       { role: "user", content: SUMMARY_INSTRUCTION, timestamp: Date.now() } as AgentMessage,
     ];
     const summary = await options.streamSummary(summaryInput).catch(() => "");
-    if (!summary) return messages; // compaction failed — degrade to full context
+    if (!summary) {
+      hasFailed = true;
+      await options.onCompactionFailed?.("summary-empty");
+      return messages; // compaction failed — degrade to full context
+    }
+    // 膨胀拒绝：摘要比被压区还长，压了不如不压
+    const headTokens = estimateTokens(head);
+    if (estimateTokens([{ role: "user", content: summary, timestamp: Date.now() } as AgentMessage]) >= headTokens) {
+      hasFailed = true;
+      await options.onCompactionFailed?.("summary-inflated");
+      return messages;
+    }
 
     options.onCompacted?.(summary, tokens);
     const compactionMessage: AgentMessage = {

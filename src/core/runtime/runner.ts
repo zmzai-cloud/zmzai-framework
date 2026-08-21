@@ -45,6 +45,9 @@ export type RunnerDeps = {
   sandbox?: SandboxExecutor;
   /** Lease store (runner stamps while owning a run). */
   leaseStore?: { stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>; clear(sessionId: string): Promise<void> };
+  /** Product approval sessions may persist an "always" rule with a bounded
+   * lifetime. The in-memory rule remains valid for the current run. */
+  sessionRuleTtlMs?: number;
   tools?: ToolDef[];
   buildToolContext?: (input: { session: SessionInfo; engine: PermissionEngine }) => ToolContext;
   /** Loads workspace custom agents (spec §6.3). */
@@ -62,6 +65,9 @@ type ActiveRun = {
   engine: PermissionEngine;
   settled: () => Promise<void>;
   abort: () => void;
+  /** Resolves only after the run has emitted its terminal state and released
+   * its lease. Control-plane code uses this before starting a continuation. */
+  done: Promise<void>;
 };
 
 /** 事件的 sessionId 提取：能自带的自带（message/part/session），其余
@@ -184,11 +190,29 @@ export class SessionRunner {
     return active.engine.reply(requestId, reply, feedback);
   }
 
+  /** Revokes matching session-scoped rules immediately for a live run and
+   * removes their persisted continuation access. */
+  async revokePermission(sessionId: string, permission: string, patterns: string[]): Promise<boolean> {
+    const active = activeRuns.get(sessionId);
+    const removedFromEngine = active?.engine.revoke(permission, patterns) ?? false;
+    const session = await this.deps.store.getSession(sessionId);
+    if (!session) return removedFromEngine;
+    const next = session.permission.filter((rule) => !(rule.permission === permission && patterns.includes(rule.pattern)));
+    const removedFromStore = next.length !== session.permission.length;
+    if (removedFromStore) await this.deps.store.updateSession(sessionId, { permission: next });
+    return removedFromEngine || removedFromStore;
+  }
+
   async abort(sessionId: string): Promise<void> {
     const active = activeRuns.get(sessionId);
     await this.deps.store.clearQueuedPrompts(sessionId);
     if (!active) return;
+    // PI's abort signal does not cancel a PermissionEngine.ask() promise.
+    // Rejecting pending approvals first releases beforeToolCall so the run can
+    // publish its terminal state and a continuation cannot overlap it.
+    active.engine.dispose("任务已停止，未处理的授权请求已取消");
     active.abort();
+    await active.done;
   }
 
   /** Builds the compaction transformContext (spec §8.3) when the runner has a
@@ -271,7 +295,10 @@ export class SessionRunner {
       onSessionRuleAdded: async (sessionId, rule) => {
         const latest = await this.deps.store.getSession(sessionId);
         if (!latest) return;
-        await this.deps.store.updateSession(sessionId, { permission: [...latest.permission, rule] });
+        const expiresAt = this.deps.sessionRuleTtlMs && this.deps.sessionRuleTtlMs > 0
+          ? new Date(Date.now() + this.deps.sessionRuleTtlMs).toISOString()
+          : undefined;
+        await this.deps.store.updateSession(sessionId, { permission: [...latest.permission, { ...rule, ...(expiresAt ? { expiresAt } : {}) }] });
       },
     });
 
@@ -297,6 +324,7 @@ export class SessionRunner {
       toolContext.spawnSubagent = (spawnInput) => this.spawnSubagent(session, spawnInput, registry, engine);
     }
     const piTools = [...toolDefs.values()].map((def) => adaptTool(def, toolContext));
+    let unknownSideEffect = false;
 
     const compactionTransform = await this.buildCompaction(session, emit);
     const agent = new Agent({
@@ -321,11 +349,16 @@ export class SessionRunner {
       abortController.abort();
       agent.abort();
     };
-    activeRuns.set(session.id, { agent, engine, settled, abort });
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+    activeRuns.set(session.id, { agent, engine, settled, abort, done });
     await this.stampLease(session.id);
 
     const loopGuard = new LoopGuard();
     agent.beforeToolCall = async ({ toolCall, args }) => {
+      if (unknownSideEffect) {
+        return { block: true, reason: "上一个可能产生副作用的动作结果不确定，已暂停执行。请先确认外部系统状态，再决定继续或重试。", terminate: true };
+      }
       // 重复失败守卫（edit）：同一 (path, oldText) 已连续失败多次时，
       // 重试前先复查文件状态——oldText 已唯一存在则放行清记录，
       // 否则直接拦截（避免无意义空转烧步数）。
@@ -371,6 +404,8 @@ export class SessionRunner {
     // 防"化妆参数"重试），在第 3 次的结果里注入改变策略指令。
     // 只碰工具结果，不碰 F6 模型级重试路径。
     agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+      const details = typeof result.details === "object" && result.details !== null ? result.details as Record<string, unknown> : null;
+      if (details?.outcome === "unknown") unknownSideEffect = true;
       const resultText = (result.content ?? [])
         .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
         .map((block) => block.text)
@@ -426,6 +461,9 @@ export class SessionRunner {
       await agent.prompt(input.text);
       await settled();
       let failed = agent.state.errorMessage;
+      if (unknownSideEffect) {
+        await this.publish({ type: "session.status", data: { status: "waiting_input" } }, session.id);
+      } else {
       // 自动重试（F6）：上游中断类错误（terminated/econnreset/timeout 等）
       // 带退避重试，最多 3 次。PI 失败时会注入一条 assistant failure 占位
       // 消息（last 是 assistant → continue() 被拒），换成合成 user 消息驱动
@@ -454,22 +492,26 @@ export class SessionRunner {
         await this.publish({ type: "session.error", data: { name: "APIError", message: failed } }, session.id);
       }
       await this.publish({ type: "session.status", data: { status: "idle" } }, session.id);
+      }
     } catch (error) {
       await settled();
       const aborted = abortController.signal.aborted;
       await this.publish(
-        aborted
+        unknownSideEffect
+          ? { type: "session.status", data: { status: "waiting_input" } }
+          : aborted
           ? { type: "session.status", data: { status: "idle" } }
           : { type: "session.error", data: { name: "AgentRuntimeError", message: error instanceof Error ? error.message : "Agent 运行失败" } },
         session.id,
       );
-      if (aborted) await this.publish({ type: "session.status", data: { status: "idle" } }, session.id);
     } finally {
       activeRuns.delete(session.id);
       engine.dispose();
       await this.clearLease(session.id);
+      resolveDone();
     }
 
+    if (unknownSideEffect) return;
     // FIFO queued prompts (spec §13.3): settle fully, then take the next one.
     const next = await this.deps.store.dequeuePrompt(session.id);
     if (next) {

@@ -25,7 +25,10 @@ function hasResponsiveStyles(styles: string): boolean {
 }
 
 function hasFixedOverflowRisk(styles: string): boolean {
-  return /(?:width|min-width)\s*:\s*(?:[5-9]\d{2}|\d{4,})px/i.test(styles) && !/max-width\s*:\s*100%/i.test(styles);
+  // `max-width` is commonly used in responsive media queries and containers;
+  // it constrains a layout rather than forcing it wider. Only a literal width
+  // or min-width declaration at a CSS declaration boundary is an overflow risk.
+  return /(?:^|[;{]\s*)(?:width|min-width)\s*:\s*(?:[5-9]\d{2}|\d{4,})px\s*(?:;|})/im.test(styles) && !/max-width\s*:\s*100%/i.test(styles);
 }
 
 export const qaCheckTool: ToolDef = {

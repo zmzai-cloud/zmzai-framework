@@ -56,7 +56,7 @@ const todoItemSchema = z.object({
 
 export const frameworkEventSchemas = {
   "session.updated": z.object({ session: sessionInfoSchema }),
-  "session.status": z.object({ status: z.enum(["idle", "running", "waiting_permission"]) }),
+  "session.status": z.object({ status: z.enum(["idle", "running", "waiting_permission", "waiting_input"]) }),
   "session.error": z.object({ name: z.string(), message: z.string() }),
   "message.updated": z.object({ message: messageInfoSchema }),
   "message.part.updated": z.object({ part: partSchema }),

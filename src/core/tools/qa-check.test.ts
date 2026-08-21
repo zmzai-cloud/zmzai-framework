@@ -35,4 +35,15 @@ describe("qa-check tool", () => {
     const result = await qaCheckTool.execute({ entryPath: "index.html", requiredText: [] }, context({ "index.html": "<html><body>Revenue</body></html>", "styles.css": "body{width:900px}" }));
     expect(qaCheckResultSchema.parse(result.metadata?.qaCheck)).toMatchObject({ status: "failed", viewports: [{ overflow: true }, { overflow: true }] });
   });
+
+  it("does not mistake a max-width media query for a fixed-width overflow", async () => {
+    const result = await qaCheckTool.execute(
+      { entryPath: "index.html", requiredText: ["Revenue"] },
+      context({
+        "index.html": "<html><head><meta name=\"viewport\" content=\"width=device-width\"></head><body>Revenue</body></html>",
+        "styles.css": ".dashboard{width:100%;max-width:68rem}@media (max-width: 860px){.dashboard{padding:16px}}",
+      }),
+    );
+    expect(qaCheckResultSchema.parse(result.metadata?.qaCheck)).toMatchObject({ status: "passed", viewports: [{ overflow: false }, { overflow: false }] });
+  });
 });

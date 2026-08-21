@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import { adaptTool, permissionForCall } from "../tools/adapter.js";
+import { adaptTool, permissionForCall, repairToolArguments } from "../tools/adapter.js";
 import type { ToolContext } from "../tools/context.js";
 import type { ToolDef } from "../tools/def.js";
 
@@ -54,6 +54,22 @@ describe("adaptTool", () => {
   it("throws a model-friendly error on invalid args", async () => {
     const tool = adaptTool(echoTool, fakeContext());
     await expect(tool.execute("call_2", { text: "" })).rejects.toThrow("参数无效");
+  });
+
+  it("repairs a safely truncated JSON argument object before validation", async () => {
+    const tool = adaptTool(echoTool, fakeContext());
+    const repaired = tool.prepareArguments?.('{"text":"你好"');
+    expect(repaired).toEqual({ text: "你好" });
+    await expect(tool.execute("call_repaired", repaired)).resolves.toMatchObject({ details: { title: "回声：你好" } });
+  });
+
+  it("does not guess an unterminated JSON string", () => {
+    expect(repairToolArguments('{"text":"unclosed}')).toBe('{"text":"unclosed}');
+  });
+
+  it("unwraps once- or twice-encoded JSON tool arguments", () => {
+    expect(repairToolArguments('{"text":"hello"}')).toEqual({ text: "hello" });
+    expect(repairToolArguments(JSON.stringify(JSON.stringify({ text: "hello" })))).toEqual({ text: "hello" });
   });
 
   it("truncates oversized output and records it in details", async () => {

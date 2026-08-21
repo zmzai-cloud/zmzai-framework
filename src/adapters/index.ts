@@ -31,7 +31,7 @@ export function noopSandboxExecutor(reason = "未配置沙箱执行器"): Sandbo
       return { revisionId: null, files: [] };
     },
     async run() {
-      return { ok: false, exitCode: 1, outputText: "", durationMs: 0, artifacts: [], errorMessage: reason };
+      return { ok: false, outcome: "failed", exitCode: 1, outputText: "", durationMs: 0, artifacts: [], errorMessage: reason };
     },
   };
 }

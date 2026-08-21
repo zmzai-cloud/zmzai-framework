@@ -182,13 +182,22 @@ export const bashTool: ToolDef = {
     if (!allowedPrograms().has(program)) throw new Error(`程序 "${program}" 不在允许列表`);
     const snapshot = await ctx.buildSnapshot();
     const result = await ctx.runSandbox({
-      toolCallId: `fwcall_${Date.now()}`,
+      toolCallId: ctx.toolCallId ?? `fwcall_${Date.now()}`,
       command: { program, args: allArgs, ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.env ? { env: args.env } : {}) },
       snapshot,
     });
     for (const artifact of result.artifacts) {
+      if (artifact.workspaceContent !== undefined) {
+        const written = await ctx.workspace.write({
+          path: artifact.path,
+          content: artifact.workspaceContent,
+          author: "agent",
+          summary: `同步沙箱产物 ${artifact.path}`,
+        });
+        if (written) await ctx.emitFileEdited({ path: artifact.path, revisionId: written.revisionId, diff: written.diff });
+      }
       await ctx.emitArtifact({
-        artifactId: `art_${Date.now()}_${artifact.path.replace(/[^a-zA-Z0-9]/g, "_")}`,
+        artifactId: artifact.artifactId ?? `art_${Date.now()}_${artifact.path.replace(/[^a-zA-Z0-9]/g, "_")}`,
         path: artifact.path,
         bytes: artifact.bytes,
         contentType: artifact.contentType,
@@ -204,10 +213,11 @@ export const bashTool: ToolDef = {
     // 沙箱请求失败（连接/认证/配置）时透出真实原因，而不是只有"退出码 1 无输出"。
     const errorLine = result.errorMessage ? `\n沙箱错误：${result.errorMessage}` : "";
     const output = [`$ ${[program, ...allArgs].join(" ")}`, `退出码 ${result.exitCode ?? "未知"} · ${result.durationMs}ms`, result.outputText || "（无输出）"].join("\n") + artifactLine + errorLine;
+    const outcome = result.outcome ?? (result.ok ? "succeeded" : "failed");
     return {
-      title: `${program} ${result.ok ? "完成" : "失败"}`,
+      title: `${program} ${outcome === "unknown" ? "待确认" : result.ok ? "完成" : "失败"}`,
       output,
-      metadata: { exitCode: result.exitCode, durationMs: result.durationMs, artifacts: result.artifacts.map((item) => ({ path: item.path, bytes: item.bytes, downloadUrl: item.downloadUrl, ...(item.previewUrl ? { previewUrl: item.previewUrl } : {}) })) },
+      metadata: { outcome, exitCode: result.exitCode, durationMs: result.durationMs, artifacts: result.artifacts.map((item) => ({ path: item.path, bytes: item.bytes, downloadUrl: item.downloadUrl, ...(item.previewUrl ? { previewUrl: item.previewUrl } : {}) })) },
     };
   },
 };

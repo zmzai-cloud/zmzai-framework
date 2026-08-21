@@ -70,6 +70,42 @@ describe("createCompactionTransform", () => {
     const result = await transform(messages);
     expect(result).toEqual(messages);
   });
+
+  it("rejects an inflated summary and remembers the failure (harness-course 05/07 retrofit)", async () => {
+    const onCompactionFailed = vi.fn();
+    const streamSummary = vi.fn(async () => "长".repeat(2000)); // 比被压区还长
+    const transform = createCompactionTransform({
+      summaryModel: fakeModel,
+      contextWindow: 100,
+      keepRecentMessages: 2,
+      streamSummary,
+      onCompactionFailed,
+    });
+    const messages = [userMessage("x".repeat(400)), assistantMessage("y".repeat(400)), userMessage("z"), assistantMessage("w")];
+    const result = await transform(messages);
+    expect(result).toEqual(messages); // 膨胀拒绝：宁用全量
+    expect(onCompactionFailed).toHaveBeenCalledWith("summary-inflated");
+    // 失败记忆：再超阈值也不重新调摘要
+    await transform(messages);
+    expect(streamSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it("remembers an empty-summary failure too", async () => {
+    const onCompactionFailed = vi.fn();
+    const streamSummary = vi.fn(async () => "");
+    const transform = createCompactionTransform({
+      summaryModel: fakeModel,
+      contextWindow: 100,
+      keepRecentMessages: 2,
+      streamSummary,
+      onCompactionFailed,
+    });
+    const messages = [userMessage("x".repeat(400)), assistantMessage("y".repeat(400)), userMessage("z"), assistantMessage("w")];
+    await transform(messages);
+    await transform(messages);
+    expect(onCompactionFailed).toHaveBeenCalledTimes(1);
+    expect(streamSummary).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("buildCompactionTransform", () => {

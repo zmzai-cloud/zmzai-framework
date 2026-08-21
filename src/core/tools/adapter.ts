@@ -10,6 +10,67 @@ const maxOutputBytes = 48 * 1024;
 const headRatio = 0.7;
 const tailRatio = 0.25;
 
+type JsonRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Completes only a structurally unfinished JSON object/array. We deliberately
+ * refuse unterminated strings: guessing user-facing content or commands would
+ * turn a transport fault into an unintended side effect. */
+function closeJsonContainers(value: string): string | null {
+  const text = value.trim();
+  if (!text || (text[0] !== "{" && text[0] !== "[")) return null;
+  const closers: string[] = [];
+  let quoted = false;
+  let escaped = false;
+  for (const character of text) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "{") closers.push("}");
+    else if (character === "[") closers.push("]");
+    else if (character === "}" || character === "]") {
+      if (closers.pop() !== character) return null;
+    }
+  }
+  return quoted || escaped || closers.length === 0 ? null : text + closers.reverse().join("");
+}
+
+/** Repairs common OpenAI-compatible tool-argument transport defects without
+ * inventing values: JSON encoded once/twice as a string, markdown fences, and
+ * missing container closers after a stream cut. */
+export function repairToolArguments(raw: unknown): unknown {
+  if (isRecord(raw)) return raw;
+  if (typeof raw !== "string") return raw;
+
+  let candidate = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (isRecord(parsed)) return parsed;
+      if (typeof parsed !== "string") return raw;
+      candidate = parsed.trim();
+      continue;
+    } catch {
+      const completed = closeJsonContainers(candidate);
+      if (!completed) return raw;
+      try {
+        const parsed: unknown = JSON.parse(completed);
+        return isRecord(parsed) ? parsed : raw;
+      } catch {
+        return raw;
+      }
+    }
+  }
+  return raw;
+}
+
 /** 按全文平均字节/字符估算预算字符数，再微调对齐——避免超长文本逐字符削的 O(n²)。 */
 function byteFitHead(text: string, budgetBytes: number): string {
   const avg = Buffer.byteLength(text, "utf8") / Math.max(text.length, 1);
@@ -61,13 +122,14 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
     description: def.description,
     parameters: jsonSchema as never,
     ...(def.executionMode ? { executionMode: def.executionMode } : {}),
+    prepareArguments: (rawParams) => repairToolArguments(rawParams) as never,
     async execute(toolCallId, rawParams) {
-      const parsed = def.parameters.safeParse(rawParams);
+      const parsed = def.parameters.safeParse(repairToolArguments(rawParams));
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         throw new Error(`参数无效：${issue ? `${issue.path.join(".")} ${issue.message}` : "不符合 schema"}，请修正后重新调用`);
       }
-      const result = await def.execute(parsed.data, ctx);
+      const result = await def.execute(parsed.data, { ...ctx, toolCallId });
       const truncated = pruneOutput(result.output);
       return {
         content: [{ type: "text" as const, text: truncated.text }],

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
 import { AgentRegistry } from "../agent/registry.js";
-import { SessionRunner, createFrameworkSession, type RunnerDeps } from "../runtime/runner.js";
+import { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "../runtime/runner.js";
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -209,6 +209,33 @@ describe("SessionRunner", () => {
     expect(assistant!.parts.some((part) => part.type === "step-finish")).toBe(true);
   });
 
+  it("repairs structurally truncated raw tool JSON before PI validates and executes it", async () => {
+    const received: string[] = [];
+    const echoTool: ToolDef = {
+      id: "echo",
+      label: "回声",
+      description: "测试工具参数修复",
+      parameters: z.object({ text: z.string().min(1) }),
+      permission: () => null,
+      async execute(args) {
+        received.push(args.text);
+        return { title: "回声", output: args.text };
+      },
+    };
+    const { runner, store, published: harness, deps } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("echo", '{"text":"修复成功"' as never)]),
+      fauxAssistantMessage("已完成。"),
+    ]);
+    deps.tools = [echoTool];
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "调用工具" });
+    await waitFor(() => lastStatus(harness) === "idle");
+
+    expect(received).toEqual(["修复成功"]);
+    expect(storeHasCompletedTool(store)).toBe(true);
+  });
+
   it("retries on a retryable upstream failure and still delivers the reply", async () => {
     const { runner, store, faux, published: harness } = makeHarness([
       fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
@@ -345,6 +372,53 @@ describe("SessionRunner", () => {
     expect(toolContext.calls.sandbox).toEqual([]);
     const toolPart = (await store.getMessages(session.id)).flatMap((entry) => entry.parts).find((part) => part.type === "tool");
     expect((toolPart as Extract<Part, { type: "tool" }>).state.status).toBe("error");
+  });
+
+  it("waits for a stopped run to settle before abort resolves", async () => {
+    const { runner, store, published: harness } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("bash", { program: "npm", args: ["run", "build"] })]),
+    ]);
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "构建项目" });
+    await waitFor(() => publishedTypes(harness).includes("permission.asked"));
+    expect(isSessionActive(session.id)).toBe(true);
+
+    await runner.abort(session.id);
+
+    expect(isSessionActive(session.id)).toBe(false);
+    expect(lastStatus(harness)).toBe("idle");
+  });
+
+  it("pauses after an uncertain side effect and does not execute the next tool", async () => {
+    const execute = vi.fn().mockResolvedValue({
+      title: "外部动作状态未知",
+      output: "请求已发出，但无法确认最终状态。",
+      metadata: { outcome: "unknown" },
+    });
+    const uncertainTool: ToolDef = {
+      id: "uncertain",
+      label: "不确定动作",
+      description: "测试一个可能已经产生副作用但状态未知的动作。",
+      parameters: z.object({ value: z.string() }),
+      permission: () => null,
+      execute,
+    };
+    const { runner, store, published: harness, deps } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("uncertain", { value: "first" })]),
+      fauxAssistantMessage([fauxToolCall("uncertain", { value: "second" })]),
+    ]);
+    deps.tools = [uncertainTool];
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "执行外部动作" });
+    await waitFor(() => lastStatus(harness) === "waiting_input");
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(store.sessions.get(session.id)?.queuedPrompts).toHaveLength(0);
+    const toolParts = [...store.parts.values()].filter((part): part is Extract<Part, { type: "tool" }> => part.type === "tool");
+    expect(toolParts.some((part) => part.state.status === "error" && part.state.metadata?.outcome === "unknown")).toBe(true);
+    expect(lastStatus(harness)).toBe("waiting_input");
   });
 
   it("queues a prompt submitted mid-run and drains it after settlement", async () => {
