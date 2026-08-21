@@ -39,8 +39,12 @@ export const qaCheckTool: ToolDef = {
   permission: () => null,
   async execute(args, ctx) {
     const entry = await ctx.workspace.read(args.entryPath);
-    const styles = (await Promise.all((await ctx.workspace.list()).filter((file) => file.path.endsWith(".css")).slice(0, 20).map((file) => ctx.workspace.read(file.path)))).filter((file): file is { path: string; content: string } => Boolean(file)).map((file) => file.content).join("\n");
+    const cssFiles = (await Promise.all((await ctx.workspace.list()).filter((file) => file.path.endsWith(".css")).slice(0, 20).map((file) => ctx.workspace.read(file.path)))).filter((file): file is { path: string; content: string } => Boolean(file)).map((file) => file.content).join("\n");
     const html = entry?.content ?? "";
+    // 单文件 web_app 的样式全部内联在 <style> 块里（workspace 没有 .css 文件），
+    // 响应式/溢出检测必须并入内联样式，否则永远判"缺少响应式样式"。
+    const inlineStyles = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((match) => match[1] ?? "").join("\n");
+    const styles = `${cssFiles}\n${inlineStyles}`;
     const htmlLoads = Boolean(entry && /<html\b/i.test(html) && /<body\b/i.test(html));
     const missingText = args.requiredText.filter((text: string) => !html.includes(text));
     const responsive = hasViewportMeta(html) && hasResponsiveStyles(styles);

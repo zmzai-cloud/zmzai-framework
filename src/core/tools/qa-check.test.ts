@@ -36,6 +36,16 @@ describe("qa-check tool", () => {
     expect(qaCheckResultSchema.parse(result.metadata?.qaCheck)).toMatchObject({ status: "failed", viewports: [{ overflow: true }, { overflow: true }] });
   });
 
+  it("detects responsive styles inlined in a single-file web_app (no .css files)", async () => {
+    const result = await qaCheckTool.execute(
+      { entryPath: "index.html", requiredText: ["Revenue"] },
+      context({
+        "index.html": '<html><head><meta name="viewport" content="width=device-width"><style>body{max-width:100%}@media (max-width: 860px){.grid{display:grid}}</style></head><body>Revenue</body></html>',
+      }),
+    );
+    expect(qaCheckResultSchema.parse(result.metadata?.qaCheck)).toMatchObject({ status: "passed", viewports: [{ overflow: false }, { overflow: false }] });
+  });
+
   it("does not mistake a max-width media query for a fixed-width overflow", async () => {
     const result = await qaCheckTool.execute(
       { entryPath: "index.html", requiredText: ["Revenue"] },
