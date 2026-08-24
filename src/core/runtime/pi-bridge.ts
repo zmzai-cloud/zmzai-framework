@@ -94,7 +94,7 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit, text: string): MessageInfo {
+  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[]): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
@@ -116,6 +116,20 @@ export class PartProjector {
       };
       this.parts.set(part.id, part);
       emit({ type: "message.part.updated", data: { part } });
+    }
+    if (images?.length) {
+      for (const image of images) {
+        const part: Part = {
+          id: newPartId(),
+          sessionId: this.identity.sessionId,
+          messageId: message.id,
+          type: "image",
+          url: image.url,
+          mediaType: image.mediaType,
+        };
+        this.parts.set(part.id, part);
+        emit({ type: "message.part.updated", data: { part } });
+      }
     }
     return message;
   }

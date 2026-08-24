@@ -171,7 +171,7 @@ export class SessionRunner {
     await this.deps.leaseStore.clear(sessionId).catch(() => undefined);
   }
 
-  async prompt(sessionId: string, input: { text: string; agent?: string; model?: ModelRef }): Promise<{ queued: boolean }> {
+  async prompt(sessionId: string, input: { text: string; agent?: string; model?: ModelRef; images?: readonly { url: string; mediaType: string }[] }): Promise<{ queued: boolean }> {
     const session = await this.deps.store.getSession(sessionId);
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
@@ -275,7 +275,7 @@ export class SessionRunner {
     }
   }
 
-  private async runLoop(session: SessionInfo, input: { text: string; agent?: string; model?: ModelRef }): Promise<void> {
+  private async runLoop(session: SessionInfo, input: { text: string; agent?: string; model?: ModelRef; images?: readonly { url: string; mediaType: string }[] }): Promise<void> {
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -457,8 +457,12 @@ export class SessionRunner {
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
 
     try {
-      projector.onUserPrompt(emit, input.text);
-      await agent.prompt(input.text);
+      projector.onUserPrompt(emit, input.text, input.images);
+      const piImages = input.images?.map((img) => {
+        const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
+        return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
+      }).filter((img): img is { type: "image"; data: string; mimeType: string } => img !== null);
+      await agent.prompt(input.text, piImages?.length ? piImages : undefined);
       await settled();
       let failed = agent.state.errorMessage;
       if (unknownSideEffect) {

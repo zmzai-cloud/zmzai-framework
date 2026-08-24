@@ -69,6 +69,7 @@ export type Part = PartBase &
     | { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } }
     | { type: "subtask"; prompt: string; description: string; agent: string; childSessionId: string }
     | { type: "file"; mime: string; filename: string; url: string }
+    | { type: "image"; url: string; mediaType: string; alt?: string }
     | { type: "compaction"; summary: string }
   );
 

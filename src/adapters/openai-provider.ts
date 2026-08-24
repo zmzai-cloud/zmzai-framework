@@ -26,7 +26,7 @@ export function createOpenAiModelProvider(input?: { baseUrl?: string; apiKey?: s
         provider: "zmzai-openai",
         baseUrl,
         reasoning: false,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128_000,
         maxTokens: 16_384,
@@ -45,7 +45,12 @@ export function createOpenAiModelProvider(input?: { baseUrl?: string; apiKey?: s
                 const content = message.content;
                 if (typeof content === "string") return { role: message.role, content };
                 if (Array.isArray(content)) {
-                  return { role: message.role, content: content.filter((b: { type?: string }) => b.type === "text").map((b: { text?: string }) => ({ type: "text", text: b.text ?? "" })) };
+                  const blocks = content.map((b: { type?: string; text?: string; image_url?: { url: string } }) => {
+                    if (b.type === "text") return { type: "text" as const, text: b.text ?? "" };
+                    if (b.type === "image_url" && b.image_url?.url) return { type: "image_url" as const, image_url: { url: b.image_url.url } };
+                    return null;
+                  }).filter(Boolean);
+                  return { role: message.role, content: blocks };
                 }
               }
               if (message.role === "toolResult") {

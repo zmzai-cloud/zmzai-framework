@@ -101,9 +101,6 @@ export function pruneOutput(text: string): { text: string; truncated: boolean; o
   return { text: head + marker + tail, truncated: true, omittedBytes: Buffer.byteLength(omitted, "utf8") };
 }
 
-/** @deprecated 兼容名，实现已换为 head+tail 裁剪。 */
-export const truncateOutput = pruneOutput;
-
 /** Adapts a framework ToolDef into a PI AgentTool (spec §7.1):
  *  - zod parameters are bridged to JSON Schema (typebox-compatible) via
  *    zod's built-in toJSONSchema; args are re-validated with zod inside
