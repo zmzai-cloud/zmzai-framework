@@ -45,6 +45,7 @@ export { startLeaseRecovery, reclaimExpiredLeases, finalizeInterruptedRun, type 
 export type { ModelProvider, SandboxExecutor, LeaseStore } from "./adapters/index.js";
 export { noopSandboxExecutor, leaseDurationMs } from "./adapters/index.js";
 export { qaCheckResultSchema, qaCheckTool, type QaCheckResult } from "./core/tools/qa-check.js";
+export { webfetchTool } from "./core/tools/webfetch.js";
 export { createFsWorkspaceFiles } from "./adapters/fs-workspace.js";
 export { createOpenAiModelProvider } from "./adapters/openai-provider.js";
 export { createSubprocessSandbox } from "./adapters/subprocess-sandbox.js";

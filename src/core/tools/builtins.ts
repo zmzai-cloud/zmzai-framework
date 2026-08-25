@@ -223,5 +223,6 @@ export const bashTool: ToolDef = {
 };
 
 import { taskTool } from "../tools/task.js";
+import { webfetchTool } from "../tools/webfetch.js";
 
-export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, qaCheckTool, taskTool];
+export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, qaCheckTool, webfetchTool, taskTool];

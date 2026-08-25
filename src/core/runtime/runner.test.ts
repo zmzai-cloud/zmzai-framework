@@ -501,6 +501,43 @@ describe("SessionRunner", () => {
     }
   });
 
+  it("task tool end-to-end: parent spawns a subagent that completes and returns its summary", async () => {
+    const { runner, store, published: harness } = makeHarness([
+      fauxAssistantMessage([fauxToolCall("task", { description: "分析模块", prompt: "分析 src 目录结构", subagent_type: "general" })]),
+      fauxAssistantMessage("子代理结论：模块结构清晰，共 3 个文件。"),
+      fauxAssistantMessage("父代理总结：已通过子代理完成分析。"),
+    ]);
+    const session = await makeSession(store);
+
+    await runner.prompt(session.id, { text: "派一个子代理分析模块" });
+    // task 在 builtinDefaults 里落到 "*": allow，无需审批；子代理在 task 工具
+    // 执行中完整跑完（单进程双 PI 循环用顺序响应驱动），父 idle 即全链路结束
+    await waitFor(() => lastStatus(harness) === "idle");
+    await waitFor(() => [...store.sessions.values()].some((candidate) => candidate.parentId === session.id));
+
+    // 子会话创建并烙印父会话属性
+    const child = [...store.sessions.values()].find((candidate) => candidate.parentId === session.id)!;
+    expect(child.agent).toBe("general");
+    expect(child.workspaceId).toBe(session.workspaceId);
+    expect(child.title).toBe("分析模块");
+
+    // 子代理的回复落库（嵌套 runLoop 完整跑完）
+    const childMessages = await store.getMessages(child.id);
+    expect(childMessages.some((entry) => entry.info.role === "assistant")).toBe(true);
+
+    // 父会话收到 subtask part 链接子会话，且最终回复来自父代理（摘要已回传上下文）
+    const subtask = [...store.parts.values()].find((part) => part.type === "subtask");
+    expect(subtask).toBeDefined();
+    expect((subtask as Extract<Part, { type: "subtask" }>).childSessionId).toBe(child.id);
+    const parentMessages = await store.getMessages(session.id);
+    const parentText = parentMessages
+      .flatMap((entry) => entry.parts)
+      .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    expect(parentText).toContain("父代理总结");
+  });
+
   it("task tool rejects when depth cap reached (child cannot re-spawn)", async () => {
     const { store } = makeHarness([]);
     const registry = new AgentRegistry();
