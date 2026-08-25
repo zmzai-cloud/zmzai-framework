@@ -49,6 +49,9 @@ export type RunnerDeps = {
    * lifetime. The in-memory rule remains valid for the current run. */
   sessionRuleTtlMs?: number;
   tools?: ToolDef[];
+  /** 本机工具（用户桌面机器上的 fs/shell/notify）。产品经 relay → bridge 下发
+   *  到桌面客户端，客户端本地审批后执行。与 sandbox 的云端执行相互独立。 */
+  localTools?: ToolDef[];
   buildToolContext?: (input: { session: SessionInfo; engine: PermissionEngine }) => ToolContext;
   /** Loads workspace custom agents (spec §6.3). */
   loadWorkspaceAgents?: (session: SessionInfo) => Promise<AgentInfo[]>;
@@ -308,7 +311,7 @@ export class SessionRunner {
 
     const projector = new PartProjector({ sessionId: session.id, agent: agentInfo?.name ?? "default", model });
     // Exclude task from contexts that can't nest; include for primary runs.
-    const baseTools = [...(this.deps.tools ?? builtinTools), ...(resolved?.tools ?? [])];
+    const baseTools = [...(this.deps.tools ?? builtinTools), ...(this.deps.localTools ?? []), ...(resolved?.tools ?? [])];
     const toolList = session.parentId ? baseTools.filter((def) => def.id !== "task") : baseTools;
     const toolDefs = new Map<string, ToolDef>(toolList.map((def) => [def.id, def]));
     const sandbox = this.deps.sandbox ?? noopSandboxExecutor();
