@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { ToolContext } from "../tools/context.js";
 import type { AnyToolDef, ExternalToolDef, ToolDef } from "../tools/def.js";
 import { isExternalToolDef } from "../tools/def.js";
+import { trimFailureOutput } from "../tools/trim.js";
 
 const maxOutputBytes = 48 * 1024;
 /** 超限后保留头部 70% + 尾部 25% 预算（尾部常带报错/退出信息，
@@ -127,14 +128,28 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
         const issue = parsed.error.issues[0];
         throw new Error(`参数无效：${issue ? `${issue.path.join(".")} ${issue.message}` : "不符合 schema"}，请修正后重新调用`);
       }
-      const result = await def.execute(parsed.data, { ...ctx, toolCallId });
-      const truncated = pruneOutput(result.output);
+      let result;
+      try {
+        result = await def.execute(parsed.data, { ...ctx, toolCallId });
+      } catch (error) {
+        // 失败日志按行剪裁（01-trim）：抛错消息超预算时只留错误行 + 上下文，
+        // 模型看到的是错误现场而不是几千行 pass 噪音
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(message.length > 8_000 ? trimFailureOutput(message).text : message);
+      }
+      // 策略分流（01-trim）：failed 结果走失败日志剪裁，其余走 head+tail。
+      // 两条链路的返回形状不同（trimmed/truncated），在这里归一化。
+      const outcome = (result.metadata as Record<string, unknown> | undefined)?.outcome;
+      const failedTrim = outcome === "failed" ? trimFailureOutput(result.output) : null;
+      const pruned = failedTrim
+        ? { text: failedTrim.text, truncated: failedTrim.trimmed, omittedBytes: failedTrim.omittedBytes }
+        : pruneOutput(result.output);
       return {
-        content: [{ type: "text" as const, text: truncated.text }],
+        content: [{ type: "text" as const, text: pruned.text }],
         details: {
           title: result.title,
           ...(result.metadata ?? {}),
-          ...(truncated.truncated ? { truncated: true, omittedBytes: truncated.omittedBytes } : {}),
+          ...(pruned.truncated ? { truncated: true, omittedBytes: pruned.omittedBytes } : {}),
         },
       };
     },
@@ -154,14 +169,24 @@ export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): Agent
     async execute(toolCallId, rawParams) {
       const args = repairToolArguments(rawParams);
       if (!isRecord(args)) throw new Error("参数无效：必须是 JSON 对象，请修正后重新调用");
-      const result = await def.execute(args as Record<string, unknown>, { ...ctx, toolCallId });
-      const truncated = pruneOutput(result.output);
+      let result;
+      try {
+        result = await def.execute(args as Record<string, unknown>, { ...ctx, toolCallId });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(message.length > 8_000 ? trimFailureOutput(message).text : message);
+      }
+      const outcome = (result.metadata as Record<string, unknown> | undefined)?.outcome;
+      const failedTrim = outcome === "failed" ? trimFailureOutput(result.output) : null;
+      const pruned = failedTrim
+        ? { text: failedTrim.text, truncated: failedTrim.trimmed, omittedBytes: failedTrim.omittedBytes }
+        : pruneOutput(result.output);
       return {
-        content: [{ type: "text" as const, text: truncated.text }],
+        content: [{ type: "text" as const, text: pruned.text }],
         details: {
           title: result.title,
           ...(result.metadata ?? {}),
-          ...(truncated.truncated ? { truncated: true, omittedBytes: truncated.omittedBytes } : {}),
+          ...(pruned.truncated ? { truncated: true, omittedBytes: pruned.omittedBytes } : {}),
         },
       };
     },

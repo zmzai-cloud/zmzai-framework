@@ -17,6 +17,7 @@ export { createMemoryEventLog, subscribeEventLog, notifyEventLogListeners } from
 // core: permission
 export type { Action, Rule, Ruleset, PermissionConfig } from "./core/permission/ruleset.js";
 export { rulesetFromConfig, evaluateRules, wildcardMatch, PERMISSIONS } from "./core/permission/ruleset.js";
+export { pathInWritePaths, writePathGuardRules, confineWorkspaceFiles } from "./core/permission/write-path.js";
 export type { Reply, PermissionRequest } from "./core/permission/engine.js";
 export { PermissionEngine, RejectedError } from "./core/permission/engine.js";
 
@@ -41,6 +42,7 @@ export type { ToolDef, ExternalToolDef, AnyToolDef } from "./core/tools/def.js";
 export { isExternalToolDef } from "./core/tools/def.js";
 export type { ToolContext, WorkspaceFiles, SandboxSnapshot, SandboxExecResult, SandboxExecInput } from "./core/tools/context.js";
 export { adaptTool, adaptExternalTool, adaptAnyTool, permissionForCall } from "./core/tools/adapter.js";
+export { pruneFailureLog, trimFailureOutput, type FailureTrimResult } from "./core/tools/trim.js";
 export { builtinTools, readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool } from "./core/tools/builtins.js";
 export { taskTool } from "./core/tools/task.js";
 export { createGitTools } from "./core/tools/git.js";

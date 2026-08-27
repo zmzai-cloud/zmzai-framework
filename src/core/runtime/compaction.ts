@@ -1,12 +1,26 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
-/** Framework compaction (spec §8.3): when the PI-visible context approaches the
- *  model's window, replace the older history with a generated summary and keep
- *  a recent tail. Wired through PI's transformContext — the loop calls it
- *  before every LLM request. The emitted `compaction` part marks the boundary
- *  in the transcript (the full pre-compaction messages stay persisted in the
- *  framework store; only the model's working context is condensed). */
+/** Framework compaction (spec §8.3) — projection style (tutorial-advanced 06):
+ *  canonical history (PI state.messages) is never mutated; the transform keeps
+ *  closure state {anchor, summary} and projects the model's view as
+ *  [summaryMessage, ...messages.slice(anchor)]. PI's transformContext result is
+ *  request-only (never written back to state), so the previous stateless
+ *  version re-summarized the whole history on every LLM request — the anchor
+ *  turns compaction into an incremental, idempotent projection.
+ *  Known limitation: closure state lives per-run (the runner builds a fresh
+ *  transform for each runLoop), so a new run re-summarizes once when it next
+ *  crosses the threshold; cross-run persistence belongs in the store later.
+ *
+ *  Harness-course retrofits (tutorial-harness 05/07) preserved:
+ *  - 膨胀拒绝：新摘要比它替代的内容（新折叠段 + 旧摘要）还长时作废本次压缩。
+ *  - 失败记忆：摘要调用失败或膨胀后，本轮不再反复烧摘要 token。
+ *  Projection retrofit adds (tutorial-advanced 06):
+ *  - 滞回带：已有摘要时，只有投影尾部自上次压缩后长够摘要体量的一半才再压，
+ *    防止超窗后每个请求都重摘一遍。
+ *  - 增量摘要：摘要提示词带【已有摘要】+ 新折叠段，反复压缩是续写不是重启。
+ *  - 摘要消息固定 timestamp: 0：投影前缀跨请求逐字节稳定，provider 的
+ *    prompt cache（前缀逐字节匹配）在两次压缩之间持续命中。 */
 
 export type CompactionOptions = {
   /** Cheap model used to write the summary (the relay's small model). */
@@ -57,52 +71,67 @@ function estimateTokens(messages: AgentMessage[]): number {
 const SUMMARY_INSTRUCTION =
   "把以下对话压缩成一份中文工作摘要，保留：任务目标、已完成的关键步骤与工具结果、当前进度、待办事项、重要的文件路径/命令/产物。不要续写对话，只输出结构化摘要。";
 
-/** Returns a transformContext that compacts when over threshold.
- *
- * Harness-course retrofits (tutorial-harness 05/07):
- *  - 膨胀拒绝（Gemini chatCompressionService）：摘要比被压区还长时作废本次压缩，
- *    宁可用全量上下文也不换一份负收益的摘要。
- *  - 失败记忆（Gemini hasFailedCompressionAttempt）：摘要调用失败或膨胀后记住这次
- *    失败，后续不再反复烧摘要 token；失败不静默，通过 onCompactionFailed 上报。
- */
+/** The summary message is deterministic (fixed shape, timestamp 0) so the
+ *  projected prefix is byte-stable across requests — this is what lets the
+ *  provider's prompt cache keep hitting between two compactions. */
+function summaryMessage(text: string): AgentMessage {
+  return { role: "user", content: `【早期对话摘要】\n${text}`, timestamp: 0 } as AgentMessage;
+}
+
+/** Returns a transformContext that projects the model's view as
+ *  [summaryMessage?, ...messages.slice(anchor)] and compacts incrementally
+ *  when the projection crosses the window. */
 export function createCompactionTransform(options: CompactionOptions): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
   const reserve = options.reserveTokens ?? 4096;
   const keepRecent = options.keepRecentMessages ?? 8;
-  let hasFailed = false;
+  let summary: string | null = null; // 投影的唯一状态：当前摘要
+  let anchor = 0; // canonical 历史中已折叠的前缀长度
+  let tailTokensAtCompaction = 0; // 上次压缩时投影尾部的 token 量（滞回带基准）
+  let hasFailed = false; // 失败记忆：本轮不再重试摘要
+
   return async (messages, signal) => {
     void signal;
-    const tokens = estimateTokens(messages);
-    if (tokens + reserve < options.contextWindow) return messages;
-    if (hasFailed) return messages; // 失败记忆：不再反复尝试摘要
-    if (messages.length <= keepRecent + 1) return messages; // nothing worth compacting
+    // 投影：canonical 不可变，模型看到的永远是 [摘要?, slice(anchor)]
+    const projected = summary === null ? messages : [summaryMessage(summary), ...messages.slice(anchor)];
+    const projectedTokens = estimateTokens(projected);
+    if (projectedTokens + reserve < options.contextWindow) return projected;
 
-    const tail = messages.slice(-keepRecent);
-    const head = messages.slice(0, -keepRecent);
+    // 滞回带：已有摘要但尾部自上次压缩后没长够摘要的一半——再压不划算
+    const tailTokens = estimateTokens(messages.slice(anchor));
+    const summaryTokens = summary === null ? 0 : estimateTokens([summaryMessage(summary)]);
+    const grownEnough = summary === null || tailTokens >= tailTokensAtCompaction + Math.ceil(summaryTokens / 2);
+    if (hasFailed || !grownEnough) return projected;
+    if (messages.length - anchor <= keepRecent + 1) return projected; // nothing new worth folding
+
+    const tailCount = Math.min(keepRecent, messages.length - anchor);
+    const fold = messages.slice(anchor, messages.length - tailCount);
+    const foldTokens = estimateTokens(fold);
+
+    // 增量摘要：旧摘要作为上下文带入，只对新折叠段续写
+    const priorSection = summary === null ? "" : `【已有摘要】\n${summary}\n\n`;
     const summaryInput: AgentMessage[] = [
-      ...head,
-      { role: "user", content: SUMMARY_INSTRUCTION, timestamp: Date.now() } as AgentMessage,
+      ...fold,
+      { role: "user", content: `${priorSection}${SUMMARY_INSTRUCTION}`, timestamp: Date.now() } as AgentMessage,
     ];
-    const summary = await options.streamSummary(summaryInput).catch(() => "");
-    if (!summary) {
+    const next = await options.streamSummary(summaryInput).catch(() => "");
+    if (!next) {
       hasFailed = true;
       await options.onCompactionFailed?.("summary-empty");
-      return messages; // compaction failed — degrade to full context
+      return projected; // compaction failed — degrade to the current projection
     }
-    // 膨胀拒绝：摘要比被压区还长，压了不如不压
-    const headTokens = estimateTokens(head);
-    if (estimateTokens([{ role: "user", content: summary, timestamp: Date.now() } as AgentMessage]) >= headTokens) {
+    // 膨胀拒绝：新摘要比它替代的内容（新折叠段 + 旧摘要）还长，压了不如不压
+    const nextTokens = estimateTokens([summaryMessage(next)]);
+    if (nextTokens >= foldTokens + summaryTokens) {
       hasFailed = true;
       await options.onCompactionFailed?.("summary-inflated");
-      return messages;
+      return projected;
     }
 
-    options.onCompacted?.(summary, tokens);
-    const compactionMessage: AgentMessage = {
-      role: "user",
-      content: `【早期对话摘要】\n${summary}`,
-      timestamp: Date.now(),
-    } as AgentMessage;
-    return [compactionMessage, ...tail];
+    summary = next;
+    anchor = messages.length - tailCount;
+    tailTokensAtCompaction = estimateTokens(messages.slice(anchor));
+    options.onCompacted?.(summary, projectedTokens);
+    return [summaryMessage(summary), ...messages.slice(anchor)];
   };
 }
 

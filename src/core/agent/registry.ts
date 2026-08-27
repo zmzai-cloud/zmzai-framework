@@ -17,6 +17,9 @@ export type AgentInfo = {
   prompt?: string; // system prompt override
   steps?: number; // max agentic turns (→ PI shouldStopAfterTurn)
   permission: Ruleset;
+  /** 写路径白名单（WritePathSet，07-subagent retrofit）：声明后该代理的
+   *  write/edit 被圈禁在白名单内；未声明则不限制（opt-in）。 */
+  writePaths?: string[];
 };
 
 export type AgentDefinition = Omit<AgentInfo, "permission"> & { permission: PermissionConfig };

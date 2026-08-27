@@ -8,6 +8,7 @@ import { notifyEventLogListeners, type EventLog } from "../events/bus.js";
 import type { FrameworkEvent } from "../events/manifest.js";
 import { PermissionEngine, RejectedError, type Reply } from "../permission/engine.js";
 import type { Ruleset } from "../permission/ruleset.js";
+import { confineWorkspaceFiles, writePathGuardRules } from "../permission/write-path.js";
 import { PartProjector, serializeEmit } from "./pi-bridge.js";
 import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
@@ -326,7 +327,10 @@ export class SessionRunner {
     const toolList = session.parentId ? baseTools.filter((def) => def.id !== "task") : baseTools;
     const toolDefs = new Map<string, AnyToolDef>(toolList.map((def) => [def.id, def]));
     const sandbox = this.deps.sandbox ?? noopSandboxExecutor();
-    const workspace = this.deps.workspaceFor(session);
+    // 子代理写路径隔离（07-subagent）：会话声明了 writePaths 时把 workspace
+    // 门面包进结构层圈禁——越界 write/edit 直接抛错，不可绕过。
+    const rawWorkspace = this.deps.workspaceFor(session);
+    const workspace = session.writePaths?.length ? confineWorkspaceFiles(rawWorkspace, session.writePaths) : rawWorkspace;
     const emitAsync = async (event: FrameworkEvent) => {
       const persisted = await this.deps.eventLog.append({ sessionId: session.id, ...event });
       notifyEventLogListeners(persisted);
@@ -599,7 +603,11 @@ export class SessionRunner {
       prompt: input.prompt,
       parentId: parent.id,
       title: input.description,
-      permission: [...parent.permission],
+      // 写路径隔离（07-subagent）：子代理 preset 声明 writePaths 时，权限层
+      // 追加白名单 allow + 全局 deny 兜底（LAST match wins，兜底必须在最后），
+      // 结构层通过 SessionInfo.writePaths 在子 runLoop 里圈禁 workspace。
+      permission: [...parent.permission, ...writePathGuardRules(subagent.writePaths ?? [])],
+      ...(subagent.writePaths?.length ? { writePaths: subagent.writePaths } : {}),
     });
 
     try {
@@ -709,6 +717,7 @@ export async function createFrameworkSession(input: {
   parentId?: string;    // subagent child: links to the spawning session (§6.4)
   title?: string;       // override the prompt-truncation default
   permission?: Ruleset; // pre-stamped session rules (subagent inherits parent's)
+  writePaths?: string[]; // 子代理写路径白名单（WritePathSet，07-subagent）
 }): Promise<SessionInfo> {
   const session: SessionInfo = {
     id: input.id ?? newSessionId(),
@@ -721,6 +730,7 @@ export async function createFrameworkSession(input: {
     ...(input.agentVersionId ? { agentVersionId: input.agentVersionId } : {}),
     model: input.model,
     permission: input.permission ?? [],
+    ...(input.writePaths?.length ? { writePaths: input.writePaths } : {}),
     queuedPrompts: [],
     time: { created: new Date().toISOString(), updated: new Date().toISOString() },
   };

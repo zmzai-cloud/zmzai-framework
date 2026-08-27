@@ -108,6 +108,60 @@ describe("createCompactionTransform", () => {
   });
 });
 
+describe("createCompactionTransform — projection (tutorial-advanced 06)", () => {
+  const tinyWindow = { contextWindow: 1_000, keepRecentMessages: 2 };
+
+  it("emits a fixed summary message (timestamp 0) that stays byte-stable across requests", async () => {
+    const transform = createCompactionTransform({ summaryModel: fakeModel, ...tinyWindow, streamSummary: async () => "摘要" });
+    const big = "字".repeat(400);
+    const messages = [userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big), userMessage("最近一"), assistantMessage("最近答")];
+    const first = await transform(messages);
+    expect((first[0] as { timestamp: number }).timestamp).toBe(0);
+    // 尾部多了一条小消息：投影前缀必须逐字节不变（prompt cache 命中的前提）
+    const second = await transform([...messages, userMessage("小小的追问")]);
+    expect(second[0]).toEqual({ role: "user", content: "【早期对话摘要】\n摘要", timestamp: 0 });
+    expect(second[second.length - 1]).toEqual({ role: "user", content: "小小的追问", timestamp: expect.any(Number) });
+  });
+
+  it("does not re-summarize while the tail is inside the hysteresis band", async () => {
+    const streamSummary = vi.fn(async () => "精简摘要");
+    const transform = createCompactionTransform({ summaryModel: fakeModel, ...tinyWindow, streamSummary });
+    const big = "字".repeat(400);
+    const messages = [userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big), userMessage("最近一"), assistantMessage("最近答")];
+    await transform(messages);
+    await transform([...messages, userMessage("小小的追问")]);
+    expect(streamSummary).toHaveBeenCalledTimes(1); // 滞回带内不重摘
+  });
+
+  it("re-compacts incrementally, carrying 【已有摘要】 into the next summary prompt", async () => {
+    const streamSummary = vi.fn().mockResolvedValueOnce("第一版摘要").mockResolvedValue("第二版摘要");
+    const transform = createCompactionTransform({ summaryModel: fakeModel, ...tinyWindow, streamSummary });
+    const big = "字".repeat(400);
+    const messages = [userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big), userMessage("最近一"), assistantMessage("最近答")];
+    await transform(messages);
+    // 追加一大段新对话：尾部增量超过摘要体量的一半，触发增量再压缩
+    const grown = [...messages, userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big)];
+    const result = await transform(grown);
+    expect(streamSummary).toHaveBeenCalledTimes(2);
+    const summaryInput = streamSummary.mock.calls[1]![0] as AgentMessage[];
+    const instruction = summaryInput[summaryInput.length - 1]! as { content: string };
+    expect(instruction.content).toContain("【已有摘要】");
+    expect(instruction.content).toContain("第一版摘要"); // 旧摘要作为上下文带入
+    expect((result[0] as { content: string }).content).toContain("第二版摘要");
+  });
+
+  it("keeps the canonical history untouched (projection, not mutation)", async () => {
+    const transform = createCompactionTransform({ summaryModel: fakeModel, ...tinyWindow, streamSummary: async () => "摘要" });
+    const big = "字".repeat(400);
+    const messages = [userMessage(big), assistantMessage(big), userMessage(big), assistantMessage(big), userMessage("最近一"), assistantMessage("最近答")];
+    const snapshot = structuredClone(messages);
+    const result = await transform(messages);
+    expect(messages).toEqual(snapshot); // canonical 不可变
+    expect(result[0]).not.toBe(messages[0]); // 投影头是新的摘要消息
+    expect(result[result.length - 1]).toBe(messages[messages.length - 1]); // 尾部保持引用
+  });
+});
+
 describe("buildCompactionTransform", () => {
   it("returns undefined when disabled or no summary model", () => {
     expect(buildCompactionTransform({ enabled: false, contextWindow: 1000, summaryModel: fakeModel, streamOne: async () => "" })).toBeUndefined();

@@ -20,6 +20,10 @@ export type SessionInfo = {
   agentVersionId?: string;
   model: ModelRef;
   permission: Ruleset; // session-scoped rules ("always" replies land here)
+  /** 子代理写路径白名单（WritePathSet，07-subagent retrofit）：声明后 write/edit
+   *  被圈禁在白名单内（权限层 deny 兜底 + workspace 门面结构性抛错），
+   *  未声明则不限制。 */
+  writePaths?: string[];
   queuedPrompts: QueuedPrompt[]; // FIFO for prompts submitted while running (§13.3)
   time: { created: string; updated: string; archived?: string };
 };
