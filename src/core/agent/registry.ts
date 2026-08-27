@@ -84,6 +84,10 @@ export const builtinDefaults: Ruleset = rulesetFromConfig({
   // cross a trust boundary and must be approved unless a user grants it.
   connector: "ask",
   edit: "allow",
+  git_read: "allow",
+  // commit 真实写仓库历史，默认问一次；用户可「总是允许」沉淀成规则
+  git_write: "ask",
+  mcp: "ask",
 });
 
 export class AgentRegistry {

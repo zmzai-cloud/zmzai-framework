@@ -41,6 +41,8 @@ export type { ToolContext, WorkspaceFiles, SandboxSnapshot, SandboxExecResult, S
 export { adaptTool, adaptExternalTool, adaptAnyTool, permissionForCall } from "./core/tools/adapter.js";
 export { builtinTools, readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool } from "./core/tools/builtins.js";
 export { taskTool } from "./core/tools/task.js";
+export { createGitTools } from "./core/tools/git.js";
+export type { GitToolsOptions } from "./core/tools/git.js";
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";
