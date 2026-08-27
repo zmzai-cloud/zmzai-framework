@@ -22,6 +22,9 @@ export type FrameworkDeps = {
   sandbox?: SandboxExecutor;
   registry?: AgentRegistry;
   loadWorkspaceAgents?: (session: SessionInfo) => Promise<import("../core/agent/registry.js").AgentInfo[]>;
+  /** Host-injected tools (desktop fs/shell, MCP server tools…). Read at every
+   *  run, so mutating the array between prompts takes effect on the next run. */
+  localTools?: import("../core/tools/def.js").AnyToolDef[];
   subagentDepth?: number;
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api> | null };
   leaseStore?: { stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>; clear(sessionId: string): Promise<void> };
@@ -48,6 +51,7 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     workspaceFor: deps.workspaceFor,
     sandbox: deps.sandbox ?? noopSandboxExecutor(),
     ...(deps.loadWorkspaceAgents ? { loadWorkspaceAgents: deps.loadWorkspaceAgents } : {}),
+    ...(deps.localTools ? { localTools: deps.localTools } : {}),
     subagentDepth: deps.subagentDepth ?? 1,
     ...(deps.compaction ? { compaction: deps.compaction } : {}),
     ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),

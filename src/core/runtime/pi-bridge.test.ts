@@ -7,9 +7,9 @@ vi.mock("node:crypto", () => {
   };
 });
 
-import { PartProjector, serializeEmit } from "@/packages/agent-framework/src/core/runtime/pi-bridge";
-import type { FrameworkEvent } from "@/packages/agent-framework/src/core/events/manifest";
-import type { ModelRef } from "@/packages/agent-framework/src/core/session/types";
+import { PartProjector, serializeEmit } from "./pi-bridge.js";
+import type { FrameworkEvent } from "../events/manifest.js";
+import type { ModelRef } from "../session/types.js";
 
 const model: ModelRef = { providerId: "openai", modelId: "gpt-4" };
 const identity = { sessionId: "ses_test", agent: "test-agent", model };

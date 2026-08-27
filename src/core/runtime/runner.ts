@@ -13,10 +13,11 @@ import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
 import { newPartId, newSessionId } from "../session/ids.js";
 import type { ModelRef, Part, SessionInfo } from "../session/types.js";
-import { adaptTool, permissionForCall } from "../tools/adapter.js";
+import { adaptAnyTool, permissionForCall } from "../tools/adapter.js";
 import { builtinTools } from "../tools/builtins.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
-import type { ToolDef } from "../tools/def.js";
+import type { AnyToolDef } from "../tools/def.js";
+import { isExternalToolDef } from "../tools/def.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
 
@@ -48,10 +49,11 @@ export type RunnerDeps = {
   /** Product approval sessions may persist an "always" rule with a bounded
    * lifetime. The in-memory rule remains valid for the current run. */
   sessionRuleTtlMs?: number;
-  tools?: ToolDef[];
+  tools?: AnyToolDef[];
   /** 本机工具（用户桌面机器上的 fs/shell/notify）。产品经 relay → bridge 下发
-   *  到桌面客户端，客户端本地审批后执行。与 sandbox 的云端执行相互独立。 */
-  localTools?: ToolDef[];
+   *  到桌面客户端，客户端本地审批后执行。与 sandbox 的云端执行相互独立。
+   *  MCP server 工具（ExternalToolDef）也走这里注入。 */
+  localTools?: AnyToolDef[];
   buildToolContext?: (input: { session: SessionInfo; engine: PermissionEngine }) => ToolContext;
   /** Loads workspace custom agents (spec §6.3). */
   loadWorkspaceAgents?: (session: SessionInfo) => Promise<AgentInfo[]>;
@@ -313,7 +315,7 @@ export class SessionRunner {
     // Exclude task from contexts that can't nest; include for primary runs.
     const baseTools = [...(this.deps.tools ?? builtinTools), ...(this.deps.localTools ?? []), ...(resolved?.tools ?? [])];
     const toolList = session.parentId ? baseTools.filter((def) => def.id !== "task") : baseTools;
-    const toolDefs = new Map<string, ToolDef>(toolList.map((def) => [def.id, def]));
+    const toolDefs = new Map<string, AnyToolDef>(toolList.map((def) => [def.id, def]));
     const sandbox = this.deps.sandbox ?? noopSandboxExecutor();
     const workspace = this.deps.workspaceFor(session);
     const emitAsync = async (event: FrameworkEvent) => {
@@ -326,7 +328,7 @@ export class SessionRunner {
     if (!session.parentId) {
       toolContext.spawnSubagent = (spawnInput) => this.spawnSubagent(session, spawnInput, registry, engine);
     }
-    const piTools = [...toolDefs.values()].map((def) => adaptTool(def, toolContext));
+    const piTools = [...toolDefs.values()].map((def) => adaptAnyTool(def, toolContext));
     let unknownSideEffect = false;
 
     const compactionTransform = await this.buildCompaction(session, emit);
@@ -366,7 +368,7 @@ export class SessionRunner {
       // 重试前先复查文件状态——oldText 已唯一存在则放行清记录，
       // 否则直接拦截（避免无意义空转烧步数）。
       const editDef = toolCall.name === "edit" ? toolDefs.get("edit") : undefined;
-      const editArgs = editDef ? editDef.parameters.safeParse(args) : undefined;
+      const editArgs = editDef && !isExternalToolDef(editDef) ? editDef.parameters.safeParse(args) : undefined;
       if (editDef && editArgs?.success && loopGuard.needsEditRecheck(editArgs.data.path, editArgs.data.oldText)) {
         const file = await workspace.read(editArgs.data.path);
         const occurrences = file ? file.content.split(editArgs.data.oldText).length - 1 : 0;
@@ -415,7 +417,8 @@ export class SessionRunner {
         .join("\n");
       let advisory = loopGuard.onToolResult({ toolName: toolCall.name, isError, errorText: resultText });
       if (toolCall.name === "edit") {
-        const parsed = toolDefs.get("edit")?.parameters.safeParse(args);
+        const editAfterDef = toolDefs.get("edit");
+        const parsed = editAfterDef && !isExternalToolDef(editAfterDef) ? editAfterDef.parameters.safeParse(args) : undefined;
         if (parsed?.success) {
           if (isError) {
             loopGuard.noteEditFailure(parsed.data.path, parsed.data.oldText);

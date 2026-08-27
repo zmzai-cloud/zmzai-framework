@@ -28,10 +28,17 @@ export type { AgentResolver, ResolvedAgent } from "./core/agent/resolver.js";
 export { parseAgentPlugin, parsePluginManifest, parsePluginMcp } from "./core/agent/plugin.js";
 export type { ParsedAgentPlugin, PluginFileSystem, PluginManifest, PluginMcpServer, PluginSkill } from "./core/agent/plugin.js";
 
+// core: mcp
+export { McpStdioClient } from "./core/mcp/client.js";
+export type { McpToolInfo, McpCallResult, StdioServerSpec, McpClientOptions } from "./core/mcp/client.js";
+export { startMcpServers } from "./core/mcp/servers.js";
+export type { McpServerEntry, McpServerStatus, McpPoolResult } from "./core/mcp/servers.js";
+
 // core: tools
-export type { ToolDef } from "./core/tools/def.js";
+export type { ToolDef, ExternalToolDef, AnyToolDef } from "./core/tools/def.js";
+export { isExternalToolDef } from "./core/tools/def.js";
 export type { ToolContext, WorkspaceFiles, SandboxSnapshot, SandboxExecResult, SandboxExecInput } from "./core/tools/context.js";
-export { adaptTool, permissionForCall } from "./core/tools/adapter.js";
+export { adaptTool, adaptExternalTool, adaptAnyTool, permissionForCall } from "./core/tools/adapter.js";
 export { builtinTools, readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool } from "./core/tools/builtins.js";
 export { taskTool } from "./core/tools/task.js";
 

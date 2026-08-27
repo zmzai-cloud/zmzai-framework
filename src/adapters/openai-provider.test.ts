@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createOpenAiModelProvider } from "@/packages/agent-framework/src/adapters/openai-provider";
-import type { ModelRef } from "@/packages/agent-framework/src/core/session/types";
+import { createOpenAiModelProvider } from "./openai-provider.js";
+import type { ModelRef } from "../core/session/types.js";
 
 beforeEach(() => {
   vi.clearAllMocks();

@@ -7,8 +7,8 @@ vi.mock("node:crypto", () => {
   };
 });
 
-import { createMemoryEventLog, notifyEventLogListeners, subscribeEventLog } from "@/packages/agent-framework/src/core/events/bus";
-import type { FrameworkEvent, PersistedFrameworkEvent } from "@/packages/agent-framework/src/core/events/manifest";
+import { createMemoryEventLog, notifyEventLogListeners, subscribeEventLog } from "./bus.js";
+import type { FrameworkEvent, PersistedFrameworkEvent } from "./manifest.js";
 
 beforeEach(() => {
   vi.clearAllMocks();

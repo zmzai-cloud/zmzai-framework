@@ -2,7 +2,8 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { z } from "zod";
 
 import type { ToolContext } from "../tools/context.js";
-import type { ToolDef } from "../tools/def.js";
+import type { AnyToolDef, ExternalToolDef, ToolDef } from "../tools/def.js";
+import { isExternalToolDef } from "../tools/def.js";
 
 const maxOutputBytes = 48 * 1024;
 /** 超限后保留头部 70% + 尾部 25% 预算（尾部常带报错/退出信息，
@@ -140,11 +141,46 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
   };
 }
 
+/** External (JSON Schema) tools reuse the same prune/wrap pipeline; args pass
+ *  through unvalidated — the remote tool owns its schema contract. */
+export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): AgentTool {
+  return {
+    name: def.id,
+    label: def.label,
+    description: def.description,
+    parameters: structuredClone(def.parametersJsonSchema) as never,
+    ...(def.executionMode ? { executionMode: def.executionMode } : {}),
+    prepareArguments: (rawParams) => repairToolArguments(rawParams) as never,
+    async execute(toolCallId, rawParams) {
+      const args = repairToolArguments(rawParams);
+      if (!isRecord(args)) throw new Error("参数无效：必须是 JSON 对象，请修正后重新调用");
+      const result = await def.execute(args as Record<string, unknown>, { ...ctx, toolCallId });
+      const truncated = pruneOutput(result.output);
+      return {
+        content: [{ type: "text" as const, text: truncated.text }],
+        details: {
+          title: result.title,
+          ...(result.metadata ?? {}),
+          ...(truncated.truncated ? { truncated: true, omittedBytes: truncated.omittedBytes } : {}),
+        },
+      };
+    },
+  };
+}
+
+/** Adapts either tool flavor into a PI AgentTool. */
+export function adaptAnyTool(def: AnyToolDef, ctx: ToolContext): AgentTool {
+  return isExternalToolDef(def) ? adaptExternalTool(def, ctx) : adaptTool(def, ctx);
+}
+
 /** Maps a tool call to its permission request — used by the runner's
  *  beforeToolCall hook. */
-export function permissionForCall(defs: Map<string, ToolDef>, toolName: string, args: unknown) {
+export function permissionForCall(defs: Map<string, AnyToolDef>, toolName: string, args: unknown) {
   const def = defs.get(toolName);
   if (!def) return null;
+  if (isExternalToolDef(def)) {
+    return isRecord(args) ? def.permission(args as Record<string, unknown>) : null;
+  }
   const parsed = def.parameters.safeParse(args);
   if (!parsed.success) return null; // invalid args fail in execute() with a clear message
   return def.permission(parsed.data);
