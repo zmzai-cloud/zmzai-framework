@@ -33,6 +33,8 @@ export { McpStdioClient } from "./core/mcp/client.js";
 export type { McpToolInfo, McpCallResult, StdioServerSpec, McpClientOptions } from "./core/mcp/client.js";
 export { startMcpServers } from "./core/mcp/servers.js";
 export type { McpServerEntry, McpServerStatus, McpPoolResult } from "./core/mcp/servers.js";
+export { McpStreamableHttpClient, McpSseClient, createMcpHttpClient, createSseParser } from "./core/mcp/http-client.js";
+export type { McpClientLike } from "./core/mcp/http-client.js";
 
 // core: tools
 export type { ToolDef, ExternalToolDef, AnyToolDef } from "./core/tools/def.js";
@@ -49,6 +51,7 @@ export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";
+export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";
 export { buildCompactionTransform, createCompactionTransform, streamOneText } from "./core/runtime/compaction.js";
 export { startLeaseRecovery, reclaimExpiredLeases, finalizeInterruptedRun, type LeaseRecoveryStore } from "./core/runtime/lease-recovery.js";
@@ -58,6 +61,10 @@ export type { ModelProvider, SandboxExecutor, LeaseStore } from "./adapters/inde
 export { noopSandboxExecutor, leaseDurationMs } from "./adapters/index.js";
 export { qaCheckResultSchema, qaCheckTool, type QaCheckResult } from "./core/tools/qa-check.js";
 export { webfetchTool } from "./core/tools/webfetch.js";
+export { createWebSearchTool, parseDuckDuckGoHtml } from "./core/tools/websearch.js";
+export type { WebSearchOptions, WebSearchResult } from "./core/tools/websearch.js";
+export { applyPatchTool, parseUnifiedPatch, applyFilePatch } from "./core/tools/patch.js";
+export type { FilePatch, PatchParseResult, ApplyPatchReportEntry } from "./core/tools/patch.js";
 export { createFsWorkspaceFiles } from "./adapters/fs-workspace.js";
 export { createOpenAiModelProvider } from "./adapters/openai-provider.js";
 export { createSubprocessSandbox } from "./adapters/subprocess-sandbox.js";

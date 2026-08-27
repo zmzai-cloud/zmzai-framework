@@ -1,6 +1,7 @@
 import type { ExternalToolDef } from "../tools/def.js";
 import type { PluginMcpServer } from "../agent/plugin.js";
 import { McpStdioClient, type McpToolInfo } from "./client.js";
+import { createMcpHttpClient, type McpClientLike } from "./http-client.js";
 
 /** 把已解析的插件 mcp.json server 配置接成可用的 MCP 工具集：逐个启动
  *  （stdio 子进程），listTools 后生成命名空间化的 ExternalToolDef。
@@ -40,18 +41,23 @@ function summarizeArgs(args: Record<string, unknown>): string {
   }
 }
 
-type ConnectOutcome = { kind: "ok"; client: McpStdioClient; tools: McpToolInfo[] } | { kind: "error"; message: string };
+type ConnectOutcome = { kind: "ok"; client: McpClientLike; tools: McpToolInfo[] } | { kind: "error"; message: string };
 
 async function connectOne(entry: McpServerEntry, opts: { connectTimeoutMs?: number }): Promise<ConnectOutcome> {
-  if (entry.spec.type !== "stdio") {
-    return { kind: "error", message: `transport ${entry.spec.type} 尚未支持（当前仅 stdio）` };
+  let client: McpClientLike;
+  if (entry.spec.type === "stdio") {
+    const stdio = new McpStdioClient(
+      { command: entry.spec.command, args: entry.spec.args, env: entry.spec.env, cwd: entry.spec.cwd },
+      { connectTimeoutMs: opts.connectTimeoutMs },
+    );
+    client = stdio;
+  } else {
+    const http = createMcpHttpClient(entry.spec, { requestTimeoutMs: opts.connectTimeoutMs });
+    if (!http) return { kind: "error", message: `不支持的 transport：${entry.spec.type as string}` };
+    client = http;
   }
-  const client = new McpStdioClient(
-    { command: entry.spec.command, args: entry.spec.args, env: entry.spec.env, cwd: entry.spec.cwd },
-    { connectTimeoutMs: opts.connectTimeoutMs },
-  );
   try {
-    await client.start();
+    await startHandshake(entry.spec, client);
     const tools = await client.listTools();
     return { kind: "ok", client, tools };
   } catch (error) {
@@ -60,8 +66,14 @@ async function connectOne(entry: McpServerEntry, opts: { connectTimeoutMs?: numb
   }
 }
 
+/** 三种传输的握手统一化：stdio 客户端自带 start()；HTTP 两种在各自的实现里。 */
+async function startHandshake(_spec: PluginMcpServer, client: McpClientLike): Promise<void> {
+  const withStart = client as McpClientLike & { start?: () => Promise<void> };
+  if (typeof withStart.start === "function") await withStart.start();
+}
+
 export async function startMcpServers(entries: McpServerEntry[], opts: { connectTimeoutMs?: number } = {}): Promise<McpPoolResult> {
-  const clients = new Map<string, McpStdioClient>();
+  const clients = new Map<string, McpClientLike>();
   const defs: ExternalToolDef[] = [];
   const settled = await Promise.allSettled(entries.map((entry) => connectOne(entry, opts)));
   const statuses: McpServerStatus[] = entries.map((entry, index) => {
@@ -93,7 +105,7 @@ export async function startMcpServers(entries: McpServerEntry[], opts: { connect
   };
 }
 
-function mcpToolDef(entry: McpServerEntry, tool: McpToolInfo, client: McpStdioClient): ExternalToolDef {
+function mcpToolDef(entry: McpServerEntry, tool: McpToolInfo, client: McpClientLike): ExternalToolDef {
   const label = `${entry.name}/${tool.name}`;
   const id = `mcp__${idSafe(entry.name)}__${idSafe(tool.name)}`;
   return {

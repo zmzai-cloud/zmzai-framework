@@ -96,14 +96,20 @@ describe("startMcpServers", () => {
     }
   }, 15_000);
 
-  it("非 stdio transport 明确报不支持", async () => {
+  it("非 stdio（http/sse）transport：连接失败时进 error status 且不影响整体", async () => {
+    // 目前无本地 fixture 服务 → 握手必失败；关键是整体不抛错、状态可读
     const pool = await startMcpServers([
-      { name: "remote", spec: { type: "sse", url: "https://example.com/sse" } },
-    ]);
-    expect(pool.statuses[0]).toMatchObject({ name: "remote", state: "error", tools: [] });
-    expect(pool.statuses[0]!.error).toContain("stdio");
+      { name: "remote", spec: { type: "sse", url: "https://127.0.0.1:1/sse" } },
+      { name: "remote2", spec: { type: "streamable-http", url: "https://127.0.0.1:1/rpc" } },
+    ], { connectTimeoutMs: 3000 });
+    expect(pool.defs).toHaveLength(0);
+    for (const status of pool.statuses) {
+      expect(status.state).toBe("error");
+      expect(status.tools).toEqual([]);
+      expect(status.error).toBeTruthy();
+    }
     pool.dispose();
-  });
+  }, 15_000);
 });
 
 function stubContext() {
