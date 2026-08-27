@@ -43,6 +43,9 @@ export { builtinTools, readTool, globTool, grepTool, writeTool, editTool, todoTo
 export { taskTool } from "./core/tools/task.js";
 export { createGitTools } from "./core/tools/git.js";
 export type { GitToolsOptions } from "./core/tools/git.js";
+export { TerminalManager, createTerminalTools } from "./core/tools/terminal.js";
+export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSessionStatus } from "./core/tools/terminal.js";
+export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";

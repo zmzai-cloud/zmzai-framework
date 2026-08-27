@@ -30,6 +30,7 @@ export const PERMISSIONS = [
   "mcp", // MCP server 工具（patterns 为 server/tool）
   "git_read", // git status/diff/log（只读，builtinDefaults 默认放行）
   "git_write", // git commit（走审批）
+  "terminal", // 本机交互式终端 terminal_start（宿主机直接起进程，走审批）
 ] as const;
 
 /** Converts config syntax into a flat ruleset. Key order in the config object

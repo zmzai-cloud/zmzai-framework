@@ -88,6 +88,8 @@ export const builtinDefaults: Ruleset = rulesetFromConfig({
   // commit 真实写仓库历史，默认问一次；用户可「总是允许」沉淀成规则
   git_write: "ask",
   mcp: "ask",
+  // 终端在用户本机直接起进程（无沙箱），至少问一次；always 允许按命令前缀沉淀
+  terminal: "ask",
 });
 
 export class AgentRegistry {
