@@ -90,7 +90,8 @@ export class McpStdioClient {
   async start(): Promise<void> {
     if (this.connected) return;
     const base = this.#opts.baseEnv ?? Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
-    const env = { ...base, ...this.#spec.env };
+    // Next.js 的类型增广把 ProcessEnv.NODE_ENV 声明为必填窄类型，而运行时 env 一定继承自 process.env（含 NODE_ENV），此处断言仅为消除类型误报。
+    const env = { ...base, ...this.#spec.env } as NodeJS.ProcessEnv;
 
     let child: ChildProcess;
     try {
