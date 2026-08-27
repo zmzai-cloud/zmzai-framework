@@ -18,6 +18,7 @@ import { builtinTools } from "../tools/builtins.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
 import type { AnyToolDef } from "../tools/def.js";
 import { isExternalToolDef } from "../tools/def.js";
+import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type LifecycleHook } from "./lifecycle.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
 
@@ -63,6 +64,8 @@ export type RunnerDeps = {
   subagentDepth: number;
   /** Auto-compaction (spec §8.3). Disabled when summaryModel is null. */
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: Model<Api> | null };
+  /** 生命周期钩子（P0）：observe/block。抛错只告警不中断运行。 */
+  hooks?: LifecycleHook[];
 };
 
 type ActiveRun = {
@@ -142,6 +145,12 @@ function defaultToolContext(input: { session: SessionInfo; engine: PermissionEng
 
 export class SessionRunner {
   constructor(private readonly deps: RunnerDeps) {}
+  #hooks: LifecycleHook[] = [];
+  /** 供 runLoop 取归一化钩子数组（lazy：constructor 后仍可由 deps 引用共享）。 */
+  private get hooks(): LifecycleHook[] {
+    if (this.#hooks.length !== (this.deps.hooks?.length ?? 0)) this.#hooks = [...(this.deps.hooks ?? [])];
+    return this.#hooks;
+  }
 
   /** fallbackSessionId 由 runLoop 闭包传入（而非实例字段）：runner 是进程级
    *  单例，两个会话并发时实例字段会互相覆盖，导致 message.part.delta 等
@@ -383,6 +392,17 @@ export class SessionRunner {
           };
         }
       }
+      // 生命周期钩子（P0）：所有工具统一的第一道闸口（在权限评估之前，
+      // 便于宿主实现全量工具审计/拦截）；reason 会反馈给模型
+      const hookBlock = await firstToolBlock(this.hooks, {
+        sessionId: session.id,
+        agent: session.agent,
+        tool: toolCall.name,
+        args,
+      }) as { block?: boolean; reason?: string } | undefined;
+      if (hookBlock?.block) {
+        return { block: true, reason: String(hookBlock.reason ?? "被钩子拦截"), terminate: false };
+      }
       const mapped = permissionForCall(toolDefs, toolCall.name, args);
       if (!mapped) return undefined;
       try {
@@ -416,6 +436,14 @@ export class SessionRunner {
         .map((block) => block.text)
         .join("\n");
       let advisory = loopGuard.onToolResult({ toolName: toolCall.name, isError, errorText: resultText });
+      // 生命周期钩子（P0）：只读观测，不阻塞结果路径
+      void Promise.all(fireAfterToolCall(this.hooks, {
+        sessionId: session.id,
+        agent: session.agent,
+        tool: toolCall.name,
+        isError,
+        title: typeof details?.title === "string" ? details.title : undefined,
+      }));
       if (toolCall.name === "edit") {
         const editAfterDef = toolDefs.get("edit");
         const parsed = editAfterDef && !isExternalToolDef(editAfterDef) ? editAfterDef.parameters.safeParse(args) : undefined;
@@ -460,7 +488,10 @@ export class SessionRunner {
       }
     });
 
+    await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
+
+    let runErrored = false;
 
     try {
       projector.onUserPrompt(emit, input.text, input.images);
@@ -499,6 +530,7 @@ export class SessionRunner {
         }
       }
       if (failed) {
+        runErrored = true;
         await this.publish({ type: "session.error", data: { name: "APIError", message: failed } }, session.id);
       }
       await this.publish({ type: "session.status", data: { status: "idle" } }, session.id);
@@ -506,6 +538,7 @@ export class SessionRunner {
     } catch (error) {
       await settled();
       const aborted = abortController.signal.aborted;
+      if (!aborted && !unknownSideEffect) runErrored = true;
       await this.publish(
         unknownSideEffect
           ? { type: "session.status", data: { status: "waiting_input" } }
@@ -518,6 +551,7 @@ export class SessionRunner {
       activeRuns.delete(session.id);
       engine.dispose();
       await this.clearLease(session.id);
+      void Promise.all(fireRunEnd(this.hooks, { sessionId: session.id, agent: session.agent, ok: !runErrored, aborted: abortController.signal.aborted }));
       resolveDone();
     }
 
