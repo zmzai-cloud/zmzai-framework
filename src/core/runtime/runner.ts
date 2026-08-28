@@ -230,16 +230,35 @@ export class SessionRunner {
     await active.done;
   }
 
+  /** 手动触发一次上下文压缩（UI「压缩当前会话」）：无条件对当前历史跑一次
+   *  摘要折叠，摘要通过 buildCompaction 的 onCompacted 落为 compaction part
+   *  并发事件。与自动 compaction 共用同一套保护（膨胀拒绝/失败降级）。 */
+  async compactSession(sessionId: string): Promise<{ ok: boolean; reason?: string }> {
+    if (!this.deps.compaction?.enabled || !this.deps.compaction.summaryModel) {
+      return { ok: false, reason: "compaction-disabled" };
+    }
+    const session = await this.deps.store.getSession(sessionId);
+    if (!session) return { ok: false, reason: "session-not-found" };
+    const transform = await this.buildCompaction(session, (event) => this.publish(event, session.id), true);
+    if (!transform) return { ok: false, reason: "compaction-disabled" };
+    const messages = await this.rebuildMessages(sessionId);
+    if (messages.length <= 1) return { ok: false, reason: "nothing-to-compact" };
+    await transform(messages);
+    return { ok: true };
+  }
+
   /** Builds the compaction transformContext (spec §8.3) when the runner has a
    *  summary model configured. Emits a `compaction` part on the latest
-   *  assistant message so the boundary shows in the transcript. */
-  private async buildCompaction(session: SessionInfo, emit: (event: FrameworkEvent) => void) {
+   *  assistant message so the boundary shows in the transcript. force=true
+   *  skips the threshold/滞回 early-outs (手动「压缩当前会话」). */
+  private async buildCompaction(session: SessionInfo, emit: (event: FrameworkEvent) => void, force = false) {
     if (!this.deps.compaction?.enabled || !this.deps.compaction.summaryModel) return undefined;
     const { buildCompactionTransform, streamOneText } = await import("./compaction.js");
     return buildCompactionTransform({
       enabled: true,
       contextWindow: this.deps.compaction.contextWindow,
       summaryModel: this.deps.compaction.summaryModel,
+      ...(force ? { force: true } : {}),
       streamOne: async (model, messages) => {
         const streamFn = this.deps.streamFnFor(session);
         return streamOneText(

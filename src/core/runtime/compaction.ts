@@ -38,6 +38,8 @@ export type CompactionOptions = {
   /** Called when a compaction attempt fails ("summary-empty" | "summary-inflated");
    *  after any failure the transform stops retrying for this run (失败记忆). */
   onCompactionFailed?: (reason: "summary-empty" | "summary-inflated") => void | Promise<void>;
+  /** 无条件压缩（UI「压缩当前会话」）：跳过阈值与滞回早退，其余保护（膨胀拒绝等）不变。 */
+  force?: boolean;
 };
 
 /** Rough token estimate (chars/4) — good enough for a threshold trigger; the
@@ -94,13 +96,13 @@ export function createCompactionTransform(options: CompactionOptions): (messages
     // 投影：canonical 不可变，模型看到的永远是 [摘要?, slice(anchor)]
     const projected = summary === null ? messages : [summaryMessage(summary), ...messages.slice(anchor)];
     const projectedTokens = estimateTokens(projected);
-    if (projectedTokens + reserve < options.contextWindow) return projected;
+    if (!options.force && projectedTokens + reserve < options.contextWindow) return projected;
 
     // 滞回带：已有摘要但尾部自上次压缩后没长够摘要的一半——再压不划算
     const tailTokens = estimateTokens(messages.slice(anchor));
     const summaryTokens = summary === null ? 0 : estimateTokens([summaryMessage(summary)]);
     const grownEnough = summary === null || tailTokens >= tailTokensAtCompaction + Math.ceil(summaryTokens / 2);
-    if (hasFailed || !grownEnough) return projected;
+    if (!options.force && (hasFailed || !grownEnough)) return projected;
     if (messages.length - anchor <= keepRecent + 1) return projected; // nothing new worth folding
 
     const tailCount = Math.min(keepRecent, messages.length - anchor);
@@ -165,6 +167,7 @@ export function buildCompactionTransform(input: {
   summaryModel: Model<Api> | null;
   streamOne: (model: Model<Api>, messages: AgentMessage[]) => Promise<string>;
   onCompacted?: (summary: string, tokensBefore: number) => void;
+  force?: boolean;
 }): ((messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>) | undefined {
   if (!input.enabled || !input.summaryModel) return undefined;
   return createCompactionTransform({
@@ -172,5 +175,6 @@ export function buildCompactionTransform(input: {
     contextWindow: input.contextWindow,
     streamSummary: (messages) => input.streamOne(input.summaryModel!, messages),
     ...(input.onCompacted ? { onCompacted: input.onCompacted } : {}),
+    ...(input.force ? { force: true } : {}),
   });
 }
