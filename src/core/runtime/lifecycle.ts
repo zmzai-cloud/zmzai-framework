@@ -10,13 +10,15 @@
  *  约定：钩子抛错只告警不中断运行；block 是唯一有副作用的出口。多个 hook
  *  依次调用，第一个返回 block 的生效。 */
 
+import type { RunTranscriptMessage } from "./run-transcript.js";
+
 export type LifecycleHook = {
   /** 诊断名（日志用） */
   name?: string;
   onRunStart?(input: { sessionId: string; agent: string; text: string }): void | Promise<void>;
   onBeforeToolCall?(input: { sessionId: string; agent: string; tool: string; args: unknown }): { block: true; reason: string } | undefined | void | Promise<{ block: true; reason: string } | undefined | void>;
   onAfterToolCall?(input: { sessionId: string; agent: string; tool: string; isError: boolean; title?: string }): void | Promise<void>;
-  onRunEnd?(input: { sessionId: string; agent: string; ok: boolean; aborted: boolean }): void | Promise<void>;
+  onRunEnd?(input: { sessionId: string; agent: string; ok: boolean; aborted: boolean; workspaceId?: string; newMessages?: RunTranscriptMessage[] }): void | Promise<void>;
 };
 
 function warn(hook: LifecycleHook, phase: string, error: unknown): void {
@@ -69,7 +71,7 @@ export function fireAfterToolCall(
   });
 }
 
-export function fireRunEnd(hooks: LifecycleHook[], input: { sessionId: string; agent: string; ok: boolean; aborted: boolean }): Promise<void>[] {
+export function fireRunEnd(hooks: LifecycleHook[], input: { sessionId: string; agent: string; ok: boolean; aborted: boolean; workspaceId?: string; newMessages?: RunTranscriptMessage[] }): Promise<void>[] {
   return hooks.map((hook) => {
     if (!hook.onRunEnd) return Promise.resolve();
     try {

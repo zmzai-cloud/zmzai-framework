@@ -54,6 +54,7 @@ export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
+export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";
 export { buildCompactionTransform, createCompactionTransform, streamOneText } from "./core/runtime/compaction.js";
 export { startLeaseRecovery, reclaimExpiredLeases, finalizeInterruptedRun, type LeaseRecoveryStore } from "./core/runtime/lease-recovery.js";

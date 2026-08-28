@@ -20,6 +20,7 @@ import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
 import type { AnyToolDef } from "../tools/def.js";
 import { isExternalToolDef } from "../tools/def.js";
 import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type LifecycleHook } from "./lifecycle.js";
+import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
 
@@ -67,6 +68,9 @@ export type RunnerDeps = {
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: Model<Api> | null };
   /** 生命周期钩子（P0）：observe/block。抛错只告警不中断运行。 */
   hooks?: LifecycleHook[];
+  /** 长期记忆召回（spec §记忆）：run 开始时按当前 prompt 查询，返回文本
+   *  则作为首条 in-memory user 消息前插（不落 store）。抛错/返回空时零影响。 */
+  memoryContextFor?: (session: SessionInfo, text: string) => Promise<string | undefined>;
 };
 
 type ActiveRun = {
@@ -364,6 +368,21 @@ export class SessionRunner {
     let unknownSideEffect = false;
 
     const compactionTransform = await this.buildCompaction(session, emit);
+    // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
+    // 队/automation/子代理触发四条路径。只进内存不落 store；抛错静默降级。
+    const history = await this.rebuildMessages(session.id);
+    if (this.deps.memoryContextFor) {
+      try {
+        const section = await this.deps.memoryContextFor(session, input.text);
+        if (section) {
+          history.unshift({ role: "user", content: [{ type: "text", text: section }], timestamp: Date.now() } as AgentMessage);
+        }
+      } catch {
+        // 召回失败不阻塞 run
+      }
+    }
+    // baseline：本次 run 新增消息从这之后算（供 onRunEnd 提取 retain）
+    const baseline = history.length;
     const agent = new Agent({
       initialState: {
         systemPrompt: agentInfo?.prompt ?? "",
@@ -373,7 +392,7 @@ export class SessionRunner {
         // so any non-"off" thinking level breaks every model call. If reasoning
         // output is desired later, the relay must accept the field first.
         tools: piTools,
-        messages: await this.rebuildMessages(session.id),
+        messages: history,
       },
       streamFn: this.deps.streamFnFor(session),
       toolExecution: "sequential",
@@ -541,7 +560,7 @@ export class SessionRunner {
         if (last?.role === "assistant" && "errorMessage" in last && last.errorMessage) {
           agent.state.messages = [
             ...messages.slice(0, -1),
-            { role: "user", content: [{ type: "text", text: "（上轮回复生成中断，请继续完成回复。）" }], timestamp: Date.now() },
+            { role: "user", content: [{ type: "text", text: RETRY_PLACEHOLDER_TEXT }], timestamp: Date.now() },
           ];
         }
         try {
@@ -574,7 +593,8 @@ export class SessionRunner {
       activeRuns.delete(session.id);
       engine.dispose();
       await this.clearLease(session.id);
-      void Promise.all(fireRunEnd(this.hooks, { sessionId: session.id, agent: session.agent, ok: !runErrored, aborted: abortController.signal.aborted }));
+      const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
+      void Promise.all(fireRunEnd(this.hooks, { sessionId: session.id, agent: session.agent, ok: !runErrored, aborted: abortController.signal.aborted, workspaceId: session.workspaceId, newMessages }));
       resolveDone();
     }
 
