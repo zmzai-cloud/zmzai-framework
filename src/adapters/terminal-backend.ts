@@ -55,14 +55,32 @@ const requireFromModuleContext =
       )
     : createRequire(process.cwd());
 
-/** 宿主终端后端单例：优先真 PTY，node-pty 不可用时降级管道模式。
+/** 宿主终端后端单例：优先真 PTY，node-pty 不可用或 spawn 探测失败时降级管道模式。
  *  首次调用即锁定后端种类（同步），session 标签从此不存在竞态。 */
 export function createHostTerminalBackend(): TerminalBackend {
   if (!cachedBackend) {
     const mod = tryLoadNodePty();
-    cachedBackend = mod ? createNodePtyBackend(mod) : createPipeBackend();
+    // 加载成功 ≠ 能用：新 Node 运行时与旧 node-pty 的 posix_spawnp 不兼容这类问题
+    // 只有真正 spawn 时才暴露，探测一次，失败永久降级 pipe（功能等价）。
+    cachedBackend = mod && probePtySpawn(mod) ? createNodePtyBackend(mod) : createPipeBackend();
   }
   return cachedBackend;
+}
+
+/** 同步 spawn 探测：能 fork /bin/sh -c true 即认为 pty 可用。 */
+function probePtySpawn(mod: NodePtyModule): boolean {
+  try {
+    const term = mod.spawn("/bin/sh", ["-c", "true"], {
+      name: "xterm-256color",
+      cols: 20,
+      rows: 5,
+      cwd: process.cwd(),
+    });
+    term.kill();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 统一 POSIX sh 执行（不用 $SHELL）：agent 语义需要可预测的语法方言，
