@@ -22,7 +22,8 @@ export function buildGraph(tags: Tag[], mentioned: Set<string>): RefGraph {
     if (!targets) continue;
     let out = graph.get(tag.file);
     if (!out) graph.set(tag.file, (out = new Map()));
-    const weight = mentioned.has(tag.name) ? 10 : 1;
+    // mentioned 存小写（任务描述与 def 名大小写常不一致），比对时统一小写
+    const weight = mentioned.has(tag.name.toLowerCase()) ? 10 : 1;
     for (const [defFile] of targets) {
       if (defFile === tag.file) continue; // 自引用不计边
       out.set(defFile, (out.get(defFile) ?? 0) + weight);

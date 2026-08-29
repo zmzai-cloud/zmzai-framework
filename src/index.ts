@@ -52,7 +52,7 @@ export { TerminalManager, createTerminalTools } from "./core/tools/terminal.js";
 export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSessionStatus } from "./core/tools/terminal.js";
 export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 export { createRepoMapTool } from "./core/tools/repomap.js";
-export { renderRepoMap, type RepoMapOptions, type RepoMapResult } from "./core/repomap/repomap.js";
+export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOptions, type RepoMapResult } from "./core/repomap/repomap.js";
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";

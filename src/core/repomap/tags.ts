@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
@@ -12,7 +11,27 @@ import { Language, Parser } from "web-tree-sitter";
 
 export type Tag = { file: string; line: number; name: string; kind: "def" | "ref" };
 
-const require_ = createRequire(import.meta.url);
+/** wasm 资源目录。bundler 环境（Next 等）下包会被打卷、createRequire 被 shim，
+ *  相对包路径解析必失败——消费方在那种环境下用 setWasmDirs 注入真实目录
+ *  （如 require.resolve 包后取 dirname）；Node 直跑用默认 resolve 路径。 */
+let wasmDirs: { runtime?: string; grammar?: string } = {};
+
+export function setWasmDirs(dirs: { runtime?: string; grammar?: string }): void {
+  wasmDirs = { ...dirs };
+  parserInit = null; // 已初始化的 Parser 绑定旧 locateFile，重置以让新目录生效
+  languageCache.clear();
+}
+
+function nodeRequire(): NodeRequire {
+  // getBuiltinModule 是运行时真 API，不会被 bundler shim；顶层 createRequire
+  // 在 bundle 里可能是空壳，故这里动态取并 fallback
+  const mod = (process as NodeJS.Process).getBuiltinModule?.("node:module");
+  const createRequireFn = mod?.createRequire;
+  if (typeof createRequireFn !== "function") {
+    throw new Error("无法获取 node:module.createRequire（bundler 环境请用 setWasmDirs 注入 wasm 目录）");
+  }
+  return createRequireFn(path.join(process.cwd(), "index.js"));
+}
 
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", "dist", "build", "out", "coverage",
@@ -45,6 +64,7 @@ const parserByLang = new Map<string, Parser>();
 function pkgDir(moduleName: string): string {
   // 包 exports 各有缺口（web-tree-sitter 不暴露 wasm/package.json 子路径，
   // tree-sitter-wasms 的 main 坏了），双策略：先 package.json 锚点，fallback 主入口
+  const require_ = nodeRequire();
   try {
     return path.dirname(require_.resolve(`${moduleName}/package.json`));
   } catch {
@@ -52,11 +72,19 @@ function pkgDir(moduleName: string): string {
   }
 }
 
+function runtimeWasmDir(): string {
+  return wasmDirs.runtime ?? pkgDir("web-tree-sitter");
+}
+
+function grammarWasmDir(): string {
+  return wasmDirs.grammar ?? path.join(pkgDir("tree-sitter-wasms"), "out");
+}
+
 function ensureParserInit(): Promise<void> {
   parserInit ??= Parser.init({
     locateFile(scriptName: string) {
       // web-tree-sitter 的运行时 wasm（tree-sitter.wasm）随包分发
-      return path.join(pkgDir("web-tree-sitter"), scriptName);
+      return path.join(runtimeWasmDir(), scriptName);
     },
   });
   return parserInit;
@@ -67,8 +95,7 @@ async function languageFor(wasmFile: string): Promise<Language> {
   if (cached) return cached;
   const pending = (async () => {
     await ensureParserInit();
-    const wasmPath = path.join(pkgDir("tree-sitter-wasms"), "out", wasmFile);
-    return Language.load(wasmPath);
+    return Language.load(path.join(grammarWasmDir(), wasmFile));
   })();
   languageCache.set(wasmFile, pending);
   return pending;
@@ -128,8 +155,11 @@ export async function extractTags(relFile: string, absFile: string): Promise<Tag
     parser.setLanguage(lang);
     return collectTags(relFile, content, spec);
   } catch (error) {
+    // 抽取失败必须向编排层报错（而非静默空数组）：空结果会被 mtime 缓存、
+    // 污染后续调用；由编排层决定跳过与重试。Next 等 bundler 环境下 wasm
+    // 解析可能失败（import.meta.url 被重写），用 serverExternalPackages 解决。
     if (process.env.ZMZAI_REPOMAP_DEBUG) console.error("[repomap] extract failed:", error);
-    return [];
+    throw error instanceof Error ? error : new Error(String(error));
   }
 }
 
