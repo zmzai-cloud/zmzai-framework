@@ -186,6 +186,8 @@ export const bashTool: ToolDef = {
       command: { program, args: allArgs, ...(args.cwd ? { cwd: args.cwd } : {}), ...(args.env ? { env: args.env } : {}) },
       snapshot,
     });
+    // 批量新文件（node_modules 等）已由 sandbox 直接 fs 回写工作区并从
+    // artifacts 里剔除，此处无需再限流；workspaceContent 样本走版本化写入。
     for (const artifact of result.artifacts) {
       if (artifact.workspaceContent !== undefined) {
         const written = await ctx.workspace.write({

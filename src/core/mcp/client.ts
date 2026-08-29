@@ -11,6 +11,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 const PROTOCOL_VERSION = "2024-11-05";
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+/** 单个 stdio server 累计 stdout 上限（P0 隔离）：超出视为失控/恶意，杀进程。
+ *  正常 JSON-RPC 流量远小于该值；防的是疯狂刷屏把宿主内存打爆。 */
+const MAX_STREAM_BYTES = 64 * 1024 * 1024;
 
 export type McpToolInfo = {
   name: string;
@@ -48,6 +51,9 @@ export type McpClientOptions = {
   cwd?: string;
   /** 追加到子进程环境的基础变量（在 server env 之前合并，可被覆盖）。 */
   baseEnv?: Record<string, string>;
+  /** stdio 命令白名单（P0 隔离）：配置后仅允许白名单内的可执行名启动。
+   *  undefined/空数组 = 不限制。匹配对象是 spec.command 的 basename。 */
+  allowedCommands?: string[];
 };
 
 /** 与 PluginMcpServer 的 stdio 形态解耦的最小入参，方便宿主直接构造。 */
@@ -72,6 +78,8 @@ export class McpStdioClient {
   #onRequest?: (method: string, params: unknown) => unknown | undefined | Promise<unknown | undefined>;
   #closed = false;
 
+  #stdoutBytes = 0;
+
   constructor(spec: StdioServerSpec, opts: McpClientOptions = {}) {
     this.#spec = spec;
     this.#opts = {
@@ -79,6 +87,7 @@ export class McpStdioClient {
       connectTimeoutMs: opts.connectTimeoutMs ?? 15_000,
       cwd: opts.cwd,
       baseEnv: opts.baseEnv,
+      allowedCommands: opts.allowedCommands,
     };
   }
 
@@ -89,6 +98,14 @@ export class McpStdioClient {
   /** 启动子进程并完成 initialize 握手。失败时保证子进程被回收后抛错。 */
   async start(): Promise<void> {
     if (this.connected) return;
+    // 白名单校验（P0）：basename 精确匹配，防 mcp.json 里的任意可执行路径
+    const allowed = this.#opts.allowedCommands;
+    if (allowed && allowed.length > 0) {
+      const base = this.#spec.command.split("/").pop()!.split("\\").pop()!;
+      if (!allowed.includes(base)) {
+        throw new Error(`MCP server 命令不在白名单内：${this.#spec.command}（允许：${allowed.join(", ")}）`);
+      }
+    }
     const base = this.#opts.baseEnv ?? Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
     // Next.js 的类型增广把 ProcessEnv.NODE_ENV 声明为必填窄类型，而运行时 env 一定继承自 process.env（含 NODE_ENV），此处断言仅为消除类型误报。
     const env = { ...base, ...this.#spec.env } as NodeJS.ProcessEnv;
@@ -99,6 +116,9 @@ export class McpStdioClient {
         cwd: this.#spec.cwd ?? this.#opts.cwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        // posix 下独立进程组：dispose 时整组回收，防 server 自行 fork 的子进程泄漏
+        detached: process.platform !== "win32",
       });
     } catch (error) {
       throw new Error(`MCP server 进程无法启动：${(error as Error).message}`);
@@ -106,7 +126,15 @@ export class McpStdioClient {
     this.#child = child;
 
     child.stdout!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk: string) => this.#consume(chunk));
+    child.stdout!.on("data", (chunk: string) => {
+      this.#stdoutBytes += Buffer.byteLength(chunk);
+      if (this.#stdoutBytes > MAX_STREAM_BYTES) {
+        this.#disposeChild();
+        this.#failAll(new Error(`MCP server 输出超过累计上限（${Math.floor(MAX_STREAM_BYTES / 1024 / 1024)}MB），已强制终止`));
+        return;
+      }
+      this.#consume(chunk);
+    });
     // stderr 只做环形摘要收集，便于把启动失败原因带给调用方。
     const stderrTail: string[] = [];
     child.stderr!.setEncoding("utf8");
@@ -272,9 +300,25 @@ export class McpStdioClient {
       /* already gone */
     }
     if (child.exitCode === null) {
-      child.kill("SIGTERM");
+      // 进程组整组回收（spawn detached 时 child.pid 即组长的 pgid）
+      const killGroup = () => {
+        try {
+          if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
+          else child.kill("SIGTERM");
+        } catch {
+          child.kill("SIGTERM");
+        }
+      };
+      killGroup();
       setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
+        if (child.exitCode === null) {
+          try {
+            if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+            else child.kill("SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
+        }
       }, 2000).unref();
     }
   }

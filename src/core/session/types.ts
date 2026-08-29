@@ -5,7 +5,10 @@ import type { Ruleset } from "../permission/ruleset.js";
 
 export type ModelRef = { providerId: string; modelId: string };
 
-export type QueuedPrompt = { text: string; agent?: string; enqueuedAt: string };
+/** 推理力度档位（relay reasoning_effort）：off = 不发送该字段（默认，对所有模型安全）。 */
+export type ThinkingEffort = "off" | "minimal" | "low" | "medium" | "high";
+
+export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; enqueuedAt: string };
 
 export type SessionInfo = {
   id: string; // ses_...

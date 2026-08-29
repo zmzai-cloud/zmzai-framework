@@ -13,7 +13,7 @@ import { PartProjector, serializeEmit } from "./pi-bridge.js";
 import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
 import { newPartId, newSessionId } from "../session/ids.js";
-import type { ModelRef, Part, SessionInfo } from "../session/types.js";
+import type { ModelRef, Part, SessionInfo, ThinkingEffort } from "../session/types.js";
 import { adaptAnyTool, permissionForCall } from "../tools/adapter.js";
 import { builtinTools } from "../tools/builtins.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -31,6 +31,16 @@ import { noopSandboxExecutor } from "../../adapters/index.js";
  *
  *  M5: fully storage/backend-agnostic. All product surfaces (model, sandbox,
  *  workspace files, event log, lease) are injected. */
+
+export type { ThinkingEffort } from "../session/types.js";
+
+export type PromptInput = {
+  text: string;
+  agent?: string;
+  model?: ModelRef;
+  images?: readonly { url: string; mediaType: string }[];
+  effort?: ThinkingEffort;
+};
 
 export type RunnerDeps = {
   store: SessionStore;
@@ -190,12 +200,12 @@ export class SessionRunner {
     await this.deps.leaseStore.clear(sessionId).catch(() => undefined);
   }
 
-  async prompt(sessionId: string, input: { text: string; agent?: string; model?: ModelRef; images?: readonly { url: string; mediaType: string }[] }): Promise<{ queued: boolean }> {
+  async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean }> {
     const session = await this.deps.store.getSession(sessionId);
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
     if (activeRuns.has(sessionId)) {
-      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), enqueuedAt: new Date().toISOString() });
+      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), enqueuedAt: new Date().toISOString() });
       return { queued: true };
     }
 
@@ -313,7 +323,7 @@ export class SessionRunner {
     }
   }
 
-  private async runLoop(session: SessionInfo, input: { text: string; agent?: string; model?: ModelRef; images?: readonly { url: string; mediaType: string }[] }): Promise<void> {
+  private async runLoop(session: SessionInfo, input: PromptInput): Promise<void> {
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -387,10 +397,9 @@ export class SessionRunner {
       initialState: {
         systemPrompt: agentInfo?.prompt ?? "",
         model: this.deps.modelFor(model),
-        // NOTE: deliberately NOT setting thinkingLevel here. The relay backend
-        // rejects `reasoning_effort` in its request schema (400 INVALID_BODY),
-        // so any non-"off" thinking level breaks every model call. If reasoning
-        // output is desired later, the relay must accept the field first.
+        // 推理力度（P1-8 复活）：relay 现已按模型白名单接受 reasoning_effort；
+        // 仅当调用方显式选择且非 off 时下发（默认不设 = 完全不带该字段）。
+        ...(input.effort && input.effort !== "off" ? { thinkingLevel: input.effort } : {}),
         tools: piTools,
         messages: history,
       },
@@ -603,7 +612,7 @@ export class SessionRunner {
     const next = await this.deps.store.dequeuePrompt(session.id);
     if (next) {
       const latest = await this.deps.store.getSession(session.id);
-      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}) });
+      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}) });
     }
   }
 

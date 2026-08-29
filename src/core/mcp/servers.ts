@@ -43,12 +43,18 @@ function summarizeArgs(args: Record<string, unknown>): string {
 
 type ConnectOutcome = { kind: "ok"; client: McpClientLike; tools: McpToolInfo[] } | { kind: "error"; message: string };
 
-async function connectOne(entry: McpServerEntry, opts: { connectTimeoutMs?: number }): Promise<ConnectOutcome> {
+export type McpPoolOptions = {
+  connectTimeoutMs?: number;
+  /** stdio 命令白名单（P0 隔离）：透传给 McpStdioClient，basename 匹配。 */
+  allowedCommands?: string[];
+};
+
+async function connectOne(entry: McpServerEntry, opts: McpPoolOptions): Promise<ConnectOutcome> {
   let client: McpClientLike;
   if (entry.spec.type === "stdio") {
     const stdio = new McpStdioClient(
       { command: entry.spec.command, args: entry.spec.args, env: entry.spec.env, cwd: entry.spec.cwd },
-      { connectTimeoutMs: opts.connectTimeoutMs },
+      { connectTimeoutMs: opts.connectTimeoutMs, allowedCommands: opts.allowedCommands },
     );
     client = stdio;
   } else {
@@ -72,7 +78,7 @@ async function startHandshake(_spec: PluginMcpServer, client: McpClientLike): Pr
   if (typeof withStart.start === "function") await withStart.start();
 }
 
-export async function startMcpServers(entries: McpServerEntry[], opts: { connectTimeoutMs?: number } = {}): Promise<McpPoolResult> {
+export async function startMcpServers(entries: McpServerEntry[], opts: McpPoolOptions = {}): Promise<McpPoolResult> {
   const clients = new Map<string, McpClientLike>();
   const defs: ExternalToolDef[] = [];
   const settled = await Promise.allSettled(entries.map((entry) => connectOne(entry, opts)));

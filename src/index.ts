@@ -3,10 +3,11 @@
  *  Assemble with createServer() (or wire SessionRunner directly). */
 
 // core: session
-export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo, SessionStatus, ModelRef, ToolState } from "./core/session/types.js";
+export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo, SessionStatus, ModelRef, ToolState, ThinkingEffort } from "./core/session/types.js";
 export type { SessionStore } from "./core/session/store.js";
 export { newSessionId, newMessageId, newPartId, newPermissionRequestId, newEventId } from "./core/session/ids.js";
 export { createJsonlSessionStore } from "./core/session/jsonl-store.js";
+export { createSqliteSessionStore } from "./core/session/sqlite-store.js";
 
 // core: events
 export type { FrameworkEvent, FrameworkEventType, PersistedFrameworkEvent, TodoItem } from "./core/events/manifest.js";
@@ -33,7 +34,7 @@ export type { ParsedAgentPlugin, PluginFileSystem, PluginManifest, PluginMcpServ
 export { McpStdioClient } from "./core/mcp/client.js";
 export type { McpToolInfo, McpCallResult, StdioServerSpec, McpClientOptions } from "./core/mcp/client.js";
 export { startMcpServers } from "./core/mcp/servers.js";
-export type { McpServerEntry, McpServerStatus, McpPoolResult } from "./core/mcp/servers.js";
+export type { McpServerEntry, McpServerStatus, McpPoolResult, McpPoolOptions } from "./core/mcp/servers.js";
 export { McpStreamableHttpClient, McpSseClient, createMcpHttpClient, createSseParser } from "./core/mcp/http-client.js";
 export type { McpClientLike } from "./core/mcp/http-client.js";
 
@@ -52,7 +53,7 @@ export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSess
 export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 
 // core: runtime
-export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "./core/runtime/runner.js";
+export { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";
@@ -69,7 +70,7 @@ export type { WebSearchOptions, WebSearchResult } from "./core/tools/websearch.j
 export { applyPatchTool, parseUnifiedPatch, applyFilePatch } from "./core/tools/patch.js";
 export type { FilePatch, PatchParseResult, ApplyPatchReportEntry } from "./core/tools/patch.js";
 export { createFsWorkspaceFiles } from "./adapters/fs-workspace.js";
-export { createOpenAiModelProvider, type ProviderHeaders } from "./adapters/openai-provider.js";
+export { createOpenAiModelProvider, type ProviderHeaders, type FailoverEndpoint, type FailoverEvent } from "./adapters/openai-provider.js";
 export { createSubprocessSandbox } from "./adapters/subprocess-sandbox.js";
 
 // server
