@@ -112,7 +112,8 @@ export function createOpenAiModelProvider(input?: {
               ...(options ?? {}),
               // 占位 key：pi-ai 要求非空 apiKey（否则 throw）。relay 不校验
               // Bearer，真实鉴权靠下方自定义 fetch 注入的登录 cookie。
-              apiKey: ep?.apiKey ?? apiKey ?? "cookie-auth",
+              // 注意用 ||：apiKey 可能为空串（未配 key 且无 env），?? 不会回退。
+              apiKey: ep?.apiKey || apiKey || "cookie-auth",
               maxTokens: options?.maxTokens ?? 16_384,
               // 自定义 fetch：剥掉 SDK 自动生成的 Authorization（relay 对无效
               // Bearer 直接 401，不会回退到 cookie 登录态），再注入动态头。

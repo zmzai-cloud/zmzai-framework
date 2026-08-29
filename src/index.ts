@@ -77,3 +77,4 @@ export { createSubprocessSandbox } from "./adapters/subprocess-sandbox.js";
 
 // server
 export { createServer, type FrameworkDeps, type AgentFramework } from "./server/create-server.js";
+export { createAgentRuntime, type AgentRuntimePreset, type AgentRuntime, type AgentRuntimeWorkspace, type AgentRuntimeSandbox, type AgentRuntimeCapabilities } from "./server/create-agent-runtime.js";
