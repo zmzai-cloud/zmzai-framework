@@ -8,11 +8,10 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   release:
-    name: Changesets Version / Publish
+    name: Version & Publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +29,24 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Create release PR or publish
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          version: pnpm changeset:version
-          publish: pnpm release
-          title: Version Packages
-          commit: Version Packages
+      # 单人维护仓库：不走 changesets 的「Version Packages PR」流程（需要仓库
+      # 开启「Actions 可创建 PR」权限，org 侧默认关且 API 打不开）。改为直接
+      # version → 提交回 main → publish。无 changeset 时 version 是 no-op，
+      # git diff 为空则只跑 publish（幂等，已发布版本 no-op）。
+      - name: Version & Publish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          pnpm changeset:version
+          if git diff --quiet; then
+            echo "No version changes — publish only"
+            pnpm release
+          else
+            git add -A
+            git commit -m "chore(release): version packages [skip ci]"
+            git push origin main
+            pnpm release
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
