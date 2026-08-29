@@ -73,6 +73,27 @@ export const frameworkEventSchemas = {
     downloadUrl: z.string(),
     previewUrl: z.string().optional(),
   }),
+  // 子代理生命周期（R3 页面联动）：started/step 以子会话为作用域发布到父会话
+  // 事件流（runner 桥接），UI 投影成可展开的子代理卡片。step 只带工具调用
+  // 摘要，不含全量输出——子代理工具结果绝不进父消息流。
+  "subagent.started": z.object({
+    id: z.string(), // childSessionId
+    agent: z.string(),
+    task: z.string(),
+    parentSessionId: z.string(),
+  }),
+  "subagent.step": z.object({
+    id: z.string(),
+    tool: z.string(),
+    title: z.string().optional(),
+    state: z.enum(["running", "completed", "error"]).optional(),
+  }),
+  "subagent.finished": z.object({
+    id: z.string(),
+    state: z.enum(["completed", "error"]),
+    durationMs: z.number().optional(),
+    toolCalls: z.number().optional(),
+  }),
 } as const;
 
 export type FrameworkEventType = keyof typeof frameworkEventSchemas;
