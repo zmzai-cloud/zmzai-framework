@@ -34,4 +34,4 @@ pnpm run build       # tsc -p tsconfig.build.json → dist/
 
 ## 版本策略
 
-独立版本号（当前 0.1.x），近期将引入 changesets；本次架构升级（repo map / 入口截流 / subagent）各成一个 minor。
+[changesets](./.changeset/README.md) 管理：feature → minor，fix → patch。合入 main 前跑 `pnpm changeset` 提交变更集；Release workflow 自动汇总版本、开 "Version Packages" PR，合并后自动 build + `npm publish` + 打 tag。
