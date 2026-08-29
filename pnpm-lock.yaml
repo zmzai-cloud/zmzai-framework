@@ -18,8 +18,8 @@ importers:
         specifier: ^0.1.13
         version: 0.1.13
       web-tree-sitter:
-        specifier: ^0.26.13
-        version: 0.26.13
+        specifier: ^0.25.8
+        version: 0.25.8
       zod:
         specifier: 4.4.3
         version: 4.4.3
@@ -826,8 +826,8 @@ packages:
     resolution: {integrity: sha512-d2JWLCivmZYTSIoge9MsgFCZrt571BikcWGYkjC1khllbTeDlGqZ2D8vD8E/lJa8WGWbb7Plm8/XJYV7IJHZZw==}
     engines: {node: '>= 8'}
 
-  web-tree-sitter@0.26.13:
-    resolution: {integrity: sha512-5bUZ7vbQ1kcondet96wzP974+JfCZDeQ7bTpacICm2nnvHpa5cO0ByRsoMcAhUP+743vpkb4m0BFlVSm+Ye9VA==}
+  web-tree-sitter@0.25.8:
+    resolution: {integrity: sha512-AOWIoUifUcpwILOI38RtfIh0X1nlMRuqmw/sMgfQko1lbQJOJQf1Mqmtjw+GLW0ewvJyWFWTqGaWy5rPfS3XDw==}
 
   why-is-node-running@2.3.0:
     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
@@ -1666,7 +1666,7 @@ snapshots:
 
   web-streams-polyfill@3.3.3: {}
 
-  web-tree-sitter@0.26.13: {}
+  web-tree-sitter@0.25.8: {}
 
   why-is-node-running@2.3.0:
     dependencies:
