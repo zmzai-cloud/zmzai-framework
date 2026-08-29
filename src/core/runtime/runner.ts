@@ -513,7 +513,17 @@ export class SessionRunner {
       return { content: [{ type: "text" as const, text: `${advisory}\n\n--- 原始工具结果 ---\n${resultText}` }] };
     };
 
+    // 流空闲看门狗：上游无响应时（模型不支持该输入如非视觉模型收图、网络挂起），
+    // runLoop 会无限挂起，用户端表现为「卡住」。任意 agent 事件喂狗；
+    // 超过阈值未喂则发布 session.error 并 abort，让 UI 得到明确反馈而非永久等待。
+    const STREAM_IDLE_TIMEOUT_MS = 120_000;
+    let lastStreamActivityAt = Date.now();
+    const feedStreamWatchdog = () => {
+      lastStreamActivityAt = Date.now();
+    };
+
     agent.subscribe((event) => {
+      feedStreamWatchdog();
       switch (event.type) {
         case "message_start":
           if (event.message.role === "assistant") projector.onAssistantStart(emit);
@@ -538,6 +548,15 @@ export class SessionRunner {
           break;
       }
     });
+    const streamWatchdog = setInterval(() => {
+      if (Date.now() - lastStreamActivityAt < STREAM_IDLE_TIMEOUT_MS) return;
+      lastStreamActivityAt = Date.now(); // 只触发一次，错误路径会 abort 收尾
+      void this.publish(
+        { type: "session.error", data: { name: "StreamIdleTimeout", message: `上游 ${STREAM_IDLE_TIMEOUT_MS / 1000}s 无响应，已中止本次运行（模型可能不支持该输入，如非视觉模型收到图片；可切换模型重试）` } },
+        session.id,
+      );
+      abortController.abort();
+    }, 15_000);
 
     await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
@@ -599,6 +618,7 @@ export class SessionRunner {
         session.id,
       );
     } finally {
+      clearInterval(streamWatchdog);
       activeRuns.delete(session.id);
       engine.dispose();
       await this.clearLease(session.id);
