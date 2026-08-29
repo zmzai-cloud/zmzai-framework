@@ -1,6 +1,7 @@
 {
   "name": "@zmzai/agent-framework",
   "version": "0.2.0",
+  "packageManager": "pnpm@10.34.5",
   "description": "PI-based agent framework — sessions, permissions, tools, runner, events (OpenCode-style).",
   "type": "module",
   "main": "./dist/index.js",
