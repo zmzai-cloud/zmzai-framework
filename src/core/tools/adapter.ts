@@ -99,8 +99,31 @@ export function pruneOutput(text: string): { text: string; truncated: boolean; o
   const tailStart = text.length - fittedTail.length;
   const tail = text.slice(Math.max(tailStart, head.length));
   const omitted = text.slice(head.length, Math.max(tailStart, head.length));
-  const marker = `\n\n…[输出过长已裁剪：省略 ${Buffer.byteLength(omitted, "utf8")} 字节 / ${omitted.split("\n").length} 行，保留头尾]…\n\n`;
+  const marker = `\n\n…[输出过长已裁剪：省略 ${Buffer.byteLength(omitted, "utf8")} 字节 / ${omitted.split("\n").length} 行，保留头尾；全文在 outputPath]…\n\n`;
   return { text: head + marker + tail, truncated: true, omittedBytes: Buffer.byteLength(omitted, "utf8") };
+}
+
+/** 截流落盘（R2，Codex 式入口截流的补全）：完整原文写入 workspace 的
+ *  .zmzai/outputs/<sessionId>/<toolCallId>.log，模型后续可用 read 工具按需
+ *  取回被省略的中间内容。落盘失败静默降级——只保留 truncated 元数据，
+ *  绝不因审计落盘阻塞工具主链路。 */
+async function persistTruncatedOutput(
+  ctx: ToolContext,
+  toolCallId: string,
+  fullText: string,
+): Promise<string | null> {
+  try {
+    const path = `.zmzai/outputs/${ctx.sessionId}/${toolCallId}.log`;
+    const written = await ctx.workspace.write({
+      path,
+      content: fullText,
+      author: "agent",
+      summary: "工具输出全文（超限截流落盘）",
+    });
+    return written ? path : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Adapts a framework ToolDef into a PI AgentTool (spec §7.1):
@@ -139,17 +162,22 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
       }
       // 策略分流（01-trim）：failed 结果走失败日志剪裁，其余走 head+tail。
       // 两条链路的返回形状不同（trimmed/truncated），在这里归一化。
+      const callId = toolCallId || `call-${Date.now()}`;
       const outcome = (result.metadata as Record<string, unknown> | undefined)?.outcome;
       const failedTrim = outcome === "failed" ? trimFailureOutput(result.output) : null;
       const pruned = failedTrim
         ? { text: failedTrim.text, truncated: failedTrim.trimmed, omittedBytes: failedTrim.omittedBytes }
         : pruneOutput(result.output);
+      const outputPath = pruned.truncated ? await persistTruncatedOutput(ctx, callId, result.output) : null;
+      // 占位路径换成真实 workspace 路径，模型可直接用 read 工具取回全文
+      const outputText = outputPath ? pruned.text.replace("全文在 outputPath", `全文在 workspace 文件 ${outputPath}`) : pruned.text;
       return {
-        content: [{ type: "text" as const, text: pruned.text }],
+        content: [{ type: "text" as const, text: outputText }],
         details: {
           title: result.title,
           ...(result.metadata ?? {}),
           ...(pruned.truncated ? { truncated: true, omittedBytes: pruned.omittedBytes } : {}),
+          ...(outputPath ? { outputPath } : {}),
         },
       };
     },
@@ -176,17 +204,21 @@ export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): Agent
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(message.length > 8_000 ? trimFailureOutput(message).text : message);
       }
+      const callId = toolCallId || `call-${Date.now()}`;
       const outcome = (result.metadata as Record<string, unknown> | undefined)?.outcome;
       const failedTrim = outcome === "failed" ? trimFailureOutput(result.output) : null;
       const pruned = failedTrim
         ? { text: failedTrim.text, truncated: failedTrim.trimmed, omittedBytes: failedTrim.omittedBytes }
         : pruneOutput(result.output);
+      const outputPath = pruned.truncated ? await persistTruncatedOutput(ctx, callId, result.output) : null;
+      const outputText = outputPath ? pruned.text.replace("全文在 outputPath", `全文在 workspace 文件 ${outputPath}`) : pruned.text;
       return {
-        content: [{ type: "text" as const, text: pruned.text }],
+        content: [{ type: "text" as const, text: outputText }],
         details: {
           title: result.title,
           ...(result.metadata ?? {}),
           ...(pruned.truncated ? { truncated: true, omittedBytes: pruned.omittedBytes } : {}),
+          ...(outputPath ? { outputPath } : {}),
         },
       };
     },

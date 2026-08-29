@@ -94,6 +94,55 @@ describe("adaptTool", () => {
     expect(text).toContain("输出过长已裁剪");
   });
 
+  it("persists the full output to the workspace on truncation (R2)", async () => {
+    const ctx = fakeContext();
+    (ctx.workspace.write as ReturnType<typeof vi.fn>).mockResolvedValue({ revisionId: "r1", diff: "" });
+    const bigTool: ToolDef = {
+      ...echoTool,
+      id: "big",
+      parameters: z.object({}),
+      permission: () => null,
+      async execute() {
+        return { title: "大输出", output: `HEAD${"x".repeat(60 * 1024)}TAIL` };
+      },
+    };
+    const tool = adaptTool(bigTool, ctx);
+    const result = await tool.execute("call_log", {});
+    // 完整原文落盘到 .zmzai/outputs/<sessionId>/<toolCallId>.log
+    expect(ctx.workspace.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: ".zmzai/outputs/ses_1/call_log.log",
+        author: "agent",
+      }),
+    );
+    const writtenArg = (ctx.workspace.write as ReturnType<typeof vi.fn>).mock.calls[0][0] as { content: string };
+    expect(writtenArg.content.startsWith("HEAD")).toBe(true);
+    expect(writtenArg.content.endsWith("TAIL")).toBe(true);
+    // 裁剪标记回填真实路径，details 携带 outputPath
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain(".zmzai/outputs/ses_1/call_log.log");
+    expect(result.details).toMatchObject({ truncated: true, outputPath: ".zmzai/outputs/ses_1/call_log.log" });
+  });
+
+  it("degrades silently when output persistence fails", async () => {
+    const ctx = fakeContext();
+    (ctx.workspace.write as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("磁盘满了"));
+    const bigTool: ToolDef = {
+      ...echoTool,
+      id: "big",
+      parameters: z.object({}),
+      permission: () => null,
+      async execute() {
+        return { title: "大输出", output: "x".repeat(60 * 1024) };
+      },
+    };
+    const tool = adaptTool(bigTool, ctx);
+    const result = await tool.execute("call_fail", {});
+    // 落盘失败不影响主链路：结果照常返回，只是没有 outputPath
+    expect(result.details).toMatchObject({ truncated: true });
+    expect((result.details as Record<string, unknown>).outputPath).toBeUndefined();
+  });
+
   it("propagates tool execution errors", async () => {
     const failTool: ToolDef = { ...echoTool, parameters: z.object({}), permission: () => null, async execute() { throw new Error("爆炸"); } };
     const tool = adaptTool(failTool, fakeContext());
