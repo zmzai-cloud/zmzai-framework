@@ -21,7 +21,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:watch": "tsc -p tsconfig.build.json --watch"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",
@@ -29,6 +30,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/node": "^26.4.0",
     "typescript": "5.9.3",
     "vitest": "^4.1.10"
   },
