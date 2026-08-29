@@ -122,8 +122,11 @@ export async function* subscribeEventLog(log: EventLog, sessionId: string, optio
   }
 }
 
-/** In-process live fan-out registry shared by subscribeEventLog consumers. */
-const listeners = new Map<string, Set<LiveListener>>();
+/** In-process live fan-out registry shared by subscribeEventLog consumers.
+ *  挂在 globalThis：Next dev 热重载会替换模块实例，而 runner 经 globalThis
+ *  缓存的 runtime 继续用旧实例 notify——listeners 必须跨重载共享，否则
+ *  live fan-out 静默失效，订阅端退化为 1s 轮询（消息 ~1-2s 才回显）。 */
+const listeners = ((globalThis as { __zmzaiEventListeners?: Map<string, Set<LiveListener>> }).__zmzaiEventListeners ??= new Map<string, Set<LiveListener>>());
 
 /** Notifies live subscribers (called by framework when an event is appended —
  *  the runner does this after EventLog.append). */
