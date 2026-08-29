@@ -115,7 +115,9 @@ describe("adaptTool", () => {
         author: "agent",
       }),
     );
-    const writtenArg = (ctx.workspace.write as ReturnType<typeof vi.fn>).mock.calls[0][0] as { content: string };
+    const firstCall = (ctx.workspace.write as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { content: string } | undefined;
+    expect(firstCall).toBeDefined();
+    const writtenArg = firstCall!;
     expect(writtenArg.content.startsWith("HEAD")).toBe(true);
     expect(writtenArg.content.endsWith("TAIL")).toBe(true);
     // 裁剪标记回填真实路径，details 携带 outputPath

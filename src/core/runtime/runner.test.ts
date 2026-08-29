@@ -501,6 +501,30 @@ describe("SessionRunner", () => {
     }
   });
 
+  it("spawnSubagent publishes started/step/finished events to the parent stream", async () => {
+    const { runner, store, published } = makeHarness([]);
+    const registry = new AgentRegistry();
+    const parent = await makeSession(store);
+    type SpawnFn = (parent: SessionInfo, input: { description: string; prompt: string; subagentType: string }, registry: AgentRegistry, engine: never) => Promise<{ childSessionId: string }>;
+    const permissionEngine = { ask: async () => "once" } as never;
+    await (runner as unknown as { spawnSubagent: SpawnFn })
+      .spawnSubagent(parent, { description: "分析模块", prompt: "分析 src 结构", subagentType: "general" }, registry, permissionEngine)
+      .catch(() => null);
+    const types = published.map((event) => event.type);
+    // started 必发；finished 无论成功/失败都必须收口（幂等收口，父流不悬挂）
+    expect(types.filter((t) => t === "subagent.started")).toHaveLength(1);
+    expect(types.filter((t) => t === "subagent.finished")).toHaveLength(1);
+    // 事件投递到父会话流，且 id 一致
+    const started = published.find((event) => event.type === "subagent.started") as { data: { parentSessionId: string; agent: string; task: string } };
+    expect(started.data.parentSessionId).toBe(parent.id);
+    expect(started.data.agent).toBe("general");
+    expect(started.data.task).toBe("分析模块");
+    const finished = published.find((event) => event.type === "subagent.finished") as { data: { state: string; durationMs: number; toolCalls: number } };
+    expect(["completed", "error"]).toContain(finished.data.state);
+    expect(typeof finished.data.durationMs).toBe("number");
+    expect(typeof finished.data.toolCalls).toBe("number");
+  });
+
   it("task tool end-to-end: parent spawns a subagent that completes and returns its summary", async () => {
     const { runner, store, published: harness } = makeHarness([
       fauxAssistantMessage([fauxToolCall("task", { description: "分析模块", prompt: "分析 src 目录结构", subagent_type: "general" })]),

@@ -658,17 +658,46 @@ export class SessionRunner {
       ...(subagent.writePaths?.length ? { writePaths: subagent.writePaths } : {}),
     });
 
+    // 事件桥接（R3，opencode 式页面联动）：子代理生命周期发到父会话事件流，
+    // UI 可实时展示子代理的执行进度而无需订阅子会话。
+    const startedAt = Date.now();
+    let toolCalls = 0;
+    await this.publish(
+      { type: "subagent.started", data: { id: childSession.id, agent: input.subagentType, task: input.description, parentSessionId: parent.id } },
+      parent.id,
+    );
+
     try {
       // Run the child with a FRESH runner (not this instance's nested runLoop):
       // reusing runLoop here would deadlock on the shared in-process state and
       // the parent's event chain. A dedicated runner owns the child's loop.
-      const childRunner = new SessionRunner(this.deps);
+      // 附加 step 桥接钩子：子会话每次工具调用完成 → subagent.step 事件。
+      const stepHook: LifecycleHook = {
+        name: "subagent-step-bridge",
+        onAfterToolCall: async ({ sessionId, tool, isError, title }) => {
+          if (sessionId !== childSession.id) return;
+          toolCalls += 1;
+          await this.publish(
+            { type: "subagent.step", data: { id: childSession.id, tool, title, state: isError ? "error" : "completed" } },
+            parent.id,
+          );
+        },
+      };
+      const childRunner = new SessionRunner({ ...this.deps, hooks: [...(this.deps.hooks ?? []), stepHook] });
       await childRunner.runLoop(childSession, { text: input.prompt, agent: input.subagentType });
       const summary = await this.lastAssistantText(childSession.id);
       await this.recordSubtask(parent, { prompt: input.prompt, description: input.description, agent: input.subagentType, childSessionId: childSession.id });
+      await this.publish(
+        { type: "subagent.finished", data: { id: childSession.id, state: "completed", durationMs: Date.now() - startedAt, toolCalls } },
+        parent.id,
+      );
       return { childSessionId: childSession.id, summary: summary || "（子代理无文本输出）", state: "completed" };
     } catch (error) {
       await this.recordSubtask(parent, { prompt: input.prompt, description: input.description, agent: input.subagentType, childSessionId: childSession.id });
+      await this.publish(
+        { type: "subagent.finished", data: { id: childSession.id, state: "error", durationMs: Date.now() - startedAt, toolCalls } },
+        parent.id,
+      );
       return { childSessionId: childSession.id, summary: `子代理失败：${error instanceof Error ? error.message : "未知错误"}`, state: "error" };
     }
   }
