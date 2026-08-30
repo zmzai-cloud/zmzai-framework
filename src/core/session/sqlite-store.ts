@@ -156,6 +156,12 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SessionSt
         return { info, parts: partsByMessage.get(info.id) ?? [] };
       });
     },
+    async deleteSession(id) {
+      // 级联删除：parts → messages → sessions（无外键，顺序删避免孤儿）
+      db.prepare("DELETE FROM parts WHERE session_id = ?").run(id);
+      db.prepare("DELETE FROM messages WHERE session_id = ?").run(id);
+      db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+    },
     async enqueuePrompt(sessionId, prompt: QueuedPrompt) {
       const session = getSessionRow(sessionId);
       if (!session) return 0;

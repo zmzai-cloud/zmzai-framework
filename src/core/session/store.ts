@@ -18,6 +18,11 @@ export interface SessionStore {
 
   getMessages(sessionId: string): Promise<MessageWithParts[]>;
 
+  /** Delete a session together with all its messages/parts. Optional:
+   *  backends that cannot delete may omit it — callers must feature-check
+   *  (`store.deleteSession?.(id)`). */
+  deleteSession?(id: string): Promise<void>;
+
   /** Atomically enqueue a prompt; returns the updated queue length. */
   enqueuePrompt(sessionId: string, prompt: QueuedPrompt): Promise<number>;
   /** Atomically dequeue the oldest prompt; null when empty. */

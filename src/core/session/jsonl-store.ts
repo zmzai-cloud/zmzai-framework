@@ -123,6 +123,19 @@ export function createJsonlSessionStore(options: JsonlStoreOptions): SessionStor
       result.sort((a, b) => a.info.time.created.localeCompare(b.info.time.created));
       return result;
     },
+    async deleteSession(id) {
+      await hydrate();
+      const { rm } = await import("node:fs/promises");
+      sessions.delete(id);
+      await rm(path.join(sessionsDir, `${id}.json`), { force: true });
+      for (const [map, dir] of [[messages, messagesDir], [parts, partsDir]] as const) {
+        for (const [rid, rec] of map) {
+          if (rec.sessionId !== id) continue;
+          map.delete(rid);
+          await rm(path.join(dir, `${rid}.json`), { force: true });
+        }
+      }
+    },
     async enqueuePrompt(sessionId, prompt) {
       await hydrate();
       const session = sessions.get(sessionId);
