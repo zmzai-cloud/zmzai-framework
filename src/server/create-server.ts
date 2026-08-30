@@ -40,6 +40,11 @@ export type AgentFramework = {
   /** Creates a session bound to a workspace + user, optionally with an initial
    *  prompt that starts running immediately. */
   createSession(input: { userId: string; workspaceId: string; agent?: string; model: ModelRef; prompt?: string; parentId?: string; title?: string }): Promise<SessionInfo>;
+  /** One-shot 补全原语（spec §13.2 async title generation 等）：宿主侧的
+   *  非会话型 LLM 调用（标题生成等）复用主聊天链路的 provider——
+   *  端点/鉴权/降级逻辑与聊天完全一致，无需另行接线。 */
+  modelFor(ref: ModelRef): ReturnType<ModelProvider["getModel"]>;
+  streamFor(session: SessionInfo): ReturnType<ModelProvider["streamFor"]>;
 };
 
 export function createServer(deps: FrameworkDeps): AgentFramework {
@@ -65,6 +70,8 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     store: deps.store,
     eventLog: deps.eventLog,
     registry,
+    modelFor: (ref) => deps.modelProvider.getModel(ref),
+    streamFor: (session) => deps.modelProvider.streamFor(session),
     async createSession(input) {
       return createFrameworkSession({ store: deps.store, ...input });
     },
