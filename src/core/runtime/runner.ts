@@ -526,9 +526,9 @@ export class SessionRunner {
     // 流空闲看门狗：上游无响应时（模型不支持该输入如非视觉模型收图、网络挂起），
     // runLoop 会无限挂起，用户端表现为「卡住」。任意 agent 事件喂狗；
     // 超过阈值未喂则发布 session.error 并 abort，让 UI 得到明确反馈而非永久等待。
-    // P1 软化：120s→180s——实测长工具调用（大文件检索、慢沙箱）后模型首 token
-    // 可能超过 2 分钟，120s 会误杀仍在正常推进的运行。
-    const STREAM_IDLE_TIMEOUT_MS = Number(process.env.ZMZAI_STREAM_IDLE_TIMEOUT_MS ?? 180_000);
+    // P2 裁决：180s→300s——长工具调用（大文件检索、慢沙箱）+ 模型排队首 token
+    // 叠加起来 3 分钟都可能不够，5 分钟内不应限制；可用 ZMZAI_STREAM_IDLE_TIMEOUT_MS 覆盖。
+    const STREAM_IDLE_TIMEOUT_MS = Number(process.env.ZMZAI_STREAM_IDLE_TIMEOUT_MS ?? 300_000);
     let lastStreamActivityAt = Date.now();
     const feedStreamWatchdog = () => {
       lastStreamActivityAt = Date.now();
@@ -564,7 +564,7 @@ export class SessionRunner {
       if (Date.now() - lastStreamActivityAt < STREAM_IDLE_TIMEOUT_MS) return;
       lastStreamActivityAt = Date.now(); // 只触发一次，错误路径会 abort 收尾
       void this.publish(
-        { type: "session.error", data: { name: "StreamIdleTimeout", message: `上游 ${STREAM_IDLE_TIMEOUT_MS / 1000}s 无响应，已中止本次运行（模型可能不支持该输入，如非视觉模型收到图片；可切换模型重试）` } },
+        { type: "session.error", data: { name: "StreamIdleTimeout", message: `上游 ${STREAM_IDLE_TIMEOUT_MS / 1000}s 无响应，已中止本次运行（模型可能不支持该输入，如非视觉模型收到图片）。点「继续」可在同一会话续跑；若持续超时可切换模型重试。` } },
         session.id,
       );
       abortController.abort();
