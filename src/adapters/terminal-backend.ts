@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { isAbsolute, resolve } from "node:path";
+import { chmodSync, existsSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { createRequire } from "node:module";
 
 import type { TerminalBackend } from "../core/tools/terminal.js";
@@ -34,6 +35,7 @@ function tryLoadNodePty(): NodePtyModule | null {
   try {
     // 变量名解析：框架不硬依赖 node-pty（可选原生依赖），缺失/ABI 不匹配时静默降级
     const specifier = ["node", "pty"].join("-");
+    ensureMacPtyHelperExecutable(specifier);
     const mod = requireFromModuleContext(specifier) as NodePtyModule & { default?: NodePtyModule };
     return mod.default ?? mod;
   } catch {
@@ -41,19 +43,25 @@ function tryLoadNodePty(): NodePtyModule | null {
   }
 }
 
-const requireFromModuleContext =
-  typeof import.meta?.url === "string" && import.meta.url !== "file://"
-    ? createRequire(
-        // 运行在编译后的 ESM/CJS 均可：从自身位置出发向上找最近 node_modules
-        (() => {
-          try {
-            return new URL("../adapters/", import.meta.url).href;
-          } catch {
-            return process.cwd();
-          }
-        })(),
-      )
-    : createRequire(process.cwd());
+// 必须从 framework 自己解析：被 Next/Electron 宿主导入时，process.cwd() 指向
+// Lectern 项目，无法找到 framework 的 optionalDependencies（如 node-pty）。
+const requireFromModuleContext = createRequire(import.meta.url);
+
+/**
+ * node-pty 1.1.0 的 darwin-arm64 预构建包偶尔丢失 spawn-helper 的执行位。
+ * 这会让加载正常、首次 spawn 却报 `posix_spawnp failed`，最终静默退回 pipe。
+ * Electron 打包禁用 asar，因此运行时补齐该位是安全且可复现的。
+ */
+function ensureMacPtyHelperExecutable(specifier: string): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const entry = requireFromModuleContext.resolve(specifier);
+    const helper = resolve(dirname(entry), "..", "prebuilds", `darwin-${process.arch}`, "spawn-helper");
+    if (existsSync(helper)) chmodSync(helper, 0o755);
+  } catch {
+    // 可选依赖缺失或只读安装目录时，后续常规探测会安全降级。
+  }
+}
 
 /** 宿主终端后端单例：优先真 PTY，node-pty 不可用或 spawn 探测失败时降级管道模式。
  *  首次调用即锁定后端种类（同步），session 标签从此不存在竞态。 */
