@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
 import { AgentRegistry } from "../agent/registry.js";
-import { SessionRunner, createFrameworkSession, isSessionActive, type RunnerDeps } from "../runtime/runner.js";
+import { SessionRunner, createFrameworkSession, isRetryableError, isSessionActive, type RunnerDeps } from "../runtime/runner.js";
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -257,8 +257,10 @@ describe("SessionRunner", () => {
     expect((textPart as Extract<Part, { type: "text" }> | undefined)?.text).toContain("重试后的回复");
   });
 
-  it("retries up to 3 times on repeated retryable failures before giving up", async () => {
+  it("retries up to 5 times on repeated retryable failures before giving up", { timeout: 30_000 }, async () => {
     const { runner, store, faux, published: harness } = makeHarness([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
       fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
       fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
       fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
@@ -267,15 +269,26 @@ describe("SessionRunner", () => {
     const session = await makeSession(store);
 
     await runner.prompt(session.id, { text: "生成回复" });
-    // 首次 + 最多 3 次重试 = 4 次调用。
-    await waitFor(() => faux.state.callCount >= 4);
-    await waitFor(() => publishedTypes(harness).includes("session.error"));
+    // 首次 + 最多 5 次重试 = 6 次调用；退避累计 0.5+1+2+4+8 = 15.5s，放宽等待窗口。
+    await waitFor(() => faux.state.callCount >= 6, 20_000);
+    await waitFor(() => publishedTypes(harness).includes("session.error"), 20_000);
 
-    expect(faux.state.callCount).toBe(4);
+    expect(faux.state.callCount).toBe(6);
     expect(lastStatus(harness)).toBe("idle");
     const errors = harness.filter((event) => event.type === "session.error");
     expect(errors).toHaveLength(1);
     expect((errors[0]!.data as { message?: string }).message).toContain("terminated");
+  });
+
+  it("treats rate-limit and gateway errors as retryable (P1)", async () => {
+    for (const message of ["HTTP 429 too many requests", "503 service unavailable", "502 bad gateway", "rate limit exceeded, retry after 10s"]) {
+      expect(isRetryableError(message)).toBe(true);
+    }
+    // 普通数字不误匹配（\b 边界）
+    expect(isRetryableError("输出 1429 tokens")).toBe(false);
+    // 确定性错误仍不重试
+    expect(isRetryableError("余额不足")).toBe(false);
+    expect(isRetryableError("invalid api key")).toBe(false);
   });
 
   it("does not retry deterministic errors (auth/billing)", async () => {

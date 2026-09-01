@@ -106,9 +106,11 @@ const globalRunners = globalThis as typeof globalThis & { __zmzaiFrameworkRuns?:
 const activeRuns = globalRunners.__zmzaiFrameworkRuns ?? new Map<string, ActiveRun>();
 globalRunners.__zmzaiFrameworkRuns = activeRuns;
 
-/** 上游中断类错误（F6）：模型流偶发终止/连接断开时自动重试一次，避免
- *  偶发中断直接结束任务（实测 relay 透传 "terminated"、上游断流
- *  "upstream_http2_stream_error" 等）。余额/鉴权等确定性错误不重试。 */
+/** 上游中断类错误（F6）：模型流偶发终止/连接断开时自动重试，避免偶发中断
+ *  直接结束任务（实测 relay 透传 "terminated"、上游断流
+ *  "upstream_http2_stream_error" 等）。余额/鉴权等确定性错误不重试。
+ *  P1 增强：限流/网关类（429/5xx）也按可重试处理——这类错误本质是上游
+ *  暂时不可用，与 terminated 同属"等等就好"，自动退避重试比直接报错体验好。 */
 export function isRetryableError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -120,7 +122,15 @@ export function isRetryableError(message: string): boolean {
     normalized.includes("overloaded") ||
     normalized.includes("timeout") ||
     normalized.includes("upstream") ||
-    normalized.includes("stream failed")
+    normalized.includes("stream failed") ||
+    // 限流 / 网关类（\b 防止误匹配普通数字，如 "1429 tokens"）
+    /\b429\b/.test(normalized) ||
+    /\b50[234]\b/.test(normalized) ||
+    normalized.includes("rate limit") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("bad gateway") ||
+    normalized.includes("service unavailable") ||
+    normalized.includes("internal server error")
   );
 }
 
@@ -516,7 +526,9 @@ export class SessionRunner {
     // 流空闲看门狗：上游无响应时（模型不支持该输入如非视觉模型收图、网络挂起），
     // runLoop 会无限挂起，用户端表现为「卡住」。任意 agent 事件喂狗；
     // 超过阈值未喂则发布 session.error 并 abort，让 UI 得到明确反馈而非永久等待。
-    const STREAM_IDLE_TIMEOUT_MS = 120_000;
+    // P1 软化：120s→180s——实测长工具调用（大文件检索、慢沙箱）后模型首 token
+    // 可能超过 2 分钟，120s 会误杀仍在正常推进的运行。
+    const STREAM_IDLE_TIMEOUT_MS = Number(process.env.ZMZAI_STREAM_IDLE_TIMEOUT_MS ?? 180_000);
     let lastStreamActivityAt = Date.now();
     const feedStreamWatchdog = () => {
       lastStreamActivityAt = Date.now();
@@ -575,12 +587,13 @@ export class SessionRunner {
       if (unknownSideEffect) {
         await this.publish({ type: "session.status", data: { status: "waiting_input" } }, session.id);
       } else {
-      // 自动重试（F6）：上游中断类错误（terminated/econnreset/timeout 等）
-      // 带退避重试，最多 3 次。PI 失败时会注入一条 assistant failure 占位
+      // 自动重试（F6）：上游中断类错误（terminated/econnreset/timeout/429/5xx 等）
+      // 带退避重试，最多 5 次。PI 失败时会注入一条 assistant failure 占位
       // 消息（last 是 assistant → continue() 被拒），换成合成 user 消息驱动
       // continue 重新生成；store 里同步的 failure 消息保留展示（UI 显示
-      // "出错了"有诊断价值）。退避 500ms→1s→2s 避免对上游施压。
-      const MAX_RETRIES = 3;
+      // "出错了"有诊断价值）。退避 500ms→1s→2s→4s→8s 避免对上游施压。
+      // P1：3→5 次——限流（429）场景退避窗口需要更长才有机会恢复。
+      const MAX_RETRIES = 5;
       for (let attempt = 0; attempt < MAX_RETRIES && failed && isRetryableError(failed); attempt += 1) {
         if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
         const messages = agent.state.messages;
