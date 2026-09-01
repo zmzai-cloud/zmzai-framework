@@ -29,6 +29,10 @@ export type SqliteSessionStore = SessionStore & {
   clear(sessionId: string): Promise<void>;
   listExpiredLeases(): Promise<{ sessionId: string }[]>;
   clearLeaseIfExpired(sessionId: string): Promise<boolean>;
+  /** 把 WAL 日志刷回主库并截断（Electron 优雅退出用，P2）。WAL +
+   *  synchronous=NORMAL 下已提交事务本就不丢，checkpoint 只是缩小 WAL 文件、
+   *  让进程退出前数据尽量并回主库。 */
+  checkpoint(): Promise<void>;
 };
 
 export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSessionStore {
@@ -232,6 +236,11 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       delete session.leaseExpiresAt;
       persistSession(session);
       return true;
+    },
+
+    // ---- WAL 收尾（P2）：优雅退出前把日志并回主库 ----
+    async checkpoint() {
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     },
   };
 }

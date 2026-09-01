@@ -852,6 +852,12 @@ export function isSessionActive(sessionId: string): boolean {
   return activeRuns.has(sessionId);
 }
 
+/** 当前所有 running 会话 id（Electron 优雅退出等收尾场景枚举用，P2）。
+ *  activeRuns 是模块级 globalThis 单例，跨项目/跨 runtime 共享。 */
+export function listActiveSessions(): string[] {
+  return [...activeRuns.keys()];
+}
+
 // The package runner is storage-agnostic: stores (Mongo/JSONL), event logs,
 // workspace backends and sandbox executors are all injected via RunnerDeps.
 // Products assemble them in createServer(); the CLI uses JSONL + subprocess.
