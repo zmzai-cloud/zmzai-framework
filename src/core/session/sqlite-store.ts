@@ -21,7 +21,17 @@ type SqliteStoreOptions = {
   importJsonl?: boolean;
 };
 
-export function createSqliteSessionStore(options: SqliteStoreOptions): SessionStore {
+/** SQLite store = SessionStore + 运行租约（spec §3.2）：stamp/clear 供 runner
+ *  盖章释放；listExpiredLeases/clearLeaseIfExpired 供 lease recovery 扫描。
+ *  消费方把同一实例同时传给 createServer 的 store 与 leaseStore 即完成接线。 */
+export type SqliteSessionStore = SessionStore & {
+  stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>;
+  clear(sessionId: string): Promise<void>;
+  listExpiredLeases(): Promise<{ sessionId: string }[]>;
+  clearLeaseIfExpired(sessionId: string): Promise<boolean>;
+};
+
+export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSessionStore {
   const { dataDir } = options;
   mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, "zmzai.db"));
@@ -180,6 +190,48 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SessionSt
       if (!session) return;
       session.queuedPrompts = [];
       persistSession(session);
+    },
+
+    // ---- 运行租约（spec §3.2，产品 P0）：runner 盖章/清除，lease recovery 扫描过期 ----
+    async stamp(sessionId, owner, expiresAt) {
+      const session = getSessionRow(sessionId);
+      if (!session) return;
+      session.leaseOwner = owner;
+      session.leaseExpiresAt = expiresAt.toISOString();
+      persistSession(session);
+    },
+    async clear(sessionId) {
+      const session = getSessionRow(sessionId);
+      if (!session?.leaseOwner && !session?.leaseExpiresAt) return;
+      delete session.leaseOwner;
+      delete session.leaseExpiresAt;
+      persistSession(session);
+    },
+    async listExpiredLeases() {
+      const now = Date.now();
+      const rows = db.prepare("SELECT id, json FROM sessions WHERE json LIKE '%leaseExpiresAt%'").all() as { id: string; json: string }[];
+      const expired: { sessionId: string }[] = [];
+      for (const row of rows) {
+        try {
+          const session = JSON.parse(row.json) as SessionInfo;
+          if (session.leaseOwner && session.leaseExpiresAt && Date.parse(session.leaseExpiresAt) < now) {
+            expired.push({ sessionId: row.id });
+            if (expired.length >= 50) break; // 上限：单轮恢复最多收尾 50 个
+          }
+        } catch {
+          // skip corrupt rows
+        }
+      }
+      return expired;
+    },
+    async clearLeaseIfExpired(sessionId) {
+      const session = getSessionRow(sessionId);
+      if (!session?.leaseOwner || !session.leaseExpiresAt) return false;
+      if (Date.parse(session.leaseExpiresAt) >= Date.now()) return false; // 未过期：另一个持有者赢了竞争
+      delete session.leaseOwner;
+      delete session.leaseExpiresAt;
+      persistSession(session);
+      return true;
     },
   };
 }

@@ -28,6 +28,10 @@ export type SessionInfo = {
    *  未声明则不限制。 */
   writePaths?: string[];
   queuedPrompts: QueuedPrompt[]; // FIFO for prompts submitted while running (§13.3)
+  /** 运行租约（spec §3.2）：runner 持有 run 时盖章（owner + 过期时间），run 结束清除。
+   *  进程崩溃/重启后租约遗留，lease recovery 扫描过期租约并收尾中断的运行。 */
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   time: { created: string; updated: string; archived?: string };
 };
 

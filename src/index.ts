@@ -7,13 +7,14 @@ export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo, Se
 export type { SessionStore } from "./core/session/store.js";
 export { newSessionId, newMessageId, newPartId, newPermissionRequestId, newEventId } from "./core/session/ids.js";
 export { createJsonlSessionStore } from "./core/session/jsonl-store.js";
-export { createSqliteSessionStore } from "./core/session/sqlite-store.js";
+export { createSqliteSessionStore, type SqliteSessionStore } from "./core/session/sqlite-store.js";
 
 // core: events
 export type { FrameworkEvent, FrameworkEventType, PersistedFrameworkEvent, TodoItem } from "./core/events/manifest.js";
 export { frameworkEventSchemas, parseFrameworkEvent } from "./core/events/manifest.js";
 export type { EventLog, SubscribeOptions } from "./core/events/bus.js";
 export { createMemoryEventLog, subscribeEventLog, notifyEventLogListeners } from "./core/events/bus.js";
+export { createSqliteEventLog } from "./core/events/sqlite-event-log.js";
 
 // core: permission
 export type { Action, Rule, Ruleset, PermissionConfig } from "./core/permission/ruleset.js";
