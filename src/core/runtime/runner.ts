@@ -534,6 +534,14 @@ export class SessionRunner {
       lastStreamActivityAt = Date.now();
     };
 
+    // 任务终态小结统计（N5）：工具调用数 + 编辑/写入文件去重集合。
+    // 在 tool_execution_start 累加（比事后解析 agent.state.messages 更稳——
+    // 那里 toolCall 是 AssistantMessage.content 里的块，结构复杂易漏）。
+    let summaryToolCalls = 0;
+    const summaryEditedFiles = new Set<string>();
+    // N6 长任务 checkpoint：记录最后一个工具名（中途快照用）
+    let summaryLastTool: string | undefined;
+
     agent.subscribe((event) => {
       feedStreamWatchdog();
       switch (event.type) {
@@ -550,6 +558,12 @@ export class SessionRunner {
           if (event.message.role === "assistant") projector.onAssistantEnd(emit, event.message);
           break;
         case "tool_execution_start":
+          summaryToolCalls += 1;
+          summaryLastTool = event.toolName;
+          if (event.toolName === "edit" || event.toolName === "write") {
+            const path = (event.args as { path?: unknown } | undefined)?.path;
+            if (typeof path === "string") summaryEditedFiles.add(path);
+          }
           projector.onToolExecutionStart(emit, event.toolCallId, event.toolName, event.args, toolDefs.get(event.toolName)?.label);
           break;
         case "tool_execution_update":
@@ -570,10 +584,30 @@ export class SessionRunner {
       abortController.abort();
     }, 15_000);
 
+    let runErrored = false;
+    const runStartedAt = Date.now();
+
+    // N6 长任务中途 checkpoint：运行超过阈值后周期性发布进度快照（已执行工具数 /
+    // 最后一步工具 / 耗时），崩溃/中断后前端据此提示「上次进行到哪」。终态收尾仍
+    // 由 session.summary 兜底；这里只在运行中给「中间落点」。可用
+    // ZMZAI_CHECKPOINT_INTERVAL_MS 覆盖间隔（默认 2 分钟），首次触发即从此刻起算。
+    const CHECKPOINT_INTERVAL_MS = Number(process.env.ZMZAI_CHECKPOINT_INTERVAL_MS ?? 120_000);
+    const checkpointTimer = setInterval(() => {
+      if (abortController.signal.aborted) return;
+      const elapsedMs = Date.now() - runStartedAt;
+      // 只在确实有进展时发（有工具调用），避免空跑会话也刷 checkpoint
+      if (summaryToolCalls === 0) return;
+      void this.publish(
+        {
+          type: "session.checkpoint",
+          data: { toolCalls: summaryToolCalls, lastTool: summaryLastTool, elapsedMs },
+        },
+        session.id,
+      ).catch(() => undefined);
+    }, CHECKPOINT_INTERVAL_MS);
+
     await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
-
-    let runErrored = false;
 
     try {
       projector.onUserPrompt(emit, input.text, input.images);
@@ -632,10 +666,22 @@ export class SessionRunner {
       );
     } finally {
       clearInterval(streamWatchdog);
+      clearInterval(checkpointTimer);
       activeRuns.delete(session.id);
       engine.dispose();
       await this.clearLease(session.id);
       const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
+      // 任务终态小结（N5）：终态 status 已发布后补一条 session.summary，
+      // 让「任务完成」有明确收尾（AI 一句总结 + 结构化统计）。await 保证
+      // 落库后再 resolveDone（中断/失败场景不阻塞——内部有静默降级）。
+      const summaryKind = abortController.signal.aborted ? "aborted" : runErrored ? "error" : "completed";
+      await this.summarizeRun(session, {
+        agent,
+        baseline,
+        startedAt: runStartedAt,
+        kind: summaryKind,
+        stats: { toolCalls: summaryToolCalls, editedFiles: [...summaryEditedFiles] },
+      });
       void Promise.all(fireRunEnd(this.hooks, { sessionId: session.id, agent: session.agent, ok: !runErrored, aborted: abortController.signal.aborted, workspaceId: session.workspaceId, newMessages }));
       resolveDone();
     }
@@ -753,6 +799,59 @@ export class SessionRunner {
     };
     await this.deps.store.appendPart(part).catch(() => undefined);
     await this.publish({ type: "message.part.updated", data: { part } }, parent.id);
+  }
+
+  /** 任务终态小结（N5）：run 收尾时用 summary 模型生成一句自然语言总结，
+   *  附本轮结构化统计，发布 session.summary 事件供前端渲染「任务完成卡」。
+   *  失败/中断也发（kind 区分），让 UI 的收尾永远有明确落点。生成失败或
+   *  无 summaryModel 时静默跳过（不阻塞 run 收尾）。 */
+  private async summarizeRun(
+    session: SessionInfo,
+    input: {
+      agent: Agent;
+      baseline: number;
+      startedAt: number;
+      kind: "completed" | "aborted" | "error";
+      stats: { toolCalls: number; editedFiles: string[] };
+    },
+  ): Promise<void> {
+    // 终态先落 session 记录（列表三态用，N5）——即使 summaryModel 缺失或生成
+    // 失败，lastOutcome 也要写回，保证列表能区分完成/中断/失败。
+    await this.deps.store.updateSession(session.id, { lastOutcome: input.kind }).catch(() => undefined);
+    const summaryModel = this.deps.compaction?.summaryModel ?? null;
+    if (!summaryModel) return;
+    // 本轮新增消息（baseline 之后），只取 user/assistant 文本作总结素材
+    const messages = input.agent.state.messages.slice(input.baseline);
+    const textMessages = messages.filter((m) => m.role === "user" || m.role === "assistant");
+    if (textMessages.length === 0) return;
+
+    const durationMs = Date.now() - input.startedAt;
+    const meta = { filesEdited: input.stats.editedFiles.length, toolCalls: input.stats.toolCalls, durationMs };
+
+    // 总结提示词：只描述本轮做了什么，一句/几句自然语言，不续写
+    const systemPrompt =
+      "你是任务收尾助手。根据用户本轮的任务与助手已完成的工作，写一句简短、克制的中文总结（1-2 句），" +
+      "说明「做了什么、结果如何、下一步建议」。不要客套、不要问句、不要续写任务，只输出总结正文。";
+    let text = "";
+    try {
+      const { streamOneText } = await import("./compaction.js");
+      const streamFn = this.deps.streamFnFor(session);
+      // 15s 超时兜底：summary 是收尾的锦上添花，不能因为上游慢而卡住 run 收尾。
+      text = await Promise.race([
+        streamOneText(
+          async (m, ctx) => streamFn(m, ctx as never),
+          summaryModel,
+          systemPrompt,
+          textMessages,
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve(""), 15_000)),
+      ]);
+    } catch {
+      /* 总结生成失败静默跳过 */
+    }
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    await this.publish({ type: "session.summary", data: { text: trimmed, kind: input.kind, meta } }, session.id).catch(() => undefined);
   }
 
   private async lastAssistantText(sessionId: string): Promise<string> {

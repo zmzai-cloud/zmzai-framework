@@ -32,6 +32,13 @@ export type SessionInfo = {
    *  进程崩溃/重启后租约遗留，lease recovery 扫描过期租约并收尾中断的运行。 */
   leaseOwner?: string;
   leaseExpiresAt?: string;
+  /** 最近一次 run 的终态（N5）：completed/aborted/error。run 收尾时写回，
+   *  供会话列表渲染三态（完成/中断/失败）而无需逐会话查 eventLog。 */
+  lastOutcome?: "completed" | "aborted" | "error";
+  /** 会话置顶（N6）：列表置顶展示（true 时排最前）。 */
+  pinned?: boolean;
+  /** 会话归档（N6）：归档后从默认列表隐藏（列表切换「已归档」视图查看）。 */
+  archived?: boolean;
   time: { created: string; updated: string; archived?: string };
 };
 

@@ -21,6 +21,9 @@ export const sessionInfoSchema: z.ZodType<SessionInfo> = z.object({
   model: modelRefSchema,
   permission: rulesetSchema,
   queuedPrompts: z.array(z.object({ text: z.string(), agent: z.string().optional(), enqueuedAt: z.string() })),
+  lastOutcome: z.enum(["completed", "aborted", "error"]).optional(),
+  pinned: z.boolean().optional(),
+  archived: z.boolean().optional(),
   time: z.object({ created: z.string(), updated: z.string(), archived: z.string().optional() }),
 }) as z.ZodType<SessionInfo>;
 
@@ -58,6 +61,31 @@ export const frameworkEventSchemas = {
   "session.updated": z.object({ session: sessionInfoSchema }),
   "session.status": z.object({ status: z.enum(["idle", "running", "waiting_permission", "waiting_input"]) }),
   "session.error": z.object({ name: z.string(), message: z.string() }),
+  // 任务终态小结（N5）：run 收尾时由 summary 模型生成的一句自然语言总结，
+  // 附带本轮结构化统计（编辑文件数 / 工具调用数 / 完成 todo 数 / 耗时）。
+  // 前端据此渲染「任务完成卡」，让「一个 call tool 结束」有了明确收尾。
+  "session.summary": z.object({
+    text: z.string(),
+    kind: z.enum(["completed", "aborted", "error"]),
+    meta: z
+      .object({
+        filesEdited: z.number(),
+        toolCalls: z.number(),
+        durationMs: z.number(),
+      })
+      .optional(),
+  }),
+  // 长任务中途进度快照（N6）：运行超过阈值后周期性发布，记录「已完成 todo 数 /
+  //  改过文件 / 最后一步工具 / 累计工具调用」，崩溃/中断后前端可据此提示
+  //  「上次进行到哪」，而非只剩一句「断了」。失败/中断的收尾仍由 session.summary
+  //  兜底，此事件是运行中的「中间落点」。
+  "session.checkpoint": z.object({
+    todosDone: z.number().optional(),
+    todosTotal: z.number().optional(),
+    toolCalls: z.number(),
+    lastTool: z.string().optional(),
+    elapsedMs: z.number(),
+  }),
   "message.updated": z.object({ message: messageInfoSchema }),
   "message.part.updated": z.object({ part: partSchema }),
   "message.part.delta": z.object({ messageId: z.string(), partId: z.string(), field: z.literal("text"), delta: z.string() }),

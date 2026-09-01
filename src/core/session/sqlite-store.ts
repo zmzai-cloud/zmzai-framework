@@ -33,6 +33,9 @@ export type SqliteSessionStore = SessionStore & {
    *  synchronous=NORMAL 下已提交事务本就不丢，checkpoint 只是缩小 WAL 文件、
    *  让进程退出前数据尽量并回主库。 */
   checkpoint(): Promise<void>;
+  /** 批量统计每个会话的消息数（N6 会话列表元信息用）：一条 GROUP BY 拿全量，
+   *  避免逐会话 N+1 查询。 */
+  countMessagesBySession(): Promise<Map<string, number>>;
 };
 
 export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSessionStore {
@@ -241,6 +244,14 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
     // ---- WAL 收尾（P2）：优雅退出前把日志并回主库 ----
     async checkpoint() {
       db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    },
+
+    // ---- 消息计数（N6）：会话列表元信息，一条 GROUP BY 拿全量 ----
+    async countMessagesBySession() {
+      const rows = db.prepare("SELECT session_id, COUNT(*) AS n FROM messages GROUP BY session_id").all() as { session_id: string; n: number }[];
+      const map = new Map<string, number>();
+      for (const row of rows) map.set(row.session_id, row.n);
+      return map;
     },
   };
 }
