@@ -7,6 +7,16 @@ export type ProviderHeaders =
   | Record<string, string>
   | (() => Record<string, string> | Promise<Record<string, string>>);
 
+/** 模型能力（真实上下文窗口等），由产品侧从模型目录解析。 */
+export type ModelCaps = {
+  contextWindow?: number;
+  maxTokens?: number;
+};
+
+/** 模型目录未覆盖该模型时的保守默认值（即原先硬编码的两个常量，行为不变）。 */
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
+export const DEFAULT_MAX_TOKENS = 16_384;
+
 /** 故障转移端点：主端点在首个流事件即报错时依次尝试（abort 不切）。 */
 export type FailoverEndpoint = {
   baseUrl: string;
@@ -47,6 +57,10 @@ export function createOpenAiModelProvider(input?: {
   apiKey?: string;
   defaultModel?: string;
   headers?: ProviderHeaders;
+  /** 按 modelId 查询真实模型能力（上下文窗口/最大输出）。同步形式——getModel
+   *  是同步契约，产品侧需自己缓存模型目录（如请求级灌入进程内缓存）。
+   *  未命中返回 undefined 时回落 DEFAULT_*，与不配置时行为完全一致。 */
+  modelCaps?: (modelId: string) => ModelCaps | undefined;
   failoverEndpoints?: FailoverEndpoint[];
   /** 降级发生时回调（宿主用于日志/UI 提示）。 */
   onFailover?: (event: FailoverEvent) => void;
@@ -67,17 +81,26 @@ export function createOpenAiModelProvider(input?: {
 
   return {
     getModel(ref: ModelRef) {
+      const id = ref.modelId || defaultModel;
+      // 真实窗口优先：模型目录未覆盖该 id 时回落默认值（与旧行为一致）。
+      // 解析器抛错同样回落——目录只是增强信息，绝不能阻断建会话/压缩摘要。
+      let caps: ModelCaps | undefined;
+      try {
+        caps = input?.modelCaps?.(id);
+      } catch {
+        caps = undefined;
+      }
       return {
-        id: ref.modelId || defaultModel,
-        name: ref.modelId || defaultModel,
+        id,
+        name: id,
         api: "openai-completions",
         provider: "zmzai-openai",
         baseUrl: resolveBase(),
         reasoning: false,
         input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128_000,
-        maxTokens: 16_384,
+        contextWindow: caps?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+        maxTokens: caps?.maxTokens ?? DEFAULT_MAX_TOKENS,
         // 兼容开关收紧到经典 OpenAI 字段：部分上游（含 relay 的通道）对
         // strict / stream_options 等新字段会 400，这里显式禁用。
         // supportsReasoningEffort：relay 已按模型白名单接受 reasoning_effort

@@ -53,6 +53,40 @@ describe("createOpenAiModelProvider", () => {
       const model = provider.getModel({ providerId: "x", modelId: "test" });
       expect(model.baseUrl).toBe("https://env.api.com/v1");
     });
+
+    it("uses the real context window when the model catalog covers the model", () => {
+      const provider = createOpenAiModelProvider({
+        modelCaps: (id) => (id === "long-ctx" ? { contextWindow: 1_000_000, maxTokens: 65_536 } : undefined),
+      });
+      const model = provider.getModel({ providerId: "x", modelId: "long-ctx" });
+      expect(model.contextWindow).toBe(1_000_000);
+      expect(model.maxTokens).toBe(65_536);
+    });
+
+    it("falls back to defaults when the catalog does not cover the model", () => {
+      const provider = createOpenAiModelProvider({ modelCaps: () => undefined });
+      const model = provider.getModel({ providerId: "x", modelId: "unknown" });
+      expect(model.contextWindow).toBe(128_000);
+      expect(model.maxTokens).toBe(16_384);
+    });
+
+    it("falls back per field when the catalog covers only one dimension", () => {
+      const provider = createOpenAiModelProvider({ modelCaps: () => ({ contextWindow: 200_000 }) });
+      const model = provider.getModel({ providerId: "x", modelId: "m" });
+      expect(model.contextWindow).toBe(200_000);
+      expect(model.maxTokens).toBe(16_384);
+    });
+
+    it("falls back to defaults when the caps resolver throws", () => {
+      const provider = createOpenAiModelProvider({
+        modelCaps: () => {
+          throw new Error("catalog broken");
+        },
+      });
+      const model = provider.getModel({ providerId: "x", modelId: "m" });
+      expect(model.contextWindow).toBe(128_000);
+      expect(model.maxTokens).toBe(16_384);
+    });
   });
 
   describe("streamFor", () => {

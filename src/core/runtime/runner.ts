@@ -271,6 +271,21 @@ export class SessionRunner {
     return { ok: true };
   }
 
+  /** 当前会话的压缩阈值：优先取模型目录给的真实上下文窗口，回落 runtime 级
+   *  全局配置。旧行为恒取 deps.compaction.contextWindow；模型目录未覆盖该
+   *  modelId 时 model.contextWindow 即等于该全局值，行为不变。
+   *  modelFor 抛错（宿主 provider 不认识该 ref）时同样回落，绝不阻断压缩。 */
+  private contextWindowFor(session: SessionInfo): number {
+    const fallback = this.deps.compaction?.contextWindow ?? 0;
+    try {
+      const model = this.deps.modelFor(session.model) as { contextWindow?: unknown } | null | undefined;
+      const win = model?.contextWindow;
+      return typeof win === "number" && win > 0 ? win : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   /** Builds the compaction transformContext (spec §8.3) when the runner has a
    *  summary model configured. Emits a `compaction` part on the latest
    *  assistant message so the boundary shows in the transcript. force=true
@@ -280,7 +295,7 @@ export class SessionRunner {
     const { buildCompactionTransform, streamOneText } = await import("./compaction.js");
     return buildCompactionTransform({
       enabled: true,
-      contextWindow: this.deps.compaction.contextWindow,
+      contextWindow: this.contextWindowFor(session),
       summaryModel: this.deps.compaction.summaryModel,
       ...(force ? { force: true } : {}),
       streamOne: async (model, messages) => {
