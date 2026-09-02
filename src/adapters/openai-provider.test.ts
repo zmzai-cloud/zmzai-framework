@@ -87,6 +87,35 @@ describe("createOpenAiModelProvider", () => {
       expect(model.contextWindow).toBe(128_000);
       expect(model.maxTokens).toBe(16_384);
     });
+
+    it("disables reasoning effort when the catalog does not cover the model", () => {
+      // 关键契约：目录未覆盖时不得臆造「支持」，否则 UI 假开关 → relay 400
+      const provider = createOpenAiModelProvider({ modelCaps: () => undefined });
+      const model = provider.getModel({ providerId: "x", modelId: "unknown" });
+      expect(model.compat.supportsReasoningEffort).toBe(false);
+      expect((model.thinkingLevelMap as Record<string, string | null>).high).toBeNull();
+    });
+
+    it("maps allowed efforts into thinkingLevelMap and enables the switch", () => {
+      const provider = createOpenAiModelProvider({
+        modelCaps: (id) => (id === "m" ? { allowedReasoningEfforts: ["low", "medium", "high"] } : undefined),
+      });
+      const model = provider.getModel({ providerId: "x", modelId: "m" });
+      expect(model.compat.supportsReasoningEffort).toBe(true);
+      const map = model.thinkingLevelMap as Record<string, string | null>;
+      expect(map.low).toBe("low");
+      expect(map.medium).toBe("medium");
+      expect(map.high).toBe("high");
+      expect(map.xhigh).toBeNull();
+      expect(map.max).toBeNull();
+      expect(map.minimal).toBeNull();
+    });
+
+    it("keeps the switch off when the allowed list is empty", () => {
+      const provider = createOpenAiModelProvider({ modelCaps: () => ({ allowedReasoningEfforts: [] }) });
+      const model = provider.getModel({ providerId: "x", modelId: "m" });
+      expect(model.compat.supportsReasoningEffort).toBe(false);
+    });
   });
 
   describe("streamFor", () => {

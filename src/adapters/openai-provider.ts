@@ -11,6 +11,9 @@ export type ProviderHeaders =
 export type ModelCaps = {
   contextWindow?: number;
   maxTokens?: number;
+  /** 该模型被 relay 允许的推理强度档位（reasoning_effort）。缺省表示「目录
+   *  未覆盖此维度」，由 getModel 回落保守默认（视为不支持任何档位）。 */
+  allowedReasoningEfforts?: string[];
 };
 
 /** 模型目录未覆盖该模型时的保守默认值（即原先硬编码的两个常量，行为不变）。 */
@@ -90,6 +93,16 @@ export function createOpenAiModelProvider(input?: {
       } catch {
         caps = undefined;
       }
+      // 推理强度：relay 按模型白名单接受 reasoning_effort，不在白名单内的
+      // 档位会 400 REASONING_EFFORT_NOT_ALLOWED。这里把白名单翻译成
+      // pi-ai 的 thinkingLevelMap（支持=档位名，不支持=null），让
+      // clampThinkingLevel 把用户选的档位自动钳制到可用范围内，避免 400。
+      // 目录未覆盖（caps 缺 allowedReasoningEfforts）时回落「不支持」，此时
+      // 不发 reasoning_effort（off 语义）——与 relay 对未知模型的行为一致。
+      const allowedEfforts = caps?.allowedReasoningEfforts ?? [];
+      const thinkingLevelMap = Object.fromEntries(
+        ["minimal", "low", "medium", "high", "xhigh", "max"].map((level) => [level, allowedEfforts.includes(level) ? level : null]),
+      );
       return {
         id,
         name: id,
@@ -101,16 +114,17 @@ export function createOpenAiModelProvider(input?: {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: caps?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
         maxTokens: caps?.maxTokens ?? DEFAULT_MAX_TOKENS,
+        thinkingLevelMap,
         // 兼容开关收紧到经典 OpenAI 字段：部分上游（含 relay 的通道）对
         // strict / stream_options 等新字段会 400，这里显式禁用。
-        // supportsReasoningEffort：relay 已按模型白名单接受 reasoning_effort
-        // （不支持的模型 relay 返回 400 REASONING_EFFORT_NOT_ALLOWED，UI 层
-        // 只在模型允许的档位上展示选择器）。
+        // supportsReasoningEffort：不再硬编码 true，改为「模型至少允许一个
+        // 档位」才为 true——目录未覆盖时 false，与「不发 reasoning_effort」
+        // 的 off 语义一致，杜绝「UI 假开关 → relay 400」的断层。
         compat: {
           supportsStrictMode: false,
           maxTokensField: "max_tokens",
           supportsUsageInStreaming: false,
-          supportsReasoningEffort: true,
+          supportsReasoningEffort: allowedEfforts.length > 0,
           supportsFinishReason: true,
         },
       } as never;
