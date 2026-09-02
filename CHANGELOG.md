@@ -1,5 +1,33 @@
 # @zmzai/agent-framework
 
+## 0.3.0
+
+### Minor Changes
+
+- dc554d5: 压缩阈值改用模型真实上下文窗口
+  
+  自动压缩此前固定用 runtime 级 `compaction.contextWindow`（产品侧多为硬编码 128k），
+  而产品通常持有模型目录里的真实窗口，两者脱节：长窗口模型被提前压缩、小窗口
+  模型不压缩直到上游溢出报错。
+  
+  - `createOpenAiModelProvider` 新增 `modelCaps` 选项：按 modelId 返回真实
+    `{ contextWindow, maxTokens }`，未命中（或解析器抛错）回落原默认常量
+    128k / 16k，与不配置时行为完全一致
+  - 导出 `DEFAULT_CONTEXT_WINDOW` / `DEFAULT_MAX_TOKENS` 常量供产品侧对齐
+  - runner 的 `contextWindowFor(session)` 优先取当前会话模型的 `contextWindow`，
+    取不到再回落 runtime 级配置；解析失败不阻断压缩
+- 推理力度跟随模型白名单
+  
+  此前 `getModel` 硬编码 `supportsReasoningEffort: true`，无论模型目录是否声明了
+  可用的推理档位，UI 都展示全部档位，用户选到白名单之外的档位时上游（relay）会
+  返回 `REASONING_EFFORT_NOT_ALLOWED` 400。
+  
+  - `ModelCaps` 新增 `allowedReasoningEfforts?: string[]`，产品侧从模型目录灌入
+  - `getModel` 据此构造 `thinkingLevelMap`（白名单内档位透传、其余为 `null`），
+    `supportsReasoningEffort` 改为「白名单非空」而非硬编码 `true`；目录未覆盖时
+    回落 `false`（等价 off 语义），pi-ai 的 `clampThinkingLevel` 会自动把用户所选
+    档位钳制到模型可用范围，从源头杜绝 400
+
 ## 0.2.2
 
 ### Patch Changes
