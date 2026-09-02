@@ -13,7 +13,7 @@ import { PartProjector, serializeEmit } from "./pi-bridge.js";
 import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
 import { newPartId, newSessionId } from "../session/ids.js";
-import type { ModelRef, Part, SessionInfo, ThinkingEffort } from "../session/types.js";
+import type { ModelRef, Part, SelectedSkill, SessionInfo, ThinkingEffort } from "../session/types.js";
 import { adaptAnyTool, permissionForCall } from "../tools/adapter.js";
 import { builtinTools } from "../tools/builtins.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -40,7 +40,11 @@ export type PromptInput = {
   model?: ModelRef;
   images?: readonly { url: string; mediaType: string }[];
   effort?: ThinkingEffort;
+  skill?: SelectedSkill;
 };
+
+/** Product-owned resolver. It must be session-root aware and return trusted, bounded text. */
+export type MandatorySkillResolver = (session: SessionInfo, skill: SelectedSkill) => Promise<{ context: string }>;
 
 export type RunnerDeps = {
   store: SessionStore;
@@ -81,6 +85,7 @@ export type RunnerDeps = {
   /** 长期记忆召回（spec §记忆）：run 开始时按当前 prompt 查询，返回文本
    *  则作为首条 in-memory user 消息前插（不落 store）。抛错/返回空时零影响。 */
   memoryContextFor?: (session: SessionInfo, text: string) => Promise<string | undefined>;
+  resolveMandatorySkill?: MandatorySkillResolver;
 };
 
 type ActiveRun = {
@@ -215,7 +220,7 @@ export class SessionRunner {
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
     if (activeRuns.has(sessionId)) {
-      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), enqueuedAt: new Date().toISOString() });
+      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(input.skill ? { skill: input.skill } : {}), enqueuedAt: new Date().toISOString() });
       return { queued: true };
     }
 
@@ -380,6 +385,12 @@ export class SessionRunner {
     });
 
     const projector = new PartProjector({ sessionId: session.id, agent: agentInfo?.name ?? "default", model });
+    let mandatorySkillContext = "";
+    if (input.skill) {
+      if (!this.deps.resolveMandatorySkill) throw new Error("该运行环境不支持 Skill 加载");
+      const loaded = await this.deps.resolveMandatorySkill(session, input.skill);
+      mandatorySkillContext = loaded.context;
+    }
     // Exclude task from contexts that can't nest; include for primary runs.
     const baseTools = [...(this.deps.tools ?? builtinTools), ...(this.deps.localTools ?? []), ...(resolved?.tools ?? [])];
     const toolList = session.parentId ? baseTools.filter((def) => def.id !== "task") : baseTools;
@@ -420,7 +431,7 @@ export class SessionRunner {
     const baseline = history.length;
     const agent = new Agent({
       initialState: {
-        systemPrompt: agentInfo?.prompt ?? "",
+        systemPrompt: [agentInfo?.prompt ?? "", mandatorySkillContext].filter(Boolean).join("\n\n"),
         model: this.deps.modelFor(model),
         // 推理力度（P1-8 复活）：relay 现已按模型白名单接受 reasoning_effort；
         // 仅当调用方显式选择且非 off 时下发（默认不设 = 完全不带该字段）。
@@ -625,7 +636,7 @@ export class SessionRunner {
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
 
     try {
-      projector.onUserPrompt(emit, input.text, input.images);
+      projector.onUserPrompt(emit, input.text, input.images, input.skill);
       const piImages = input.images?.map((img) => {
         const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
@@ -706,7 +717,7 @@ export class SessionRunner {
     const next = await this.deps.store.dequeuePrompt(session.id);
     if (next) {
       const latest = await this.deps.store.getSession(session.id);
-      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}) });
+      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}), ...(next.skill ? { skill: next.skill } : {}) });
     }
   }
 

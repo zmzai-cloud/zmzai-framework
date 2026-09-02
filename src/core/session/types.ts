@@ -8,7 +8,10 @@ export type ModelRef = { providerId: string; modelId: string };
 /** 推理力度档位（relay reasoning_effort）：off = 不发送该字段（默认，对所有模型安全）。 */
 export type ThinkingEffort = "off" | "minimal" | "low" | "medium" | "high";
 
-export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; enqueuedAt: string };
+/** A user-selected skill. The digest pins mandatory instructions across queues and rewind. */
+export type SelectedSkill = { id: string; name: string; digest: string };
+
+export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; skill?: SelectedSkill; enqueuedAt: string };
 
 export type SessionInfo = {
   id: string; // ses_...
@@ -49,6 +52,8 @@ export type MessageInfo =
       role: "user";
       agent: string;
       model: ModelRef;
+      /** Presentation metadata only; the SKILL.md body is never persisted here. */
+      skill?: SelectedSkill;
       time: { created: string };
     }
   | {

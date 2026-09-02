@@ -3,7 +3,7 @@
  *  Assemble with createServer() (or wire SessionRunner directly). */
 
 // core: session
-export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo, SessionStatus, ModelRef, ToolState, ThinkingEffort } from "./core/session/types.js";
+export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SelectedSkill, SessionInfo, SessionStatus, ModelRef, ToolState, ThinkingEffort } from "./core/session/types.js";
 export type { SessionStore } from "./core/session/store.js";
 export { newSessionId, newMessageId, newPartId, newPermissionRequestId, newEventId } from "./core/session/ids.js";
 export { createJsonlSessionStore } from "./core/session/jsonl-store.js";

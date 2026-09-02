@@ -2,7 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import type { FrameworkEvent } from "../events/manifest.js";
 import { newMessageId, newPartId } from "../session/ids.js";
-import type { MessageInfo, ModelRef, Part, ToolState } from "../session/types.js";
+import type { MessageInfo, ModelRef, Part, SelectedSkill, ToolState } from "../session/types.js";
 
 /** Part-projector (spec §8.2): folds PI agent events into the persisted
  *  Message/Part graph and the framework events to publish. Pure and sync —
@@ -94,13 +94,14 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[]): MessageInfo {
+  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
       role: "user",
       agent: this.identity.agent,
       model: this.identity.model,
+      ...(skill ? { skill } : {}),
       time: { created: new Date().toISOString() },
     };
     this.userMessageId = message.id;

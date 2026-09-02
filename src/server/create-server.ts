@@ -30,6 +30,7 @@ export type FrameworkDeps = {
   subagentDepth?: number;
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api> | null };
   leaseStore?: { stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>; clear(sessionId: string): Promise<void> };
+  resolveMandatorySkill?: import("../core/runtime/runner.js").MandatorySkillResolver;
 };
 
 export type AgentFramework = {
@@ -63,6 +64,7 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     subagentDepth: deps.subagentDepth ?? 1,
     ...(deps.compaction ? { compaction: deps.compaction } : {}),
     ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),
+    ...(deps.resolveMandatorySkill ? { resolveMandatorySkill: deps.resolveMandatorySkill } : {}),
   });
 
   return {
