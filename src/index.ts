@@ -73,7 +73,15 @@ export type { WebSearchOptions, WebSearchResult } from "./core/tools/websearch.j
 export { applyPatchTool, parseUnifiedPatch, applyFilePatch } from "./core/tools/patch.js";
 export type { FilePatch, PatchParseResult, ApplyPatchReportEntry } from "./core/tools/patch.js";
 export { createFsWorkspaceFiles } from "./adapters/fs-workspace.js";
-export { createOpenAiModelProvider, type ProviderHeaders, type FailoverEndpoint, type FailoverEvent } from "./adapters/openai-provider.js";
+export {
+  createOpenAiModelProvider,
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_MAX_TOKENS,
+  type ProviderHeaders,
+  type ModelCaps,
+  type FailoverEndpoint,
+  type FailoverEvent,
+} from "./adapters/openai-provider.js";
 export { createSubprocessSandbox } from "./adapters/subprocess-sandbox.js";
 
 // server
