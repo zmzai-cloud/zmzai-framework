@@ -1,5 +1,29 @@
 # @zmzai/agent-framework
 
+## 0.2.5
+
+### Minor Changes
+
+- 回溯重发基座：`SessionStore.truncateFrom` + `session.rewound` 事件。消息可截断到指定位置重发，事件溯源保证 SSE 续传不复活已删消息。
+
+## 0.2.4
+
+### Minor Changes
+
+- node-pty spawn-helper 执行位修复（darwin-arm64）
+- 任务小结 + 运行中断点 + 会话状态字段
+- 优雅退出原子能力：`listActiveSessions` + `SqliteSessionStore.checkpoint`
+- 流空闲看门狗默认 5 分钟，超时文案引导一键继续
+- 会话稳定性 P1：重试增强 + 看门狗软化
+- SQLite 运行租约 + 持久化事件日志（会话稳定性 P0）
+
+## 0.2.3
+
+### Minor Changes
+
+- `AgentFramework` 暴露 `modelFor` / `streamFor`：宿主侧 one-shot LLM 调用复用主链路
+- `SessionStore` 增加 `deleteSession`：SQLite / JSONL 级联删除会话
+
 ## 0.3.0
 
 ### Minor Changes
