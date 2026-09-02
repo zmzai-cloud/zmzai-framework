@@ -64,7 +64,7 @@ export function createOpenAiModelProvider(input?: {
    *  是同步契约，产品侧需自己缓存模型目录（如请求级灌入进程内缓存）。
    *  未命中返回 undefined 时回落 DEFAULT_*，与不配置时行为完全一致。 */
   modelCaps?: (modelId: string) => ModelCaps | undefined;
-  failoverEndpoints?: FailoverEndpoint[];
+  failoverEndpoints?: FailoverEndpoint[] | (() => FailoverEndpoint[]);
   /** 降级发生时回调（宿主用于日志/UI 提示）。 */
   onFailover?: (event: FailoverEvent) => void;
 }): ModelProvider {
@@ -74,7 +74,16 @@ export function createOpenAiModelProvider(input?: {
     ((typeof baseUrlInput === "function" ? baseUrlInput() : baseUrlInput) ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
   const apiKey = input?.apiKey ?? process.env.OPENAI_API_KEY ?? "";
   const defaultModel = input?.defaultModel ?? process.env.OPENAI_MODEL ?? "gpt-4o";
-  const failovers = input?.failoverEndpoints ?? [];
+  // 备用端点每请求求值：设置页增删改降级端点无需重启 runtime 即时生效。
+  // 求值失败回落空数组（降级是增强，绝不能阻断主链路）。
+  const resolveFailovers = (): FailoverEndpoint[] => {
+    try {
+      const f = input?.failoverEndpoints;
+      return (typeof f === "function" ? f() : f) ?? [];
+    } catch {
+      return [];
+    }
+  };
   const onFailover = input?.onFailover;
   const resolveHeaders = async (): Promise<Record<string, string>> => {
     const h = input?.headers;
@@ -163,6 +172,8 @@ export function createOpenAiModelProvider(input?: {
             } as never,
           );
         };
+
+        const failovers = resolveFailovers();
 
         // 无备用端点：直连主端点（零额外开销）
         if (failovers.length === 0) return attempt();

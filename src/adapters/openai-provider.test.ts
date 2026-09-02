@@ -125,5 +125,14 @@ describe("createOpenAiModelProvider", () => {
       const streamFn = provider.streamFor(session);
       expect(typeof streamFn).toBe("function");
     });
+
+    it("accepts a function-form failoverEndpoints resolver", () => {
+      const resolver = vi.fn(() => [{ baseUrl: "https://backup.api.com/v1" }]);
+      const provider = createOpenAiModelProvider({ apiKey: "test", failoverEndpoints: resolver });
+      const streamFn = provider.streamFor({ id: "ses_1" } as never);
+      expect(typeof streamFn).toBe("function");
+      // resolver 在 streamFor 建函数时不求值（每请求才求值），这里只验证类型被接受。
+      expect(resolver).not.toHaveBeenCalled();
+    });
   });
 });
