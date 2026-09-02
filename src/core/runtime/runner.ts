@@ -41,6 +41,7 @@ export type PromptInput = {
   images?: readonly { url: string; mediaType: string }[];
   effort?: ThinkingEffort;
   skill?: SelectedSkill;
+  references?: readonly string[];
 };
 
 /** Product-owned resolver. It must be session-root aware and return trusted, bounded text. */
@@ -220,7 +221,7 @@ export class SessionRunner {
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
     if (activeRuns.has(sessionId)) {
-      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(input.skill ? { skill: input.skill } : {}), enqueuedAt: new Date().toISOString() });
+      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(input.skill ? { skill: input.skill } : {}), ...(input.references?.length ? { references: [...input.references] } : {}), enqueuedAt: new Date().toISOString() });
       return { queued: true };
     }
 
@@ -431,7 +432,7 @@ export class SessionRunner {
     const baseline = history.length;
     const agent = new Agent({
       initialState: {
-        systemPrompt: [agentInfo?.prompt ?? "", mandatorySkillContext].filter(Boolean).join("\n\n"),
+        systemPrompt: [agentInfo?.prompt ?? "", mandatorySkillContext, input.references?.length ? `<attached-resources>\nThe user attached these workspace paths. Read the relevant ones before acting:\n${input.references.join("\n")}\n</attached-resources>` : ""].filter(Boolean).join("\n\n"),
         model: this.deps.modelFor(model),
         // 推理力度（P1-8 复活）：relay 现已按模型白名单接受 reasoning_effort；
         // 仅当调用方显式选择且非 off 时下发（默认不设 = 完全不带该字段）。
@@ -636,7 +637,7 @@ export class SessionRunner {
     await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
 
     try {
-      projector.onUserPrompt(emit, input.text, input.images, input.skill);
+      projector.onUserPrompt(emit, input.text, input.images, input.skill, input.references);
       const piImages = input.images?.map((img) => {
         const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
@@ -717,7 +718,7 @@ export class SessionRunner {
     const next = await this.deps.store.dequeuePrompt(session.id);
     if (next) {
       const latest = await this.deps.store.getSession(session.id);
-      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}), ...(next.skill ? { skill: next.skill } : {}) });
+      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}), ...(next.skill ? { skill: next.skill } : {}), ...(next.references?.length ? { references: next.references } : {}) });
     }
   }
 

@@ -94,7 +94,7 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill): MessageInfo {
+  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill, references?: readonly string[]): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
@@ -102,6 +102,7 @@ export class PartProjector {
       agent: this.identity.agent,
       model: this.identity.model,
       ...(skill ? { skill } : {}),
+      ...(references?.length ? { references: [...references] } : {}),
       time: { created: new Date().toISOString() },
     };
     this.userMessageId = message.id;

@@ -11,7 +11,7 @@ export type ThinkingEffort = "off" | "minimal" | "low" | "medium" | "high";
 /** A user-selected skill. The digest pins mandatory instructions across queues and rewind. */
 export type SelectedSkill = { id: string; name: string; digest: string };
 
-export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; skill?: SelectedSkill; enqueuedAt: string };
+export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; skill?: SelectedSkill; references?: string[]; enqueuedAt: string };
 
 export type SessionInfo = {
   id: string; // ses_...
@@ -54,6 +54,7 @@ export type MessageInfo =
       model: ModelRef;
       /** Presentation metadata only; the SKILL.md body is never persisted here. */
       skill?: SelectedSkill;
+      references?: string[];
       time: { created: string };
     }
   | {
