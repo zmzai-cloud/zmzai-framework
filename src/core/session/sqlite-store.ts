@@ -179,6 +179,19 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       db.prepare("DELETE FROM messages WHERE session_id = ?").run(id);
       db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
     },
+    async truncateFrom(sessionId, fromMessageId) {
+      // 回溯重发（rewind）：按 getMessages 同序（created ASC）定位目标消息，
+      // 删除它及其后所有消息 + 所属 parts。目标不存在时抛错（调用方 404）。
+      const rows = db
+        .prepare("SELECT id FROM messages WHERE session_id = ? ORDER BY created ASC")
+        .all(sessionId) as { id: string }[];
+      const idx = rows.findIndex((row) => row.id === fromMessageId);
+      if (idx < 0) throw new Error("MESSAGE_NOT_FOUND");
+      const doomed = rows.slice(idx).map((row) => row.id);
+      const placeholders = doomed.map(() => "?").join(", ");
+      db.prepare(`DELETE FROM parts WHERE message_id IN (${placeholders})`).run(...doomed);
+      db.prepare(`DELETE FROM messages WHERE id IN (${placeholders})`).run(...doomed);
+    },
     async enqueuePrompt(sessionId, prompt: QueuedPrompt) {
       const session = getSessionRow(sessionId);
       if (!session) return 0;

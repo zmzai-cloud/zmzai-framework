@@ -89,6 +89,10 @@ export const frameworkEventSchemas = {
   "message.updated": z.object({ message: messageInfoSchema }),
   "message.part.updated": z.object({ part: partSchema }),
   "message.part.delta": z.object({ messageId: z.string(), partId: z.string(), field: z.literal("text"), delta: z.string() }),
+  // 回溯重发（rewind）：宿主截断转录后发布，data 为被替换的目标用户消息 id
+  // （含其自身）。订阅端（投影器/重放）据此把该消息及其后的状态裁掉——
+  // 事件按 seq 重放时「旧事件 → rewound → 新 run 事件」的最终态天然正确。
+  "session.rewound": z.object({ fromMessageId: z.string() }),
   "permission.asked": z.object({ request: permissionRequestSchema }),
   "permission.replied": z.object({ id: z.string(), reply: z.enum(["once", "always", "reject"]) }),
   "todo.updated": z.object({ todos: z.array(todoItemSchema) }),

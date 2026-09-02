@@ -136,6 +136,25 @@ export function createJsonlSessionStore(options: JsonlStoreOptions): SessionStor
         }
       }
     },
+    async truncateFrom(sessionId, fromMessageId) {
+      // 回溯重发（rewind）：定位目标消息，删除它及其后所有消息 + 所属 parts。
+      const doomedMessages = [...messages.values()]
+        .filter((message) => message.sessionId === sessionId)
+        .sort((a, b) => a.time.created.localeCompare(b.time.created));
+      const idx = doomedMessages.findIndex((message) => message.id === fromMessageId);
+      if (idx < 0) throw new Error("MESSAGE_NOT_FOUND");
+      const doomedIds = new Set(doomedMessages.slice(idx).map((message) => message.id));
+      const { rm } = await import("node:fs/promises");
+      for (const id of doomedIds) {
+        messages.delete(id);
+        await rm(path.join(messagesDir, `${id}.json`), { force: true });
+      }
+      for (const [rid, part] of parts) {
+        if (!doomedIds.has(part.messageId)) continue;
+        parts.delete(rid);
+        await rm(path.join(partsDir, `${rid}.json`), { force: true });
+      }
+    },
     async enqueuePrompt(sessionId, prompt) {
       await hydrate();
       const session = sessions.get(sessionId);

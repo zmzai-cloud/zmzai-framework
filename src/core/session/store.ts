@@ -18,6 +18,13 @@ export interface SessionStore {
 
   getMessages(sessionId: string): Promise<MessageWithParts[]>;
 
+  /** 截断转录（回溯重发 / rewind）：删除 fromMessageId 及其后（store 排序）
+   *  的所有消息与所属 parts。用于「编辑某条用户消息并从此重跑」——模型上下文
+   *  每次 run 由 rebuildMessages 从 store 现场重建，截断持久层即可生效。
+   *  Optional: backends that cannot truncate may omit it — callers must
+   *  feature-check (`store.truncateFrom?.(...)`). 目标消息不存在时抛错。 */
+  truncateFrom?(sessionId: string, fromMessageId: string): Promise<void>;
+
   /** Delete a session together with all its messages/parts. Optional:
    *  backends that cannot delete may omit it — callers must feature-check
    *  (`store.deleteSession?.(id)`). */
