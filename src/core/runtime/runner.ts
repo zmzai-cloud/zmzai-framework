@@ -845,40 +845,53 @@ export class SessionRunner {
     // 终态先落 session 记录（列表三态用，N5）——即使 summaryModel 缺失或生成
     // 失败，lastOutcome 也要写回，保证列表能区分完成/中断/失败。
     await this.deps.store.updateSession(session.id, { lastOutcome: input.kind }).catch(() => undefined);
-    const summaryModel = this.deps.compaction?.summaryModel ?? null;
-    if (!summaryModel) return;
-    // 本轮新增消息（baseline 之后），只取 user/assistant 文本作总结素材
-    const messages = input.agent.state.messages.slice(input.baseline);
-    const textMessages = messages.filter((m) => m.role === "user" || m.role === "assistant");
-    if (textMessages.length === 0) return;
 
     const durationMs = Date.now() - input.startedAt;
     const meta = { filesEdited: input.stats.editedFiles.length, toolCalls: input.stats.toolCalls, durationMs };
 
-    // 总结提示词：只描述本轮做了什么，一句/几句自然语言，不续写
-    const systemPrompt =
-      "你是任务收尾助手。根据用户本轮的任务与助手已完成的工作，写一句简短、克制的中文总结（1-2 句），" +
-      "说明「做了什么、结果如何、下一步建议」。不要客套、不要问句、不要续写任务，只输出总结正文。";
+    // 兜底文案：summary 生成失败 / 无模型 / 超时 / 空文本时，仍然发一条带
+    // meta 的 session.summary，保证前端「任务完成卡」三态必现，而非悄无声息结束。
+    const fallbackText =
+      input.kind === "completed"
+        ? `本轮任务已完成，共 ${meta.toolCalls} 次工具调用${meta.filesEdited > 0 ? `，改动 ${meta.filesEdited} 个文件` : ""}。`
+        : input.kind === "aborted"
+        ? `本轮任务已中断，已完成 ${meta.toolCalls} 次工具调用${meta.filesEdited > 0 ? `，改动 ${meta.filesEdited} 个文件` : ""}。`
+        : `本轮任务执行出错，已完成 ${meta.toolCalls} 次工具调用${meta.filesEdited > 0 ? `，改动 ${meta.filesEdited} 个文件` : ""}。`;
+
+    const summaryModel = this.deps.compaction?.summaryModel ?? null;
+    // 本轮新增消息（baseline 之后），只取 user/assistant 文本作总结素材
+    const messages = input.agent.state.messages.slice(input.baseline);
+    const textMessages = messages.filter((m) => m.role === "user" || m.role === "assistant");
+
     let text = "";
-    try {
-      const { streamOneText } = await import("./compaction.js");
-      const streamFn = this.deps.streamFnFor(session);
-      // 15s 超时兜底：summary 是收尾的锦上添花，不能因为上游慢而卡住 run 收尾。
-      text = await Promise.race([
-        streamOneText(
-          async (m, ctx) => streamFn(m, ctx as never),
-          summaryModel,
-          systemPrompt,
-          textMessages,
-        ),
-        new Promise<string>((resolve) => setTimeout(() => resolve(""), 15_000)),
-      ]);
-    } catch {
-      /* 总结生成失败静默跳过 */
+    if (summaryModel && textMessages.length > 0) {
+      // 总结提示词：只描述本轮做了什么，一句/几句自然语言，不续写
+      const systemPrompt =
+        "你是任务收尾助手。根据用户本轮的任务与助手已完成的工作，写一句简短、克制的中文总结（1-2 句），" +
+        "说明「做了什么、结果如何、下一步建议」。不要客套、不要问句、不要续写任务，只输出总结正文。";
+      try {
+        const { streamOneText } = await import("./compaction.js");
+        const streamFn = this.deps.streamFnFor(session);
+        // 15s 超时兜底：summary 是收尾的锦上添花，不能因为上游慢而卡住 run 收尾。
+        text = await Promise.race([
+          streamOneText(
+            async (m, ctx) => streamFn(m, ctx as never),
+            summaryModel,
+            systemPrompt,
+            textMessages,
+          ),
+          new Promise<string>((resolve) => setTimeout(() => resolve(""), 15_000)),
+        ]);
+      } catch {
+        /* 总结生成失败 → 落到下方兜底文案 */
+      }
     }
+
     const trimmed = text.trim();
-    if (!trimmed) return;
-    await this.publish({ type: "session.summary", data: { text: trimmed, kind: input.kind, meta } }, session.id).catch(() => undefined);
+    await this.publish(
+      { type: "session.summary", data: { text: trimmed || fallbackText, kind: input.kind, meta } },
+      session.id,
+    ).catch(() => undefined);
   }
 
   private async lastAssistantText(sessionId: string): Promise<string> {
