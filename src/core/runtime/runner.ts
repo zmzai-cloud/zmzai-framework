@@ -1014,6 +1014,14 @@ export function isSessionActive(sessionId: string): boolean {
   return activeRuns.has(sessionId);
 }
 
+/** 会话当前 run 是否挂起等待人工授权（HITL 待确认）。宿主会话列表用它把
+ *  「待确认」从笼统的「运行中」里区分出来，否则后台会话被权限卡住时
+ *  侧边栏毫无信号。无 run 或 run 无 pending 请求均为 false。 */
+export function isSessionAwaitingPermission(sessionId: string): boolean {
+  const active = activeRuns.get(sessionId);
+  return !!active && active.engine.pendingRequests.length > 0;
+}
+
 /** 当前所有 running 会话 id（Electron 优雅退出等收尾场景枚举用，P2）。
  *  activeRuns 是模块级 globalThis 单例，跨项目/跨 runtime 共享。 */
 export function listActiveSessions(): string[] {

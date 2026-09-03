@@ -56,7 +56,7 @@ export { createRepoMapTool } from "./core/tools/repomap.js";
 export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOptions, type RepoMapResult } from "./core/repomap/repomap.js";
 
 // core: runtime
-export { SessionRunner, createFrameworkSession, isSessionActive, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
+export { SessionRunner, createFrameworkSession, isSessionActive, isSessionAwaitingPermission, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";

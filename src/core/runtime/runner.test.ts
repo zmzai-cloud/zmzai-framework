@@ -3,7 +3,7 @@ import { z } from "zod";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
 import { AgentRegistry } from "../agent/registry.js";
-import { SessionRunner, createFrameworkSession, isRetryableError, isSessionActive, type RunnerDeps } from "../runtime/runner.js";
+import { SessionRunner, createFrameworkSession, isRetryableError, isSessionActive, isSessionAwaitingPermission, type RunnerDeps } from "../runtime/runner.js";
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -359,12 +359,15 @@ describe("SessionRunner", () => {
     await runner.prompt(session.id, { text: "构建项目" });
     // The run suspends on the bash permission ask.
     await waitFor(() => publishedTypes(harness).includes("permission.asked"));
+    // HITL 挂起态可被宿主查询（会话列表「待确认」提醒的数据源）
+    expect(isSessionAwaitingPermission(session.id)).toBe(true);
     const asked = harness.find((event) => event.type === "permission.asked");
     const request = (asked as unknown as { data: { request: { id: string; patterns: string[] } } }).data.request;
     expect(request.patterns).toEqual(["npm run build"]);
 
     const replied = await runner.replyPermission(session.id, request.id, "once");
     expect(replied).toBe(true);
+    expect(isSessionAwaitingPermission(session.id)).toBe(false);
 
     await waitFor(() => lastStatus(harness) === "idle");
     // The event chain is fanned out asynchronously; wait until the completed
