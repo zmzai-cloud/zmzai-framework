@@ -360,6 +360,17 @@ export class SessionRunner {
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
     const agentInfo = resolved?.agent ?? registry.get(agentName) ?? registry.get("default");
     const model = input.model ?? agentInfo?.model ?? session.model;
+    // 回写当轮实际模型：session.model 是「会话当前模型」的持久来源，但
+    // prompt 传入的 model / agent 声明的 model 此前只用于当轮、从不落库，
+    // 于是所有读 session.model 的旁路（压缩阈值 contextWindowFor、总结
+    // 陈词 summarizeRun、子代理继承、宿主侧标题生成）拿到的都是建会话时
+    // 的旧模型甚至 env 兜底值。回写后这些旁路自动跟随当轮模型，无需各自
+    // 传参。必须在 buildCompaction 之前完成，否则压缩阈值仍按旧模型算。
+    if (model.providerId !== session.model?.providerId || model.modelId !== session.model?.modelId) {
+      await this.deps.store.updateSession(session.id, { model }).catch(() => undefined);
+      // 同步内存引用：本轮后续（buildCompaction/闭包捕获）都用新模型
+      session = { ...session, model };
+    }
 
     const agentRulesets = resolved ? [registry.rulesetsFor("default")[0]!, resolved.agent.permission] : registry.rulesetsFor(agentInfo?.name ?? "default");
     const engine = new PermissionEngine(session.id, agentRulesets, session.permission, {

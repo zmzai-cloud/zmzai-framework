@@ -209,6 +209,20 @@ describe("SessionRunner", () => {
     expect(assistant!.parts.some((part) => part.type === "step-finish")).toBe(true);
   });
 
+  it("prompt 传入的 model 回写 session.model（旁路不再读到建会话时的旧模型）", async () => {
+    const { runner, store, published: harness } = makeHarness([fauxAssistantMessage("已切换模型完成。")]);
+    const session = await makeSession(store);
+    expect(session.model).toEqual({ providerId: "faux", modelId: "test-model" });
+
+    await runner.prompt(session.id, { text: "换个模型跑", model: { providerId: "faux", modelId: "switched" } });
+    await waitFor(() => lastStatus(harness) === "idle");
+
+    // 回写后：压缩阈值（contextWindowFor）、总结陈词（summarizeRun）、
+    // 子代理继承、宿主侧标题生成读 session.model 时都跟随当轮模型
+    const updated = await store.getSession(session.id);
+    expect(updated!.model).toEqual({ providerId: "faux", modelId: "switched" });
+  });
+
   it("repairs structurally truncated raw tool JSON before PI validates and executes it", async () => {
     const received: string[] = [];
     const echoTool: ToolDef = {
