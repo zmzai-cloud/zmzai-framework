@@ -858,7 +858,19 @@ export class SessionRunner {
         ? `本轮任务已中断，已完成 ${meta.toolCalls} 次工具调用${meta.filesEdited > 0 ? `，改动 ${meta.filesEdited} 个文件` : ""}。`
         : `本轮任务执行出错，已完成 ${meta.toolCalls} 次工具调用${meta.filesEdited > 0 ? `，改动 ${meta.filesEdited} 个文件` : ""}。`;
 
-    const summaryModel = this.deps.compaction?.summaryModel ?? null;
+    // 总结模型沿用「会话实际模型」而非 compaction 专用 summaryModel，保证
+    // 总结卡文案由当前会话正在用的模型生成。仅当 compaction 启用时才做 AI
+    // 总结（否则落到兜底文案），但模型来源与会话模型解耦。modelFor 抛错
+    // （宿主 provider 不认识该 ref）时回落 compaction.summaryModel，再不行
+    // 落到下方兜底文案。
+    let summaryModel: Model<Api> | null = null;
+    if (this.deps.compaction?.enabled) {
+      try {
+        summaryModel = this.deps.modelFor(session.model);
+      } catch {
+        summaryModel = this.deps.compaction.summaryModel ?? null;
+      }
+    }
     // 本轮新增消息（baseline 之后），只取 user/assistant 文本作总结素材
     const messages = input.agent.state.messages.slice(input.baseline);
     const textMessages = messages.filter((m) => m.role === "user" || m.role === "assistant");
