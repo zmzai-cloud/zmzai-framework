@@ -67,7 +67,7 @@ describe("startMcpServers", () => {
       expect(def.parametersJsonSchema).toMatchObject({ type: "object" });
 
       const mapped = def.permission({ msg: "hi" });
-      expect(mapped).toMatchObject({ permission: "mcp", patterns: ["demo.server/echo"], always: ["demo.server/*"] });
+      expect(mapped).toMatchObject({ permission: "mcp", patterns: ["demo.server/echo"], always: ["demo.server/echo"] });
 
       await expect(def.execute({ msg: "你好" }, stubContext())).resolves.toMatchObject({
         title: "demo.server/echo",

@@ -122,7 +122,10 @@ function mcpToolDef(entry: McpServerEntry, tool: McpToolInfo, client: McpClientL
     permission: (args) => ({
       permission: "mcp",
       patterns: [`${entry.name}/${tool.name}`],
-      always: [`${entry.name}/*`],
+      // 只沉淀当前工具的精确规则：server/* 级通配意味着批准一个工具 =
+      // 该服务器全部工具永久放行（服务器之间的信任不应隐式传染）。
+      // 「信任整个服务器」应由产品层显式提供按钮，写 server 级规则。
+      always: [`${entry.name}/${tool.name}`],
       metadata: { server: entry.name, tool: tool.name, argsSummary: summarizeArgs(args) },
     }),
     executionMode: "sequential",

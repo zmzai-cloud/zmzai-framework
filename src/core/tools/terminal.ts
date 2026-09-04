@@ -216,12 +216,18 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
       cols: z.number().int().min(20).max(500).optional(),
       rows: z.number().int().min(5).max(200).optional(),
     }),
-    permission: (args) => ({
-      permission: "terminal",
-      patterns: [args.command],
-      always: [args.command, `${args.command.trim().split(/\s+/)[0] ?? "*"} *`],
-      metadata: { command: args.command, ...(args.name ? { name: args.name } : {}) },
-    }),
+    permission: (args) => {
+      // 复合/管道/命令替换（$()、反引号）只沉淀精确整串：首 token 通配会让
+      // `npm run dev && rm -rf ~` 这类命令沉淀出 `npm *`，一次批准全放行。
+      const isCompound = /[|><;&]|\$\(|`/.test(args.command);
+      const firstToken = args.command.trim().split(/\s+/)[0] ?? "*";
+      return {
+        permission: "terminal",
+        patterns: [args.command],
+        always: isCompound ? [args.command] : [args.command, `${firstToken} *`],
+        metadata: { command: args.command, ...(args.name ? { name: args.name } : {}) },
+      };
+    },
     executionMode: "sequential",
     async execute(args) {
       const resolvedCwd = args.cwd ? resolveWithin(opts.workspaceRoot(), args.cwd) : opts.workspaceRoot();

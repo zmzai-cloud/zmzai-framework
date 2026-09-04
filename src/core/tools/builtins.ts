@@ -173,7 +173,11 @@ export const bashTool: ToolDef = {
     const { program, args: inlineArgs } = splitProgram(args.program);
     const allArgs = [...inlineArgs, ...(args.args ?? [])];
     const command = [program, ...allArgs].join(" ");
-    return { permission: "bash", patterns: [command], always: [command, `${program} *`], metadata: { command } };
+    // 复合/管道命令（splitProgram 已归一为 sh -c）只沉淀精确整串，绝不下沉
+    // 程序级通配：否则一次「总是允许」= `sh *` 全放行，任意危险复合命令静默通过。
+    // 简单命令保留 `${program} *` 的便利（对单程序命令，用户语义就是信任该程序）。
+    const always = program === "sh" ? [command] : [command, `${program} *`];
+    return { permission: "bash", patterns: [command], always, metadata: { command } };
   },
   executionMode: "sequential",
   async execute(args, ctx) {
