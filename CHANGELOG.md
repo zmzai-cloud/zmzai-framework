@@ -1,5 +1,20 @@
 # @zmzai/agent-framework
 
+## 0.4.1
+
+### Patch Changes
+
+- c2bdb63: 修复权限「always」沉淀粒度（P0，对照 Claude Code v2.1.259 四类参数位置绕过自查后的直接修复）：
+  
+  - **bash**：复合/管道命令（归一为 `sh -c`）在「总是允许」时只沉淀精确整串规则，绝不再沉淀 `sh *` 程序级通配——此前一次批准任意无害复合命令 = 之后所有复合命令静默放行。简单单程序命令仍保留 `program *` 通配便利。
+  - **terminal**：同构修复。含 `| > < ; & $()` 或反引号的命令只沉淀精确整串，不下沉首 token 通配（`npm run dev && rm -rf ~` 不再产生 `npm *`）。
+  - **MCP**：「总是允许」从 `server/*` 收窄为精确 `server/tool`——批准一个工具不再隐式放行同服务器全部工具；服务器级信任应由宿主产品显式提供。
+- b1d095a: `runLoop` 会把当轮实际使用的模型回写 `session.model`（仅在模型变化时写库）。此前 `input.model` / agent 声明的 model 只作用于当轮、从不落库，导致所有读 `session.model` 的旁路拿到的都是建会话时的旧模型甚至 env 兜底值——包括压缩阈值 `contextWindowFor`、总结陈词 `summarizeRun`、子代理继承、以及宿主侧的异步标题生成。回写在 `buildCompaction` 之前完成并同步内存引用，因此压缩阈值当轮即按新模型计算。
+- 24c748d: 新增 `isSessionAwaitingPermission(sessionId)`：查询会话当前 run 是否挂起等待人工授权（HITL 待确认）。供宿主会话列表把「待确认」从笼统的「运行中」区分出来——后台会话被权限请求卡住时侧边栏能直接给出信号。
+- 4c84c50: `summarizeRun` 在任务终态不再静默跳过：即使 summary 模型缺失、本轮无可总结消息、生成失败、超时或返回空文本，也会兜底发一条带 `meta`（工具调用数/改动文件数/耗时）的 `session.summary` 事件。前端「任务完成卡」三态（完成/中断/失败）因此必然出现，而非生成端异常时悄无声息结束。AI 总结成功时仍用真实文本，失败时用结构化模板文案。
+  
+  总结模型改为沿用**会话实际模型**（`modelFor(session.model)`），不再依赖 compaction 专用的 `summaryModel`——当宿主把 compaction 的 summaryModel 配成与主链路不一致的模型名（如硬编码 `gpt-4o`）时，总结陈词仍由当前会话正在用的模型生成，避免「模型名对不上 → 总结退化成兜底模板」。仅当 compaction 启用时才做 AI 总结，`modelFor` 抛错时回落 `compaction.summaryModel`。
+
 ## 0.4.0
 
 ### Minor Changes
