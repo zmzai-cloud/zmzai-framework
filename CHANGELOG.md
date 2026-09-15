@@ -1,5 +1,19 @@
 # @zmzai/agent-framework
 
+## 0.5.0
+
+### Minor Changes
+
+- 会话工作流与消息体验（Lectern 0.5.x 已在用、此前只存在于本地 vendor 包，现坐实为版本）：
+  
+  - **会话工作流持久化**：`SessionStore.workflow` 提供 `acceptPrompt` / `claimPrompt` / `finishPrompt` / `recoverInterrupted`。请求、用户消息、附件 parts 与首批事件在单个 SQLite 事务内登记；相同 `requestId` 与载荷返回原 receipt，不同载荷返回 409；排队任务 FIFO，未开始的消息不进入当前模型上下文；`revision` 单调递增，rewind 后旧游标请求 409。
+  - **消息快照与搜索**：`getMessageSnapshot` 支持 before/after/around 窗口并与状态事件、运行记录同事务返回；`searchMessages` 使用规范化搜索表与稳定游标，**仅索引正文、工具名/摘要、附件名**——推理、工具输入/完整输出、附件 URL 与正文一律不入索引，并遮蔽常见凭据格式。
+  - **已读状态**：`getReadState` / `markRead` 持久化已读游标与未读数，绑定 `historyRevision`。
+  - **输入附件校验**：新增导出 `validateAttachments`，限制 5 个文件、512KB、UTF-8 文本白名单，拒绝控制字符与路径分隔符，不抓取用户提供的 URL。
+  - **事件订阅与租约**：订阅在缺口后保留后续事件并按 seq 去重，取消的订阅立即退出；过期租约回收与「中断运行」标记同事务完成。
+  - **Windows 加固**：终端优先 `pwsh.exe` / `powershell.exe`（`cmd.exe` 仅作兜底），PTY/管道与 MCP stdio 子进程在 Windows 上改用进程树终止，避免遗留孤儿进程。
+  - **`createFrameworkSession`**：`createSession` 接受 `id` 与 `creationRequestId` / `creationPayloadHash`，用于宿主侧幂等建会话。
+
 ## 0.4.1
 
 ### Patch Changes
