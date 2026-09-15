@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import type { SandboxExecutor } from "../adapters/index.js";
 import type { SandboxSnapshot, SandboxExecResult } from "../core/tools/context.js";
@@ -29,6 +31,60 @@ const ARTIFACT_SKIP_DIRS = new Set(["node_modules", ".git", "__pycache__", ".cac
 const ARTIFACT_MAX_PATHS = 100;
 const WORKSPACE_CONTENT_MAX_FILES = 30;
 const WORKSPACE_CONTENT_MAX_BYTES = 256 * 1024;
+
+const UNIX_PROGRAMS = new Set([
+  "bash", "sh", "ls", "cat", "grep", "find", "mkdir", "cp", "mv", "rm",
+  "echo", "printf", "unzip", "tar", "curl", "wget", "env",
+]);
+
+function inside(root: string, relative: string): string {
+  const candidate = path.resolve(root, relative);
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`sandbox path escapes workspace: ${relative}`);
+  }
+  return candidate;
+}
+
+function commandEnvironment(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    if (process.platform === "win32") {
+      for (const inherited of Object.keys(env)) {
+        if (inherited.toLowerCase() === key.toLowerCase()) delete env[inherited];
+      }
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+/** Git for Windows normally exposes only Git/cmd on PATH, not its Unix tools. */
+function resolveProgram(program: string, env: NodeJS.ProcessEnv): string {
+  if (process.platform !== "win32" || !UNIX_PROGRAMS.has(program)) return program;
+  const envKey = (name: string) => Object.keys(env).find((key) => key.toLowerCase() === name.toLowerCase());
+  const pathKey = envKey("PATH") ?? "PATH";
+  const entries = (env[pathKey] ?? "").split(";").map((entry) => entry.trim().replace(/^"(.*)"$/, "$1"))
+    .filter((entry) => path.win32.isAbsolute(entry));
+  const candidates = entries.flatMap((entry) => [
+    entry,
+    path.win32.resolve(entry, "../usr/bin"),
+    path.win32.resolve(entry, "../../usr/bin"),
+  ]);
+  for (const root of [env[envKey("ProgramFiles") ?? ""] ?? "C:\\Program Files", env[envKey("ProgramFiles(x86)") ?? ""]]) {
+    if (root) candidates.push(path.win32.join(root, "Git", "usr", "bin"));
+  }
+  const local = env[envKey("LOCALAPPDATA") ?? ""];
+  if (local) candidates.push(path.win32.join(local, "Programs", "Git", "usr", "bin"));
+  for (const bin of new Set(candidates)) {
+    // Require the Unix toolchain so Windows find.exe is never mistaken for GNU find.
+    if (!existsSync(path.win32.join(bin, "sh.exe"))) continue;
+    const executable = path.win32.join(bin, `${program}.exe`);
+    if (!existsSync(executable)) continue;
+    env[pathKey] = `${bin};${env[pathKey] ?? ""}`;
+    return executable;
+  }
+  return program;
+}
 
 export function createSubprocessSandbox(input?: {
   /** 提供后：快照从真实工作区采集、新产物回写工作区（函数形式随项目切换）。 */
@@ -74,18 +130,21 @@ export function createSubprocessSandbox(input?: {
       const dir = await mkdtemp(path.join(tmpdir(), "fw-sandbox-"));
       try {
         for (const file of input.snapshot.files) {
-          const full = path.join(dir, file.path);
+          const full = inside(dir, file.path);
           await mkdir(path.dirname(full), { recursive: true });
           await writeFile(full, file.content, "utf8");
         }
-        const cwd = input.command.cwd ? path.join(dir, input.command.cwd) : dir;
+        const cwd = input.command.cwd ? inside(dir, input.command.cwd) : dir;
         // cwd 可能指向快照里没有文件的子目录（如刚 mkdir 的空项目）：先建出来
         await mkdir(cwd, { recursive: true });
+        const env = commandEnvironment(input.command.env);
+        const program = resolveProgram(input.command.program, env);
         const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-          const child = spawn(input.command.program, input.command.args ?? [], {
+          const child = spawn(program, input.command.args ?? [], {
             cwd,
-            env: { ...process.env, ...(input.command.env ?? {}) },
+            env,
             shell: false,
+            windowsHide: true,
             stdio: ["ignore", "pipe", "pipe"],
           });
           let output = "";
@@ -95,7 +154,16 @@ export function createSubprocessSandbox(input?: {
           child.stderr.on("data", (chunk) => {
             output += String(chunk);
           });
-          child.on("error", reject);
+          child.on("error", (error: NodeJS.ErrnoException) => {
+            if (process.platform === "win32" && error.code === "ENOENT") {
+              const hint = UNIX_PROGRAMS.has(input.command.program)
+                ? ` Install Git for Windows (including Git Bash), add its usr\\bin directory to PATH if installed in a custom location, then restart Lectern.`
+                : ` Install "${input.command.program}" or add its installation directory to PATH, then restart Lectern.`;
+              reject(new Error(`${error.message}.${hint}`, { cause: error }));
+            } else {
+              reject(error);
+            }
+          });
           child.on("close", (code) => resolve({ code, output }));
         });
         // 收集快照外的新文件：批量 fs 回写工作区 + 产物元数据（限流）
@@ -142,7 +210,7 @@ export function createSubprocessSandbox(input?: {
                 bytes: info.size,
                 contentType: guessContentType(rel),
                 // 回写后的文件指向工作区真实路径（temp 目录在 finally 里会删）
-                downloadUrl: ws ? `file://${path.join(ws, rel)}` : `file://${full}`,
+                downloadUrl: pathToFileURL(ws ? path.join(ws, rel) : full).href,
                 ...(workspaceContent !== undefined ? { workspaceContent } : {}),
               });
             }

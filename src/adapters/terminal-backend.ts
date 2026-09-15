@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -94,7 +94,15 @@ function probePtySpawn(mod: NodePtyModule): boolean {
 /** 统一 POSIX sh 执行（不用 $SHELL）：agent 语义需要可预测的语法方言，
  *  fish/zsh 差异会造成同一条命令两种结果。 */
 function shell(): { file: string; prefixArgs: string[] } {
-  if (process.platform === "win32") return { file: "cmd.exe", prefixArgs: ["/d", "/s", "/c"] };
+  if (process.platform === "win32") {
+    // PowerShell preserves the shell users normally expect on modern Windows;
+    // retain cmd as a fallback for minimal/server installations.
+    const pathEntries = (process.env.Path ?? process.env.PATH ?? "").split(";");
+    const has = (name: string) => pathEntries.some((entry) => existsSync(resolve(entry, name)));
+    if (has("pwsh.exe")) return { file: "pwsh.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-NoExit", "-Command"] };
+    if (has("powershell.exe")) return { file: "powershell.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-NoExit", "-Command"] };
+    return { file: process.env.ComSpec || "cmd.exe", prefixArgs: ["/d", "/s", "/c"] };
+  }
   return { file: "/bin/sh", prefixArgs: ["-c"] };
 }
 
@@ -134,14 +142,23 @@ function createPipeBackend(): TerminalBackend {
           if (exited) return;
           try {
             if (pid != null && process.platform !== "win32") process.kill(-pid, signal);
-            else child.kill(signal as NodeJS.Signals);
+            else killWindowsTree(pid, signal);
           } catch {
-            child.kill("SIGKILL");
+            killWindowsTree(pid, "SIGKILL");
           }
         },
       };
     },
   };
+}
+
+function killWindowsTree(pid: number | undefined, signal: string): void {
+  if (!pid) return;
+  try {
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  } catch {
+    // The process may have exited between the status check and taskkill.
+  }
 }
 
 function createNodePtyBackend(moduleRef: NodePtyModule): TerminalBackend {
@@ -162,7 +179,10 @@ function createNodePtyBackend(moduleRef: NodePtyModule): TerminalBackend {
       return {
         pid: term.pid,
         write: (data) => term.write(data),
-        kill: (signal) => term.kill(signal),
+        kill: (signal) => {
+          if (process.platform === "win32") killWindowsTree(term.pid, signal ?? "SIGTERM");
+          else term.kill(signal);
+        },
         resize: (cols, rows) => term.resize(cols, rows),
       };
     },
