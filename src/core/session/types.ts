@@ -11,7 +11,18 @@ export type ThinkingEffort = "off" | "minimal" | "low" | "medium" | "high";
 /** A user-selected skill. The digest pins mandatory instructions across queues and rewind. */
 export type SelectedSkill = { id: string; name: string; digest: string };
 
-export type QueuedPrompt = { text: string; agent?: string; effort?: ThinkingEffort; skill?: SelectedSkill; references?: string[]; enqueuedAt: string };
+export type QueuedPrompt = {
+  text: string;
+  attachments?: readonly import("../runtime/attachments.js").InputAttachment[];
+  images?: readonly { url: string; mediaType: string }[];
+  model?: ModelRef;
+  agent?: string;
+  effort?: ThinkingEffort;
+  skill?: SelectedSkill;
+  references?: string[];
+  requestId?: string;
+  enqueuedAt: string;
+};
 
 export type SessionInfo = {
   id: string; // ses_...
@@ -31,6 +42,9 @@ export type SessionInfo = {
    *  未声明则不限制。 */
   writePaths?: string[];
   queuedPrompts: QueuedPrompt[]; // FIFO for prompts submitted while running (§13.3)
+  /** Idempotency metadata for client-created sessions. */
+  creationRequestId?: string;
+  creationPayloadHash?: string;
   /** 运行租约（spec §3.2）：runner 持有 run 时盖章（owner + 过期时间），run 结束清除。
    *  进程崩溃/重启后租约遗留，lease recovery 扫描过期租约并收尾中断的运行。 */
   leaseOwner?: string;
@@ -97,6 +111,6 @@ export type Part = PartBase &
     | { type: "compaction"; summary: string }
   );
 
-export type MessageWithParts = { info: MessageInfo; parts: Part[] };
+export type MessageWithParts = { info: MessageInfo; parts: Part[]; messageSeq?: number };
 
 export type SessionStatus = "idle" | "running" | "waiting_permission" | "waiting_input";

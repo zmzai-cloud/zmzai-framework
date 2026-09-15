@@ -57,6 +57,8 @@ export class PartProjector {
 
   constructor(private readonly identity: BridgeIdentity) {}
 
+  restoreUserMessage(id: string): void { this.userMessageId = id; }
+
   private emitPart(emit: Emit, part: Part): void {
     this.parts.set(part.id, part);
     emit({ type: "message.part.updated", data: { part } });
@@ -94,7 +96,7 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill, references?: readonly string[]): MessageInfo {
+  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill, references?: readonly string[], attachments?: readonly import("./attachments.js").InputAttachment[]): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
@@ -132,6 +134,11 @@ export class PartProjector {
         this.parts.set(part.id, part);
         emit({ type: "message.part.updated", data: { part } });
       }
+    }
+    for (const file of attachments ?? []) {
+      const part: Part = { id: newPartId(), sessionId: this.identity.sessionId, messageId: message.id, type: "file", filename: file.name, mime: file.mediaType, url: file.data };
+      this.parts.set(part.id, part);
+      emit({ type: "message.part.updated", data: { part } });
     }
     return message;
   }

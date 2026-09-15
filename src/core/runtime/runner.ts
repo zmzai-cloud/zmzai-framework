@@ -1,4 +1,5 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { validateAttachments, attachmentContent } from "./attachments.js";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 import { AgentRegistry, type AgentInfo } from "../agent/registry.js";
@@ -23,6 +24,8 @@ import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type Lifec
 import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
+import { randomUUID } from "node:crypto";
+import type { PromptReceipt, WorkflowState } from "../session/workflow.js";
 
 /** SessionRunner (spec §8.1): owns one session's full lifecycle — prompt →
  *  PI agent loop → persisted parts + framework events → terminal settlement
@@ -35,6 +38,8 @@ import { noopSandboxExecutor } from "../../adapters/index.js";
 export type { ThinkingEffort } from "../session/types.js";
 
 export type PromptInput = {
+  requestId?: string;
+  attachments?: readonly import("./attachments.js").InputAttachment[];
   text: string;
   agent?: string;
   model?: ModelRef;
@@ -176,6 +181,42 @@ function defaultToolContext(input: { session: SessionInfo; engine: PermissionEng
 
 export class SessionRunner {
   constructor(private readonly deps: RunnerDeps) {}
+  private draining = new Map<string, Promise<void>>();
+  private stopRequested = new Set<string>();
+
+  private drain(sessionId: string): void {
+    if (this.draining.has(sessionId)) return;
+    const work = (async () => {
+      while (true) {
+        const job = await this.deps.store.workflow!.claimPrompt(sessionId, `node:${process.pid}`);
+        if (!job) return;
+        let outcome: WorkflowState = "recovery_required";
+        try {
+          if (this.stopRequested.has(sessionId)) {
+            outcome = "cancelled";
+          } else {
+          const session = await this.deps.store.getSession(sessionId);
+          if (!session) {
+            outcome = "failed";
+          } else {
+            outcome = await this.runLoop(session, job.input, job.receipt.userMessageId);
+          }
+          }
+        } catch {
+          // Setup or settlement may have failed after a tool ran. Do not replay.
+        }
+        await this.deps.store.workflow!.finishPrompt(sessionId,job.receipt.runId,job.revision,outcome);
+        if (outcome !== "completed") return;
+      }
+    })();
+    this.draining.set(sessionId, work);
+    void work.catch(() => undefined).finally(async () => {
+      this.draining.delete(sessionId);
+      if (this.stopRequested.has(sessionId)) return;
+      const queued = await this.deps.store.workflow!.workflowRuns(sessionId).catch(() => []);
+      if (queued.some(run => run.status === "queued") && !queued.some(run => run.status === "running" || run.status === "recovery_required")) this.drain(sessionId);
+    });
+  }
   #hooks: LifecycleHook[] = [];
   /** 供 runLoop 取归一化钩子数组（lazy：constructor 后仍可由 deps 引用共享）。 */
   private get hooks(): LifecycleHook[] {
@@ -187,6 +228,12 @@ export class SessionRunner {
    *  单例，两个会话并发时实例字段会互相覆盖，导致 message.part.delta 等
    *  无自带 sessionId 的事件落到错误的会话事件流里（串台）。 */
   private async persist(event: FrameworkEvent, fallbackSessionId: string): Promise<void> {
+    const sessionId = sessionIdOf(event, fallbackSessionId);
+    if (this.deps.store.persistEvent) {
+      const persisted = await this.deps.store.persistEvent({ sessionId,...event });
+      notifyEventLogListeners(persisted);
+      return;
+    }
     if (event.type === "message.updated") {
       const message = event.data.message;
       const exists = await this.deps.store.getMessages(message.sessionId).then((entries) => entries.some((entry) => entry.info.id === message.id));
@@ -197,12 +244,14 @@ export class SessionRunner {
     } else if (event.type === "session.updated") {
       await this.deps.store.updateSession(event.data.session.id, event.data.session);
     }
-    const persisted = await this.deps.eventLog.append({ sessionId: sessionIdOf(event, fallbackSessionId), ...event });
+    const persisted = await this.deps.eventLog.append({ sessionId, ...event });
     notifyEventLogListeners(persisted);
   }
 
   private async publish(event: FrameworkEvent, sessionId: string): Promise<void> {
-    const persisted = await this.deps.eventLog.append({ sessionId, ...event });
+    const persisted = this.deps.store.persistEvent
+      ? await this.deps.store.persistEvent({ sessionId,...event })
+      : await this.deps.eventLog.append({ sessionId, ...event });
     notifyEventLogListeners(persisted);
   }
 
@@ -216,12 +265,36 @@ export class SessionRunner {
     await this.deps.leaseStore.clear(sessionId).catch(() => undefined);
   }
 
-  async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean }> {
+  async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
+    input = { ...input, attachments: validateAttachments(input.attachments) };
     const session = await this.deps.store.getSession(sessionId);
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
+    if (this.deps.store.workflow) {
+      input = { ...input, requestId: input.requestId ?? randomUUID(), model: input.model ?? session.model };
+      const projector = new PartProjector({ sessionId, agent: input.agent ?? session.agent, model: input.model! });
+      const parts: Part[] = [];
+      const message = projector.onUserPrompt(event => {
+        if (event.type === "message.part.updated") parts.push(event.data.part);
+      }, input.text,input.images,input.skill,input.references,input.attachments);
+      const accepted = await this.deps.store.workflow.acceptPrompt(sessionId,input,{ message,parts });
+      for (const event of accepted.events) notifyEventLogListeners(event);
+      if (accepted.events.length) this.drain(sessionId);
+      return accepted.receipt;
+    }
+
     if (activeRuns.has(sessionId)) {
-      await this.deps.store.enqueuePrompt(sessionId, { text: input.text, ...(input.agent ? { agent: input.agent } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(input.skill ? { skill: input.skill } : {}), ...(input.references?.length ? { references: [...input.references] } : {}), enqueuedAt: new Date().toISOString() });
+      await this.deps.store.enqueuePrompt(sessionId, {
+        text: input.text,
+        attachments: input.attachments,
+        images: input.images,
+        model: input.model,
+        ...(input.agent ? { agent: input.agent } : {}),
+        ...(input.effort ? { effort: input.effort } : {}),
+        ...(input.skill ? { skill: input.skill } : {}),
+        ...(input.references?.length ? { references: [...input.references] } : {}),
+        enqueuedAt: new Date().toISOString(),
+      });
       return { queued: true };
     }
 
@@ -249,15 +322,19 @@ export class SessionRunner {
   }
 
   async abort(sessionId: string): Promise<void> {
-    const active = activeRuns.get(sessionId);
+    this.stopRequested.add(sessionId);
     await this.deps.store.clearQueuedPrompts(sessionId);
-    if (!active) return;
+    const active = activeRuns.get(sessionId);
     // PI's abort signal does not cancel a PermissionEngine.ask() promise.
     // Rejecting pending approvals first releases beforeToolCall so the run can
     // publish its terminal state and a continuation cannot overlap it.
-    active.engine.dispose("任务已停止，未处理的授权请求已取消");
-    active.abort();
-    await active.done;
+    if (active) {
+      active.engine.dispose("任务已停止，未处理的授权请求已取消");
+      active.abort();
+      await active.done;
+    }
+    await this.draining.get(sessionId);
+    this.stopRequested.delete(sessionId);
   }
 
   /** 手动触发一次上下文压缩（UI「压缩当前会话」）：无条件对当前历史跑一次
@@ -271,7 +348,11 @@ export class SessionRunner {
     if (!session) return { ok: false, reason: "session-not-found" };
     const transform = await this.buildCompaction(session, (event) => this.publish(event, session.id), true);
     if (!transform) return { ok: false, reason: "compaction-disabled" };
-    const messages = await this.rebuildMessages(sessionId);
+    const workflowRuns = this.deps.store.workflow ? await this.deps.store.workflow.workflowRuns(sessionId) : [];
+    const excludedUserIds = this.deps.store.workflow
+      ? new Set(workflowRuns.filter((run) => run.status !== "completed" && run.status !== "failed").map((run) => run.receipt.userMessageId))
+      : undefined;
+    const messages = await this.rebuildMessages(sessionId, excludedUserIds);
     if (messages.length <= 1) return { ok: false, reason: "nothing-to-compact" };
     await transform(messages);
     return { ok: true };
@@ -354,7 +435,7 @@ export class SessionRunner {
     }
   }
 
-  private async runLoop(session: SessionInfo, input: PromptInput): Promise<void> {
+  private async runLoop(session: SessionInfo, input: PromptInput, acceptedUserId?: string): Promise<WorkflowState> {
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -397,6 +478,7 @@ export class SessionRunner {
     });
 
     const projector = new PartProjector({ sessionId: session.id, agent: agentInfo?.name ?? "default", model });
+    if (acceptedUserId) projector.restoreUserMessage(acceptedUserId);
     let mandatorySkillContext = "";
     if (input.skill) {
       if (!this.deps.resolveMandatorySkill) throw new Error("该运行环境不支持 Skill 加载");
@@ -413,8 +495,7 @@ export class SessionRunner {
     const rawWorkspace = this.deps.workspaceFor(session);
     const workspace = session.writePaths?.length ? confineWorkspaceFiles(rawWorkspace, session.writePaths) : rawWorkspace;
     const emitAsync = async (event: FrameworkEvent) => {
-      const persisted = await this.deps.eventLog.append({ sessionId: session.id, ...event });
-      notifyEventLogListeners(persisted);
+      await this.publish(event,session.id);
     };
     const toolContext = (this.deps.buildToolContext ?? defaultToolContext)({ session, engine, workspace, sandbox, emit: emitAsync });
     // Subagent spawning is only available to primary (non-child) sessions, and
@@ -428,7 +509,11 @@ export class SessionRunner {
     const compactionTransform = await this.buildCompaction(session, emit);
     // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
     // 队/automation/子代理触发四条路径。只进内存不落 store；抛错静默降级。
-    const history = await this.rebuildMessages(session.id);
+    const workflowRuns = this.deps.store.workflow ? await this.deps.store.workflow.workflowRuns(session.id) : [];
+    const excludedUserIds = this.deps.store.workflow
+      ? new Set(workflowRuns.filter((run) => run.status !== "completed" && run.status !== "failed").map((run) => run.receipt.userMessageId))
+      : undefined;
+    const history = await this.rebuildMessages(session.id, excludedUserIds);
     if (this.deps.memoryContextFor) {
       try {
         const section = await this.deps.memoryContextFor(session, input.text);
@@ -465,6 +550,7 @@ export class SessionRunner {
     let resolveDone!: () => void;
     const done = new Promise<void>((resolve) => { resolveDone = resolve; });
     activeRuns.set(session.id, { agent, engine, settled, abort, done });
+    if (this.stopRequested.has(session.id)) abort();
     await this.stampLease(session.id);
 
     const loopGuard = new LoopGuard();
@@ -644,16 +730,16 @@ export class SessionRunner {
       ).catch(() => undefined);
     }, CHECKPOINT_INTERVAL_MS);
 
-    await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
-    await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
-
     try {
-      projector.onUserPrompt(emit, input.text, input.images, input.skill, input.references);
+      await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
+      await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
+      if (abortController.signal.aborted) throw new Error("Run cancelled during setup");
+      if (!acceptedUserId) projector.onUserPrompt(emit, input.text, input.images, input.skill, input.references, input.attachments);
       const piImages = input.images?.map((img) => {
         const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
       }).filter((img): img is { type: "image"; data: string; mimeType: string } => img !== null);
-      await agent.prompt(input.text, piImages?.length ? piImages : undefined);
+      await agent.prompt({ role: "user", content: [{ type: "text", text: input.text }, ...attachmentContent(input.attachments ?? []), ...(piImages ?? [])], timestamp: Date.now() });
       await settled();
       let failed = agent.state.errorMessage;
       if (unknownSideEffect) {
@@ -702,12 +788,14 @@ export class SessionRunner {
           : { type: "session.error", data: { name: "AgentRuntimeError", message: error instanceof Error ? error.message : "Agent 运行失败" } },
         session.id,
       );
+      if (!aborted && !unknownSideEffect) await this.publish({ type: "session.status", data: { status: "idle" } }, session.id);
     } finally {
       clearInterval(streamWatchdog);
       clearInterval(checkpointTimer);
       activeRuns.delete(session.id);
       engine.dispose();
-      await this.clearLease(session.id);
+      // Workflow settlement clears its lease atomically with the terminal run state.
+      if (!acceptedUserId) await this.clearLease(session.id);
       const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
       // 任务终态小结（N5）：终态 status 已发布后补一条 session.summary，
       // 让「任务完成」有明确收尾（AI 一句总结 + 结构化统计）。await 保证
@@ -724,13 +812,24 @@ export class SessionRunner {
       resolveDone();
     }
 
-    if (unknownSideEffect) return;
+    const outcome = unknownSideEffect ? "recovery_required" : abortController.signal.aborted ? "cancelled" : runErrored ? "failed" : "completed";
+    if (acceptedUserId || unknownSideEffect) return outcome;
     // FIFO queued prompts (spec §13.3): settle fully, then take the next one.
     const next = await this.deps.store.dequeuePrompt(session.id);
     if (next) {
       const latest = await this.deps.store.getSession(session.id);
-      if (latest) await this.runLoop(latest, { text: next.text, ...(next.agent ? { agent: next.agent } : {}), ...(next.effort ? { effort: next.effort } : {}), ...(next.skill ? { skill: next.skill } : {}), ...(next.references?.length ? { references: next.references } : {}) });
+      if (latest) await this.runLoop(latest, {
+        text: next.text,
+        attachments: next.attachments,
+        images: next.images,
+        model: next.model,
+        ...(next.agent ? { agent: next.agent } : {}),
+        ...(next.effort ? { effort: next.effort } : {}),
+        ...(next.skill ? { skill: next.skill } : {}),
+        ...(next.references?.length ? { references: [...next.references] } : {}),
+      });
     }
+    return outcome;
   }
 
   /** Spawns a subagent child session (spec §6.4): depth-capped, permission
@@ -943,16 +1042,19 @@ export class SessionRunner {
     }
     return depth;
   }
-  private async rebuildMessages(sessionId: string): Promise<AgentMessage[]> {
+  private async rebuildMessages(sessionId: string, excludedUserIds?: Set<string>): Promise<AgentMessage[]> {
     const entries = await this.deps.store.getMessages(sessionId);
     const messages: AgentMessage[] = [];
     for (const { info, parts } of entries) {
       if (info.role === "user") {
+        if (excludedUserIds?.has(info.id)) continue;
         const text = parts
           .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
           .map((part) => part.text)
           .join("\n");
-        messages.push({ role: "user", content: text || "（空消息）", timestamp: Date.parse(info.time.created) || Date.now() });
+        const files = parts.filter((p): p is Extract<Part, { type: "file" }> => p.type === "file" && p.url.startsWith("data:"));
+        const attachments = files.map((p) => ({ name: p.filename, mediaType: p.mime, data: p.url, size: Buffer.from(p.url.slice(p.url.indexOf(",") + 1), "base64").length }));
+        messages.push({ role: "user", content: [{ type: "text", text }, ...attachmentContent(attachments)], timestamp: Date.parse(info.time.created) || Date.now() });
       } else {
         const text = parts
           .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
@@ -990,6 +1092,8 @@ export async function createFrameworkSession(input: {
   title?: string;       // override the prompt-truncation default
   permission?: Ruleset; // pre-stamped session rules (subagent inherits parent's)
   writePaths?: string[]; // 子代理写路径白名单（WritePathSet，07-subagent）
+  creationRequestId?: string;
+  creationPayloadHash?: string;
 }): Promise<SessionInfo> {
   const session: SessionInfo = {
     id: input.id ?? newSessionId(),
@@ -1004,6 +1108,8 @@ export async function createFrameworkSession(input: {
     permission: input.permission ?? [],
     ...(input.writePaths?.length ? { writePaths: input.writePaths } : {}),
     queuedPrompts: [],
+    ...(input.creationRequestId ? { creationRequestId: input.creationRequestId } : {}),
+    ...(input.creationPayloadHash ? { creationPayloadHash: input.creationPayloadHash } : {}),
     time: { created: new Date().toISOString(), updated: new Date().toISOString() },
   };
   await input.store.createSession(session);

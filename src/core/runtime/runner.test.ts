@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { z } from "zod";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 
@@ -9,6 +12,8 @@ import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../sessio
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
 import type { ToolDef } from "../tools/def.js";
 import { createMemoryEventLog } from "../events/bus.js";
+import { createSqliteEventLog } from "../events/sqlite-event-log.js";
+import { createSqliteSessionStore } from "../session/sqlite-store.js";
 
 // ---- in-memory SessionStore ----
 
@@ -184,6 +189,98 @@ beforeEach(() => {
 });
 
 describe("SessionRunner", () => {
+  it("cancels during setup without calling the model or leaving a running lease", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "runner-abort-"));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const store = createSqliteSessionStore({ dataDir });
+    const h = makeHarness([fauxAssistantMessage("must not run")]);
+    const stream = vi.fn();
+    const runner = new SessionRunner({ ...h.deps, store, eventLog: createSqliteEventLog({ dataDir }), streamFnFor: () => stream as never,
+      leaseStore: { stamp: async () => { await gate; }, clear: store.clear },
+    });
+    const session = await createFrameworkSession({ store, userId: "u", workspaceId: "w", model: { providerId: "faux", modelId: "test-model" } });
+    try {
+      await runner.prompt(session.id, { requestId: "abort_setup_1", text: "first" });
+      await waitFor(() => isSessionActive(session.id));
+      await runner.prompt(session.id, { requestId: "abort_setup_2", text: "queued" });
+      const stopping = runner.abort(session.id);
+      release();
+      await stopping;
+      expect(stream).not.toHaveBeenCalled();
+      expect(isSessionActive(session.id)).toBe(false);
+      expect((await store.workflow!.workflowRuns(session.id)).map(run => run.status)).toEqual(["cancelled", "cancelled"]);
+      expect((await store.getSession(session.id))?.leaseOwner).toBeUndefined();
+    } finally {
+      release();
+      await runner.abort(session.id);
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs registered prompts FIFO without leaking future queued users into model context", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "runner-workflow-"));
+    try {
+      const h = makeHarness([
+        fauxAssistantMessage("first answer"),
+        fauxAssistantMessage("second answer"),
+      ]);
+      const store = createSqliteSessionStore({ dataDir });
+      const contexts: string[] = [];
+      const original = h.deps.streamFnFor;
+      const runner = new SessionRunner({
+        ...h.deps,
+        store,
+        eventLog: createSqliteEventLog({ dataDir }),
+        streamFnFor: (session) => {
+          const stream = original(session)!;
+          return (model, context, options) => {
+            contexts.push(JSON.stringify(context.messages));
+            return stream(model, context, options);
+          };
+        },
+      });
+      const session = await createFrameworkSession({ store, userId: "user", workspaceId: "ws", model: { providerId: "faux", modelId: "test-model" }, prompt: "queue" });
+      await store.appendMessage({ id: "msg_legacy_user",sessionId: session.id,role: "user",agent: "default",model: session.model,time: { created: "2026-09-01T00:00:00.000Z" } });
+      await store.appendPart({ id: "part_legacy_user",sessionId: session.id,messageId: "msg_legacy_user",type: "text",text: "legacy user" });
+      await store.appendMessage({ id: "msg_legacy_assistant",sessionId: session.id,role: "assistant",parentId: "msg_legacy_user",agent: "default",model: session.model,time: { created: "2026-09-01T00:00:01.000Z" } });
+      await store.appendPart({ id: "part_legacy_assistant",sessionId: session.id,messageId: "msg_legacy_assistant",type: "text",text: "legacy answer" });
+      const first = await runner.prompt(session.id,{ requestId: "request_fifo_1", text: "first user" });
+      const second = await runner.prompt(session.id,{ requestId: "request_fifo_2", text: "future queued user" });
+      expect(first.disposition).toBe("started");
+      expect(second.disposition).toBe("queued");
+      await waitFor(() => contexts.length === 2,5_000);
+      expect(contexts[0]).toContain("first user");
+      expect(contexts[0]).toContain("legacy user");
+      expect(contexts[0]).not.toContain("future queued user");
+      expect(contexts[1]).toContain("first user");
+      expect(contexts[1]).toContain("first answer");
+      expect(contexts[1]).toContain("future queued user");
+    } finally {
+      await rm(dataDir,{ recursive: true, force: true });
+    }
+  });
+  it("persists files separately and sends decoded contents on initial and restored runs", async () => {
+    const h = makeHarness([fauxAssistantMessage("read"), fauxAssistantMessage("remembered")]);
+    const contexts: string[] = [];
+    const original = h.deps.streamFnFor;
+    h.deps.streamFnFor = (session) => {
+      const stream = original(session)!;
+      return (model, context, options) => { contexts.push(JSON.stringify(context.messages)); return stream(model, context, options); };
+    };
+    const runner = new SessionRunner(h.deps);
+    const session = await makeSession(h.store);
+    const data = Buffer.from("独立附件 secret-123");
+    await runner.prompt(session.id, { text: "这是什么文件", attachments: [{ name: "IDEAS.md", mediaType: "text/plain", size: data.length, data: `data:text/plain;base64,${data.toString("base64")}` }] });
+    await waitFor(() => lastStatus(h.published) === "idle");
+    const user = (await h.store.getMessages(session.id)).find((m) => m.info.role === "user")!;
+    expect(user.parts.filter((p) => p.type === "text")).toEqual([expect.objectContaining({ text: "这是什么文件" })]);
+    expect(user.parts).toContainEqual(expect.objectContaining({ type: "file", filename: "IDEAS.md" }));
+    expect(contexts[0]).toContain("secret-123");
+    await new SessionRunner(h.deps).prompt(session.id, { text: "再看一次" });
+    await waitFor(() => contexts.length >= 2 && lastStatus(h.published) === "idle");
+    expect(contexts.at(-1)).toContain("secret-123");
+  });
   it("text-only run: emits full part chain and settles idle", async () => {
     const { runner, store, published: harness } = makeHarness([fauxAssistantMessage("任务完成，已读取 1 个文件。")]);
     const session = await makeSession(store);
@@ -459,9 +556,14 @@ describe("SessionRunner", () => {
     await waitFor(() => publishedTypes(harness).includes("permission.asked"));
 
     // Mid-run prompt goes to the FIFO queue.
-    const queued = await runner.prompt(session.id, { text: "第二个任务" });
+    const queued = await runner.prompt(session.id, {
+      text: "第二个任务",
+      model: { providerId: "test", modelId: "queued-model" },
+      images: [{ url: "data:image/png;base64,AA==", mediaType: "image/png" }],
+    });
     expect(queued).toEqual({ queued: true });
     expect(store.sessions.get(session.id)?.queuedPrompts).toHaveLength(1);
+    expect(store.sessions.get(session.id)?.queuedPrompts[0]).toMatchObject({ model: { modelId: "queued-model" }, images: [{ mediaType: "image/png" }] });
 
     // Approve → first run settles → queued prompt drains with the next scripted response.
     faux.appendResponses([fauxAssistantMessage("第一个完成。"), fauxAssistantMessage("第二个完成。")]);
