@@ -57,6 +57,7 @@ export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOpt
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, isSessionAwaitingPermission, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
+export { validateAttachments, type InputAttachment } from "./core/runtime/attachments.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";
