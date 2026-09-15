@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 
 /** Minimal MCP (Model Context Protocol) stdio client. Speaks newline-delimited
  *  JSON-RPC 2.0 over the spawned server's stdin/stdout — the same framing as
@@ -304,7 +304,7 @@ export class McpStdioClient {
       const killGroup = () => {
         try {
           if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
-          else child.kill("SIGTERM");
+          else killWindowsTree(child.pid, "SIGTERM");
         } catch {
           child.kill("SIGTERM");
         }
@@ -314,7 +314,7 @@ export class McpStdioClient {
         if (child.exitCode === null) {
           try {
             if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
-            else child.kill("SIGKILL");
+            else killWindowsTree(child.pid, "SIGKILL");
           } catch {
             child.kill("SIGKILL");
           }
@@ -329,5 +329,14 @@ export class McpStdioClient {
       pending.reject(error);
     }
     this.#pending.clear();
+  }
+}
+
+function killWindowsTree(pid: number | undefined, _signal: string): void {
+  if (!pid) return;
+  try {
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  } catch {
+    // The process may have exited already.
   }
 }
