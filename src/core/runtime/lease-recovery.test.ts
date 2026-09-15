@@ -76,6 +76,19 @@ async function seedLeftovers() {
 }
 
 describe("finalizeInterruptedRun", () => {
+  it("recovers leftovers after the first thousand events and remains idempotent", async () => {
+    const log = createMemoryEventLog();
+    for (let i = 0; i < 1005; i++) await log.append({ sessionId, type: "session.status", data: { status: "running" } });
+    await log.append({ sessionId, type: "permission.asked", data: { request: { id: "late", sessionId, permission: "bash", patterns: [], always: [] } } });
+    await log.append({ sessionId, type: "todo.updated", data: { todos: [{ content: "late", status: "in_progress" }] } });
+    const { store } = memoryStore();
+    await finalizeInterruptedRun({ sessionId, log, store });
+    const count = await log.count(sessionId);
+    expect((await log.read(sessionId, 1007, 10)).map(event => event.type)).toEqual(["permission.replied", "todo.updated"]);
+    await finalizeInterruptedRun({ sessionId, log, store });
+    expect(await log.count(sessionId)).toBe(count);
+  });
+
   it("folds pending permission, running tool parts and in-flight todos to terminal states", async () => {
     const { log } = await seedLeftovers();
     const { store, parts } = memoryStore();

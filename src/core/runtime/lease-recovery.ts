@@ -1,6 +1,6 @@
 import type { EventLog } from "../events/bus.js";
 import { notifyEventLogListeners } from "../events/bus.js";
-import type { FrameworkEvent } from "../events/manifest.js";
+import type { FrameworkEvent, PersistedFrameworkEvent } from "../events/manifest.js";
 import type { Part } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
 
@@ -34,9 +34,19 @@ const globalRecovery = globalThis as typeof globalThis & { __zmzaiFrameworkLease
  *  both in the store and as appended events. Idempotent: a second pass finds
  *  no pending leftovers. */
 export async function finalizeInterruptedRun(input: { sessionId: string; log: EventLog; store: SessionStore }): Promise<void> {
-  const events = await input.log.read(input.sessionId, 0, 1_000);
+  const events: PersistedFrameworkEvent[] = [];
+  let cursor = 0;
+  while (true) {
+    const page = await input.log.read(input.sessionId, cursor, 1_000);
+    events.push(...page);
+    if (page.length < 1_000) break;
+    cursor = page[page.length - 1]!.seq;
+  }
   const append = async (event: FrameworkEvent) => {
-    const persisted = await input.log.append({ sessionId: input.sessionId, ...event }).catch(() => null);
+    const payload = { sessionId: input.sessionId, ...event };
+    const persisted = input.store.persistEvent
+      ? await input.store.persistEvent(payload)
+      : await input.log.append(payload);
     if (persisted) notifyEventLogListeners(persisted);
   };
 
@@ -73,7 +83,7 @@ export async function finalizeInterruptedRun(input: { sessionId: string; log: Ev
         time: { start: started, end: new Date().toISOString() },
       },
     } as Extract<Part, { type: "tool" }>;
-    await input.store.updatePart(terminal).catch(() => undefined);
+    if (!input.store.persistEvent) await input.store.updatePart(terminal);
     await append({ type: "message.part.updated", data: { part: terminal } });
   }
 
@@ -94,6 +104,8 @@ export async function reclaimExpiredLeases(input: { store: LeaseRecoveryStore; l
   for (const session of expired) {
     const reclaimed = await input.store.clearLeaseIfExpired(session.sessionId);
     if (!reclaimed) continue; // another scanner won the race
+    const workflow = input.finalizeStore?.workflow;
+    if (workflow) await workflow.recoverInterrupted(session.sessionId).catch(() => undefined);
     const events: Array<{ type: "session.status" | "session.error"; data: { status?: "idle"; name?: string; message?: string } }> = [
       { type: "session.error", data: { name: "LeaseExpired", message: "运行因服务重启中断，可在同一会话继续。" } },
       { type: "session.status", data: { status: "idle" } },

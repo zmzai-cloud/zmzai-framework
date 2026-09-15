@@ -46,23 +46,28 @@ export function createSqliteEventLog(options: SqliteEventLogOptions): EventLog {
     "SELECT json FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
   );
   const countStmt = db.prepare("SELECT COUNT(*) AS n FROM events WHERE session_id = ?");
+  function transaction<T>(body: () => T): T {
+    if (db.isTransaction) return body();
+    db.exec("BEGIN IMMEDIATE");
+    try { const result = body(); db.exec("COMMIT"); return result; }
+    catch (error) { db.exec("ROLLBACK"); throw error; }
+  }
 
   return {
     async append(event) {
       const schema = frameworkEventSchemas[event.type as FrameworkEventType];
       const parsed = schema.safeParse(event.data);
       if (!parsed.success) throw new Error(`INVALID_FRAMEWORK_EVENT: ${event.type} ${parsed.error.issues[0]?.message ?? ""}`);
-      const seq = (nextSeq.get(event.sessionId) as { n: number }).n;
-      const persisted: PersistedFrameworkEvent = {
-        id: newEventId(),
-        sessionId: event.sessionId,
-        seq,
-        type: event.type as FrameworkEventType,
-        data: parsed.data as never,
-        at: new Date().toISOString(),
-      };
-      insert.run(event.sessionId, seq, persisted.id, persisted.type, persisted.at, JSON.stringify(persisted));
-      return persisted;
+      return transaction(() => {
+        const seq = (nextSeq.get(event.sessionId) as { n: number }).n;
+        const persisted: PersistedFrameworkEvent = {
+          id: newEventId(), sessionId: event.sessionId, seq,
+          type: event.type as FrameworkEventType, data: parsed.data as never,
+          at: new Date().toISOString(),
+        };
+        insert.run(event.sessionId, seq, persisted.id, persisted.type, persisted.at, JSON.stringify(persisted));
+        return persisted;
+      });
     },
     async read(sessionId, sinceSeq, limit) {
       const rows = readStmt.all(sessionId, sinceSeq, limit) as { json: string }[];

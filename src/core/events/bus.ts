@@ -64,13 +64,13 @@ export type SubscribeOptions = {
 export async function* subscribeEventLog(log: EventLog, sessionId: string, options: SubscribeOptions = {}): AsyncIterable<PersistedFrameworkEvent> {
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   let cursor = options.sinceSeq ?? 0;
-  const queue: PersistedFrameworkEvent[] = [];
+  const queue = new Map<number, PersistedFrameworkEvent>();
   let wake: (() => void) | null = null;
-  let done = false;
+  let done = options.signal?.aborted ?? false;
 
   const listener = (event: PersistedFrameworkEvent) => {
     if (event.seq <= cursor) return;
-    queue.push(event);
+    queue.set(event.seq, event);
     wake?.();
   };
   const registered = listeners.get(sessionId) ?? new Set<LiveListener>();
@@ -88,16 +88,19 @@ export async function* subscribeEventLog(log: EventLog, sessionId: string, optio
       const missed = await log.read(sessionId, cursor, 500);
       for (const record of missed) {
         if (record.seq <= cursor) continue;
-        queue.push(record);
+        queue.set(record.seq, record);
       }
-      queue.sort((a, b) => a.seq - b.seq);
-      while (queue.length && queue[0]!.seq > cursor) {
-        const event = queue.shift()!;
+      for (const event of [...queue.values()].sort((a, b) => a.seq - b.seq)) {
+        if (done) break;
+        if (event.seq <= cursor) { queue.delete(event.seq); continue; }
+        if (event.seq !== cursor + 1) break;
+        queue.delete(event.seq);
         cursor = event.seq;
         yield event;
       }
-      queue.length = 0;
       if (done) break;
+      // Drain full replay batches without inserting a polling delay per page.
+      if (missed.length === 500 && missed[missed.length - 1]!.seq <= cursor) continue;
 
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {

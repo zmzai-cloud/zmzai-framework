@@ -173,6 +173,40 @@ describe("notifyEventLogListeners", () => {
 // ---- subscribeEventLog ----
 
 describe("subscribeEventLog", () => {
+  it("retains future live events until the missing sequence arrives", async () => {
+    const log = createMemoryEventLog();
+    const ac = new AbortController();
+    const received: number[] = [];
+    const consuming = (async () => {
+      for await (const event of subscribeEventLog(log, "gap", { sinceSeq: 1, signal: ac.signal, pollIntervalMs: 5 })) {
+        received.push(event.seq);
+        if (received.length === 2) break;
+      }
+    })();
+    const event = { id: "future", sessionId: "gap", seq: 3, type: "session.status", data: { status: "idle" }, at: new Date().toISOString() } as PersistedFrameworkEvent;
+    try {
+      notifyEventLogListeners(event);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(received).toEqual([]);
+      notifyEventLogListeners({ ...event, id: "missing", seq: 2 });
+      await vi.waitFor(() => expect(received).toEqual([2, 3]));
+    } finally {
+      ac.abort();
+      await consuming;
+    }
+  });
+
+  it("does not read or subscribe indefinitely with an already aborted signal", async () => {
+    const log = createMemoryEventLog();
+    const read = vi.spyOn(log, "read");
+    const ac = new AbortController();
+    ac.abort();
+    const received = [];
+    for await (const event of subscribeEventLog(log, "aborted", { signal: ac.signal })) received.push(event);
+    expect(received).toEqual([]);
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it("replays past events from the log", async () => {
     const log = createMemoryEventLog();
     await log.append({ type: "session.status", data: { status: "running" }, sessionId: "ses_1" } as unknown as FrameworkEvent & { sessionId: string });
