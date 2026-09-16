@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { shellSpecFor } from "./terminal-backend.js";
+import { probeCommandFor, shellSpecFor } from "./terminal-backend.js";
 
 /** 终端会话的退出态完全由进程退出事件驱动（`TerminalBackend.onExit`），
  *  所以 shell 规格必须保证「命令跑完即退出」。
@@ -34,5 +34,31 @@ describe("shellSpecFor：一次执行型 shell 规格", () => {
     const spec = shellSpecFor("linux", { hasPwsh: false, hasPowershell: false });
     expect(spec.file).toBe("/bin/sh");
     expect(spec.prefixArgs).toEqual(["-c"]);
+  });
+});
+
+/** 回归锚点：probePtySpawn 曾硬编码 /bin/sh -c true——Windows 上没有 /bin/sh，
+ *  探测必失败 → 打包版在真实 Windows 上永久静默降级 pipe。探测命令必须跟随
+ *  shellSpecFor 的跨平台规格，且语义是一次性执行（跑完即退）。 */
+describe("probeCommandFor：跨平台 pty 探测命令", () => {
+  it("Windows pwsh：用 pwsh -Command exit 0，不引用 /bin/sh", () => {
+    const cmd = probeCommandFor("win32", { hasPwsh: true, hasPowershell: true });
+    expect(cmd.file).toBe("pwsh.exe");
+    expect(cmd.args).toEqual(["-NoLogo", "-NoProfile", "-Command", "exit 0"]);
+    expect(cmd.args.join(" ")).not.toContain("/bin/sh");
+  });
+
+  it("Windows 兜底：powershell 与 cmd 分支同样可执行 exit 0", () => {
+    expect(probeCommandFor("win32", { hasPwsh: false, hasPowershell: true }).file).toBe("powershell.exe");
+    const cmd = probeCommandFor("win32", { hasPwsh: false, hasPowershell: false });
+    expect(cmd.file).toBe("cmd.exe");
+    expect(cmd.args).toEqual(["/d", "/s", "/c", "exit 0"]);
+  });
+
+  it("POSIX：sh -c exit 0，保持原探测语义", () => {
+    expect(probeCommandFor("darwin", { hasPwsh: false, hasPowershell: false })).toEqual({
+      file: "/bin/sh",
+      args: ["-c", "exit 0"],
+    });
   });
 });

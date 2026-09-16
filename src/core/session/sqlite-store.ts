@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
@@ -56,7 +56,10 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
     && !!db.prepare("SELECT 1 FROM schema_migrations WHERE version=?").get(migrationVersion);
   if (existed && !migrationRecorded) {
     const backupPath = `${databasePath}.pre-f0-v${migrationVersion}.bak`;
-    if (!existsSync(backupPath)) writeFileSync(backupPath,db.serialize());
+    // node:sqlite 的 DatabaseSync 没有 serialize()（那是 better-sqlite3 的 API），
+    // 旧库迁移路径一旦触发会直接 TypeError 崩掉启动。VACUUM INTO 支持参数绑定，
+    // 生成同结构完整备份且不需要额外写文件权限语义。
+    if (!existsSync(backupPath)) db.prepare("VACUUM INTO ?").run(backupPath);
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (

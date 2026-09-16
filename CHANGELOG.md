@@ -1,5 +1,15 @@
 # @zmzai/agent-framework
 
+## 0.5.2
+
+### Patch Changes
+
+- Windows 终端后端修复：pty 探测不再硬编码 `/bin/sh -c true`。
+  
+  该探测在 Windows 上必然失败（没有 /bin/sh），导致 node-pty 加载成功也**永久静默降级 pipe 后端**——打包版在真实 Windows 上从未用过真 PTY，macOS 一直正常所以长期未暴露（CI 原生 Windows 冒烟首次跑到 `backend === "pty"` 断言才现形）。探测命令现跟随 `shellSpecFor` 的跨平台 shell 规格（pwsh/powershell/cmd 优先级与正式会话一致），`exit 0` 在三种 shell 下语义一致；新增纯函数 `probeCommandFor` 供单测钉住回归。
+  
+  另修复旧库迁移路径的启动崩溃：`DatabaseSync.serialize()` 在 node:sqlite 上不存在（better-sqlite3 专属 API），带旧库的用户首次启动会 TypeError 崩溃；改用 `VACUUM INTO ?`（参数绑定）生成迁移前备份。
+
 ## 0.5.1
 
 ### Patch Changes

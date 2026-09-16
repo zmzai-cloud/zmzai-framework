@@ -75,10 +75,15 @@ export function createHostTerminalBackend(): TerminalBackend {
   return cachedBackend;
 }
 
-/** 同步 spawn 探测：能 fork /bin/sh -c true 即认为 pty 可用。 */
+/** 同步 spawn 探测：用宿主一次性 shell 规格跑 `exit 0`，能起 pty 即认为可用。
+ *
+ *  回归锚点：这里曾硬编码 `/bin/sh -c true`——Windows 上没有 /bin/sh，探测必失败，
+ *  导致打包版在真实 Windows 上**永久静默降级 pipe**（macOS 一直绿，CI 冒烟首次
+ *  跑到 backend === "pty" 断言才暴露）。探测必须走 shell() 的跨平台规格。 */
 function probePtySpawn(mod: NodePtyModule): boolean {
   try {
-    const term = mod.spawn("/bin/sh", ["-c", "true"], {
+    const { file, prefixArgs } = shell();
+    const term = mod.spawn(file, [...prefixArgs, "exit 0"], {
       name: "xterm-256color",
       cols: 20,
       rows: 5,
@@ -89,6 +94,17 @@ function probePtySpawn(mod: NodePtyModule): boolean {
   } catch {
     return false;
   }
+}
+
+/** pty 探测命令（纯函数，便于跨平台单测）。
+ *  `exit 0` 在 sh -c / pwsh -Command / cmd /c 下语义一致：立即退出且退出码 0，
+ *  绝不能换成交互式变体（会话永不退出，见 shellSpecFor 的 -NoExit 教训）。 */
+export function probeCommandFor(
+  platform: NodeJS.Platform,
+  availability: { hasPwsh: boolean; hasPowershell: boolean; comSpec?: string | undefined },
+): { file: string; args: string[] } {
+  const { file, prefixArgs } = shellSpecFor(platform, availability);
+  return { file, args: [...prefixArgs, "exit 0"] };
 }
 
 /** 一次性执行型 shell 规格（纯函数，便于跨平台单测）。
