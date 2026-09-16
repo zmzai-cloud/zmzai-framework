@@ -91,19 +91,37 @@ function probePtySpawn(mod: NodePtyModule): boolean {
   }
 }
 
-/** 统一 POSIX sh 执行（不用 $SHELL）：agent 语义需要可预测的语法方言，
- *  fish/zsh 差异会造成同一条命令两种结果。 */
-function shell(): { file: string; prefixArgs: string[] } {
-  if (process.platform === "win32") {
+/** 一次性执行型 shell 规格（纯函数，便于跨平台单测）。
+ *
+ *  语义必须与 POSIX 的 `sh -c "<command>"` 对齐：命令跑完 shell 即退出。
+ *  framework 的终端会话状态完全由进程退出事件驱动（`TerminalBackend.onExit`），
+ *  所以这里**绝不能带 `-NoExit`**——它会让 PowerShell 执行完命令后继续挂在交互
+ *  提示符上，进程永不退出，会话永远停在 running，read 也再等不到退出码。 */
+export function shellSpecFor(
+  platform: NodeJS.Platform,
+  availability: { hasPwsh: boolean; hasPowershell: boolean; comSpec?: string | undefined },
+): { file: string; prefixArgs: string[] } {
+  if (platform === "win32") {
     // PowerShell preserves the shell users normally expect on modern Windows;
     // retain cmd as a fallback for minimal/server installations.
-    const pathEntries = (process.env.Path ?? process.env.PATH ?? "").split(";");
-    const has = (name: string) => pathEntries.some((entry) => existsSync(resolve(entry, name)));
-    if (has("pwsh.exe")) return { file: "pwsh.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-NoExit", "-Command"] };
-    if (has("powershell.exe")) return { file: "powershell.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-NoExit", "-Command"] };
-    return { file: process.env.ComSpec || "cmd.exe", prefixArgs: ["/d", "/s", "/c"] };
+    if (availability.hasPwsh) return { file: "pwsh.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-Command"] };
+    if (availability.hasPowershell) return { file: "powershell.exe", prefixArgs: ["-NoLogo", "-NoProfile", "-Command"] };
+    return { file: availability.comSpec || "cmd.exe", prefixArgs: ["/d", "/s", "/c"] };
   }
+  // 统一 POSIX sh（不用 $SHELL）：agent 语义需要可预测的语法方言，
+  // fish/zsh 差异会造成同一条命令两种结果。
   return { file: "/bin/sh", prefixArgs: ["-c"] };
+}
+
+function shell(): { file: string; prefixArgs: string[] } {
+  if (process.platform !== "win32") return shellSpecFor(process.platform, { hasPwsh: false, hasPowershell: false });
+  const pathEntries = (process.env.Path ?? process.env.PATH ?? "").split(";");
+  const has = (name: string) => pathEntries.some((entry) => existsSync(resolve(entry, name)));
+  return shellSpecFor("win32", {
+    hasPwsh: has("pwsh.exe"),
+    hasPowershell: has("powershell.exe"),
+    comSpec: process.env.ComSpec,
+  });
 }
 
 /** 管道模式：detached 进程组 + 负值 pid 组杀，保证 npm run dev 这类带子进程的树能整树回收。 */

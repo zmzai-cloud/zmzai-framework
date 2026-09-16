@@ -1,5 +1,13 @@
 # @zmzai/agent-framework
 
+## 0.5.1
+
+### Patch Changes
+
+- Windows 终端会话修复：pwsh/powershell 启动参数不再带 `-NoExit`。
+  
+  该参数会让 PowerShell 执行完命令后继续挂在交互提示符上，进程永不退出，而终端会话状态完全由进程退出事件驱动——结果是 Windows 上每个终端会话都永远停在 `running`，`terminal_read` 拿不到退出码，打包冒烟的 “Terminal did not exit” 断言与跨盘冒烟都会失败。现与 POSIX 的 `sh -c "<command>"` 语义对齐（命令跑完即退出），并把 shell 规格抽成纯函数 `shellSpecFor`，用单测钉住该回归。
+
 ## 0.5.0
 
 ### Minor Changes
