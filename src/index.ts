@@ -69,11 +69,31 @@ export {
   MAX_ATTACHMENT_REFS,
   type AttachmentKind,
   type AttachmentContentRef,
+  type AttachmentAccessScope,
+  type AttachmentSummary,
   type AttachmentProvider,
   type InputAttachment,
   type InputAttachmentRef,
   type PiContentPart,
 } from "./core/runtime/attachments.js";
+export {
+  EXTRACTION_LIMITS,
+  EXTRACTION_VERSION,
+  READ_ATTACHMENT_MAX_CHARS,
+  SEARCH_ATTACHMENT_DEFAULT_HITS,
+  SEARCH_ATTACHMENT_MAX_HITS,
+  compactionAttachmentNote,
+  formatLocator,
+  searchSections,
+  sectionsForLocator,
+  selectInitialSections,
+  validateExtractedDocument,
+  type ExtractedDocument,
+  type ExtractedSection,
+  type ExtractionLocator,
+  type SectionHit,
+} from "./core/runtime/extraction.js";
+export { createAttachmentTools } from "./core/tools/attachments.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";

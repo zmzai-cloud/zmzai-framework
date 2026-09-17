@@ -753,7 +753,7 @@ export class SessionRunner {
         const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
       }).filter((img): img is { type: "image"; data: string; mimeType: string } => img !== null);
-      const attachmentParts = await attachmentRefContent(this.deps.attachments, input.attachmentRefs ?? []);
+      const attachmentParts = await attachmentRefContent(this.deps.attachments, input.attachmentRefs ?? [], { sessionId: session.id });
       await agent.prompt({ role: "user", content: [{ type: "text", text: input.text }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() });
       await settled();
       let failed = agent.state.errorMessage;
@@ -1087,7 +1087,7 @@ export class SessionRunner {
             kind: p.kind ?? "text",
           }]
           : []);
-        const refParts = await attachmentRefContent(this.deps.attachments, refs);
+        const refParts = await attachmentRefContent(this.deps.attachments, refs, { sessionId });
         messages.push({ role: "user", content: [{ type: "text", text }, ...attachmentContent(legacy), ...refParts], timestamp: Date.parse(info.time.created) || Date.now() });
       } else {
         const text = parts

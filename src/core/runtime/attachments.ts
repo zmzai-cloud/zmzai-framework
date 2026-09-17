@@ -1,3 +1,5 @@
+import type { ExtractedDocument } from "./extraction.js";
+
 export type InputAttachment = { name: string; mediaType: string; data: string; size: number };
 
 /** 支持的文件大类（规格 2 §8）。`kind` 决定模型侧的处理方式（图片走视觉输入，
@@ -21,13 +23,29 @@ export type InputAttachmentRef = {
   kind: AttachmentKind;
 };
 
+/** 附件访问的授权范围（规格 2 §13）。
+ *
+ *  **必填**而不是可选：一个「省略就等于不校验」的参数迟早会被某个调用点省掉，
+ *  而它的失效方式（读到别的会话的文件）是静默的。framework 自己无法判断某个 id
+ *  属于谁——那必须由能访问存储的一侧按这个范围判定。 */
+export type AttachmentAccessScope = { sessionId: string };
+
+/** 清单与搜索结果里的附件摘要（不含内容）。 */
+export type AttachmentSummary = { id: string; name: string; kind: AttachmentKind };
+
 /**
- * Host 提供的附件读取器（规格 2 §9.2）。framework 自己不碰文件系统：
+ * Host 提供的附件读取器（规格 2 §9.2 / §10.2）。framework 自己不碰文件系统：
  * 桌面端读本地 blob store，服务端读对象存储，同一接口两种实现。
  */
 export interface AttachmentProvider {
-  /** 返回原始字节；附件不存在或已清理时返回 null（历史消息仍要能渲染）。 */
-  read(id: string): Promise<{ ref: InputAttachmentRef; bytes: Uint8Array } | null>;
+  /** 返回原始字节；附件不存在、**不属于该会话**或已清理时返回 null（历史消息仍要能渲染）。 */
+  read(id: string, scope: AttachmentAccessScope): Promise<{ ref: InputAttachmentRef; bytes: Uint8Array } | null>;
+  /** 返回结构化提取结果（带 locator，规格 §10.1）。未实现时 `read_attachment`
+   *  会明确说「这个附件没有结构化正文」，而不是让模型自己猜内容。 */
+  extract?(id: string, scope: AttachmentAccessScope): Promise<ExtractedDocument | null>;
+  /** 列出该会话的附件（供跨附件搜索）。未实现时 `search_attachments` 必须显式要求
+   *  attachmentId——不允许退化成「搜索全项目」。 */
+  list?(scope: AttachmentAccessScope): Promise<readonly AttachmentSummary[]>;
 }
 
 /** Validate before queuing or persisting. Never fetch user-supplied URLs. */
@@ -121,17 +139,21 @@ export type AttachmentContentRef = {
  * 模型上下文里的附件清单（**不含正文**，规格 2 §10.2）。
  * 仅在正文不可用时出现——长文档、图片之外的二进制、或 blob 已丢失。
  */
-export function attachmentManifest(refs: readonly AttachmentContentRef[]): string {
+export function attachmentManifest(refs: readonly AttachmentContentRef[], options: { canReadStructured?: boolean } = {}): string {
   const lines = refs.map((ref) => {
     const media = ref.mediaType ?? "unknown";
     const bytes = typeof ref.size === "number" ? `${ref.size} bytes` : "size unknown";
     return `- ${ref.name} (${media}, ${bytes}, attachment_id=${ref.id}, kind=${ref.kind})`;
   });
-  // 注意：措辞里刻意不点名任何工具。正文提取尚未接入时，不能引导模型调用一个
-  // 不存在的工具去猜内容——那只会产生幻觉。提取接入后由产品侧补充读取指引。
+  // 是否点名工具取决于 host 是否真的提供了结构化正文（`provider.extract`）。
+  // 没有提取能力时提「可以用 read_attachment 读」就是在诱导模型调用一个只会
+  // 回「没有正文」的工具——那不是能力，是噪音。
+  const hint = options.canReadStructured
+    ? "Their full text is NOT in this turn — use read_attachment (by attachment_id, page/sheet/slide/line, or section_id) and search_attachments to read the parts you need."
+    : "Their contents are NOT available in this turn — only the file list below.";
   return [
     "<user_attachments>",
-    "These files were sent with the message. Their contents are NOT available in this turn — only the file list below.",
+    `These files were sent with the message. ${hint}`,
     ...lines,
     "</user_attachments>",
   ].join("\n");
@@ -167,14 +189,15 @@ export type PiContentPart = { type: "text"; text: string } | { type: "image"; da
 export async function attachmentRefContent(
   provider: AttachmentProvider | undefined,
   refs: readonly AttachmentContentRef[],
+  scope: AttachmentAccessScope,
 ): Promise<PiContentPart[]> {
   if (refs.length === 0) return [];
   const parts: PiContentPart[] = [];
   const listed: AttachmentContentRef[] = [];
   for (const ref of refs) {
-    // 未注入 provider（或附件已被清理）时降级为清单条目，绝不报错——
+    // 未注入 provider（或附件已被清理、不属于该会话）时降级为清单条目，绝不报错——
     // 历史消息必须始终可重放（规格 2 §12「不让整条消息渲染失败」）。
-    const media = provider ? await provider.read(ref.id).catch(() => null) : null;
+    const media = provider ? await provider.read(ref.id, scope).catch(() => null) : null;
     if (!media) {
       listed.push(ref);
       continue;
@@ -189,7 +212,7 @@ export async function attachmentRefContent(
     }
     listed.push(ref);
   }
-  if (listed.length > 0) parts.push({ type: "text", text: attachmentManifest(listed) });
+  if (listed.length > 0) parts.push({ type: "text", text: attachmentManifest(listed, { canReadStructured: provider?.extract !== undefined }) });
   return parts;
 }
 
