@@ -3,7 +3,7 @@
  *  Assemble with createServer() (or wire SessionRunner directly). */
 
 // core: session
-export type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SelectedSkill, SessionInfo, SessionStatus, ModelRef, ToolState, ThinkingEffort } from "./core/session/types.js";
+export type { MessageInfo, MessageWithParts, Part, FilePart, QueuedPrompt, SelectedSkill, SessionInfo, SessionStatus, ModelRef, ToolState, ThinkingEffort } from "./core/session/types.js";
 export type { SessionStore } from "./core/session/store.js";
 export { newSessionId, newMessageId, newPartId, newPermissionRequestId, newEventId } from "./core/session/ids.js";
 export { createJsonlSessionStore } from "./core/session/jsonl-store.js";
@@ -57,7 +57,23 @@ export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOpt
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, isSessionAwaitingPermission, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
-export { validateAttachments, type InputAttachment } from "./core/runtime/attachments.js";
+export {
+  validateAttachments,
+  validateAttachmentRefs,
+  attachmentContent,
+  attachmentManifest,
+  attachmentDataBlock,
+  attachmentRefContent,
+  ATTACHMENT_KINDS,
+  INLINE_TEXT_LIMIT,
+  MAX_ATTACHMENT_REFS,
+  type AttachmentKind,
+  type AttachmentContentRef,
+  type AttachmentProvider,
+  type InputAttachment,
+  type InputAttachmentRef,
+  type PiContentPart,
+} from "./core/runtime/attachments.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";
 export { PartProjector, serializeEmit } from "./core/runtime/pi-bridge.js";

@@ -13,7 +13,10 @@ export type SelectedSkill = { id: string; name: string; digest: string };
 
 export type QueuedPrompt = {
   text: string;
+  /** 旧契约（v1，data URL）。仅为兼容仍在传 base64 的调用方保留。 */
   attachments?: readonly import("../runtime/attachments.js").InputAttachment[];
+  /** 新契约（v2）：附件描述符，内容由 host 的附件存储持有（规格 2 §11）。 */
+  attachmentRefs?: readonly import("../runtime/attachments.js").InputAttachmentRef[];
   images?: readonly { url: string; mediaType: string }[];
   model?: ModelRef;
   agent?: string;
@@ -98,18 +101,36 @@ export type ToolState =
 
 type PartBase = { id: string; sessionId: string; messageId: string };
 
-export type Part = PartBase &
-  (
-    | { type: "text"; text: string; synthetic?: boolean }
-    | { type: "reasoning"; text: string }
-    | { type: "tool"; callId: string; tool: string; state: ToolState }
-    | { type: "step-start" }
-    | { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } }
-    | { type: "subtask"; prompt: string; description: string; agent: string; childSessionId: string }
-    | { type: "file"; mime: string; filename: string; url: string }
-    | { type: "image"; url: string; mediaType: string; alt?: string }
-    | { type: "compaction"; summary: string }
-  );
+/**
+ * 文件 part（规格 2 §11）。
+ *
+ * 【为什么 `url` 变成可选】旧链路把文件写成 `url: "data:...base64,..."`，消息 part
+ * 里因此塞着整份文件。新链路只写 `attachmentId` 描述符。为了让历史消息仍能渲染，
+ * `url` 保留为可选字段——消费方必须先判 `url`（旧）再判 `attachmentId`（新）。
+ */
+export type FilePart = PartBase & {
+  type: "file";
+  mime: string;
+  filename: string;
+  /** 旧链路遗留的内联 data URL。新消息不再产生。 */
+  url?: string;
+  /** 新链路：附件 id（内容在 host 的附件存储里）。 */
+  attachmentId?: string;
+  size?: number;
+  kind?: import("../runtime/attachments.js").AttachmentKind;
+  status?: "processing" | "ready" | "error";
+};
+
+export type Part =
+  | (PartBase & { type: "text"; text: string; synthetic?: boolean })
+  | (PartBase & { type: "reasoning"; text: string })
+  | (PartBase & { type: "tool"; callId: string; tool: string; state: ToolState })
+  | (PartBase & { type: "step-start" })
+  | (PartBase & { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } })
+  | (PartBase & { type: "subtask"; prompt: string; description: string; agent: string; childSessionId: string })
+  | FilePart
+  | (PartBase & { type: "image"; url: string; mediaType: string; alt?: string })
+  | (PartBase & { type: "compaction"; summary: string });
 
 export type MessageWithParts = { info: MessageInfo; parts: Part[]; messageSeq?: number };
 

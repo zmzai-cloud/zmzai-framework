@@ -96,7 +96,7 @@ export class PartProjector {
 
   // ---- PI event handlers (called by handleAgentEvent) ----
 
-  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill, references?: readonly string[], attachments?: readonly import("./attachments.js").InputAttachment[]): MessageInfo {
+  onUserPrompt(emit: Emit, text: string, images?: readonly { url: string; mediaType: string }[], skill?: SelectedSkill, references?: readonly string[], attachments?: readonly import("./attachments.js").InputAttachment[], attachmentRefs?: readonly import("./attachments.js").InputAttachmentRef[]): MessageInfo {
     const message: MessageInfo = {
       id: newMessageId(),
       sessionId: this.identity.sessionId,
@@ -137,6 +137,24 @@ export class PartProjector {
     }
     for (const file of attachments ?? []) {
       const part: Part = { id: newPartId(), sessionId: this.identity.sessionId, messageId: message.id, type: "file", filename: file.name, mime: file.mediaType, url: file.data };
+      this.parts.set(part.id, part);
+      emit({ type: "message.part.updated", data: { part } });
+    }
+    // 新契约（规格 2 §11）：只写描述符，不写内容——消息 part 与事件里因此不再出现
+    // base64，历史加载也不必反序列化整份文件。
+    for (const ref of attachmentRefs ?? []) {
+      const part: Part = {
+        id: newPartId(),
+        sessionId: this.identity.sessionId,
+        messageId: message.id,
+        type: "file",
+        filename: ref.name,
+        mime: ref.mediaType,
+        attachmentId: ref.id,
+        size: ref.size,
+        kind: ref.kind,
+        status: "ready",
+      };
       this.parts.set(part.id, part);
       emit({ type: "message.part.updated", data: { part } });
     }

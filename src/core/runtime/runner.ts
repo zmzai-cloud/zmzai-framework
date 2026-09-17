@@ -1,5 +1,11 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { validateAttachments, attachmentContent } from "./attachments.js";
+import {
+  validateAttachments,
+  validateAttachmentRefs,
+  attachmentContent,
+  attachmentRefContent,
+  type AttachmentContentRef,
+} from "./attachments.js";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 import { AgentRegistry, type AgentInfo } from "../agent/registry.js";
@@ -39,7 +45,10 @@ export type { ThinkingEffort } from "../session/types.js";
 
 export type PromptInput = {
   requestId?: string;
+  /** 旧契约（v1，data URL）。 */
   attachments?: readonly import("./attachments.js").InputAttachment[];
+  /** 新契约（v2）：附件描述符（规格 2 §11）。与 `attachments` 可并存，便于迁移期混用。 */
+  attachmentRefs?: readonly import("./attachments.js").InputAttachmentRef[];
   text: string;
   agent?: string;
   model?: ModelRef;
@@ -92,6 +101,9 @@ export type RunnerDeps = {
    *  则作为首条 in-memory user 消息前插（不落 store）。抛错/返回空时零影响。 */
   memoryContextFor?: (session: SessionInfo, text: string) => Promise<string | undefined>;
   resolveMandatorySkill?: MandatorySkillResolver;
+  /** 附件正文读取器（规格 2 §9.2）。未注入时描述符只能渲染成清单，
+   *  图片与小型文本附件也不会被内联——功能降级但不报错。 */
+  attachments?: import("./attachments.js").AttachmentProvider;
 };
 
 type ActiveRun = {
@@ -266,7 +278,7 @@ export class SessionRunner {
   }
 
   async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
-    input = { ...input, attachments: validateAttachments(input.attachments) };
+    input = { ...input, attachments: validateAttachments(input.attachments), attachmentRefs: validateAttachmentRefs(input.attachmentRefs) };
     const session = await this.deps.store.getSession(sessionId);
     if (!session) throw new Error("SESSION_NOT_FOUND");
 
@@ -276,7 +288,7 @@ export class SessionRunner {
       const parts: Part[] = [];
       const message = projector.onUserPrompt(event => {
         if (event.type === "message.part.updated") parts.push(event.data.part);
-      }, input.text,input.images,input.skill,input.references,input.attachments);
+      }, input.text,input.images,input.skill,input.references,input.attachments,input.attachmentRefs);
       const accepted = await this.deps.store.workflow.acceptPrompt(sessionId,input,{ message,parts });
       for (const event of accepted.events) notifyEventLogListeners(event);
       if (accepted.events.length) this.drain(sessionId);
@@ -287,6 +299,8 @@ export class SessionRunner {
       await this.deps.store.enqueuePrompt(sessionId, {
         text: input.text,
         attachments: input.attachments,
+        // 排队消息必须记住附件引用：真正执行时要按 id 重新确认附件仍存在且可读（规格 2 §11）
+        ...(input.attachmentRefs?.length ? { attachmentRefs: [...input.attachmentRefs] } : {}),
         images: input.images,
         model: input.model,
         ...(input.agent ? { agent: input.agent } : {}),
@@ -734,12 +748,13 @@ export class SessionRunner {
       await Promise.all(fireRunStart(this.hooks, { sessionId: session.id, agent: session.agent, text: input.text }));
       await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
       if (abortController.signal.aborted) throw new Error("Run cancelled during setup");
-      if (!acceptedUserId) projector.onUserPrompt(emit, input.text, input.images, input.skill, input.references, input.attachments);
+      if (!acceptedUserId) projector.onUserPrompt(emit, input.text, input.images, input.skill, input.references, input.attachments, input.attachmentRefs);
       const piImages = input.images?.map((img) => {
         const match = img.url.match(/^data:([^;]+);base64,(.+)$/);
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
       }).filter((img): img is { type: "image"; data: string; mimeType: string } => img !== null);
-      await agent.prompt({ role: "user", content: [{ type: "text", text: input.text }, ...attachmentContent(input.attachments ?? []), ...(piImages ?? [])], timestamp: Date.now() });
+      const attachmentParts = await attachmentRefContent(this.deps.attachments, input.attachmentRefs ?? []);
+      await agent.prompt({ role: "user", content: [{ type: "text", text: input.text }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() });
       await settled();
       let failed = agent.state.errorMessage;
       if (unknownSideEffect) {
@@ -1052,9 +1067,28 @@ export class SessionRunner {
           .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
           .map((part) => part.text)
           .join("\n");
-        const files = parts.filter((p): p is Extract<Part, { type: "file" }> => p.type === "file" && p.url.startsWith("data:"));
-        const attachments = files.map((p) => ({ name: p.filename, mediaType: p.mime, data: p.url, size: Buffer.from(p.url.slice(p.url.indexOf(",") + 1), "base64").length }));
-        messages.push({ role: "user", content: [{ type: "text", text }, ...attachmentContent(attachments)], timestamp: Date.parse(info.time.created) || Date.now() });
+        const fileParts = parts.filter((p): p is Extract<Part, { type: "file" }> => p.type === "file");
+        // 旧链路历史：data URL 内联部分保持原样重建，否则升级后老会话会「丢附件」。
+        const legacy = fileParts.flatMap((p) => {
+          const url = p.url;
+          if (typeof url !== "string" || !url.startsWith("data:")) return [];
+          return [{ name: p.filename, mediaType: p.mime, data: url, size: Buffer.from(url.slice(url.indexOf(",") + 1), "base64").length }];
+        });
+        // 新链路：按描述符重建，正文经 provider 读取（图片→视觉输入、小文本→内联、其余→清单）。
+        // 因此重放历史**不会**把所有附件正文反复塞进后续每个 turn（规格 2 §11）。
+        // 用 AttachmentContentRef 而不是 InputAttachmentRef：part 里没有 sha256，
+        // 硬编一个假摘要会违反该类型的不变量。
+        const refs: AttachmentContentRef[] = fileParts.flatMap((p) => p.attachmentId
+          ? [{
+            id: p.attachmentId,
+            name: p.filename,
+            mediaType: p.mime,
+            ...(typeof p.size === "number" ? { size: p.size } : {}),
+            kind: p.kind ?? "text",
+          }]
+          : []);
+        const refParts = await attachmentRefContent(this.deps.attachments, refs);
+        messages.push({ role: "user", content: [{ type: "text", text }, ...attachmentContent(legacy), ...refParts], timestamp: Date.parse(info.time.created) || Date.now() });
       } else {
         const text = parts
           .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
