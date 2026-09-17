@@ -71,7 +71,11 @@ describe("read_attachment", () => {
   it("归属校验由 host 做：本会话取不到的附件给出可操作的说明", async () => {
     const tools = createAttachmentTools(provider());
     const result = await tools[0]!.execute({ attachmentId: "att_other_session" } as never, ctx());
-    expect(result.output).toContain("不属于当前会话");
+    // 框架这一侧无法区分「不存在」「不属于本会话」「还没解析完」「是图片」——
+    // 所以逐一列出可能原因，而不是替 host 断言其中一个
+    expect(result.output).toContain("不属于本会话");
+    expect(result.output).toContain("解析中");
+    expect(result.output).toContain("图片");
   });
 
   it("把会话 id 传给 host（否则跨会话读取无从拦截）", async () => {

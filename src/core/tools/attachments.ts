@@ -102,9 +102,12 @@ export function createAttachmentTools(provider: AttachmentProvider | undefined):
     async execute(args, ctx: ToolContext) {
       const doc = await extract(args.attachmentId, { sessionId: ctx.sessionId }).catch(() => null);
       if (!doc) {
+        // 三种原因都会走到这里，而且**无法在这一侧区分**（能不能读取决于 host 的
+        // 存储与解析状态）。所以逐一列出可能的原因，而不是断言其中一个——把一个
+        // 「还没解析完」说成「不存在」会让模型放弃一个其实马上就能读的文件。
         return {
           title: "附件不可读",
-          output: `附件 ${args.attachmentId} 不存在、不属于当前会话，或尚未完成解析。请确认 attachment_id 来自本会话消息里的附件清单。`,
+          output: `附件 ${args.attachmentId} 没有可用的结构化正文。可能原因：该 id 不存在或不属于本会话；文件还在解析中或解析失败；它是图片（内容已作为图像输入提供，没有文本正文）；或它是不支持提取正文的格式。请对照消息里的附件清单确认 id，不要凭猜测重复调用。`,
         };
       }
       const title = doc.title ? `${doc.title}` : args.attachmentId;
