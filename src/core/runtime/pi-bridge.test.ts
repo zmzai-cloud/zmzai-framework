@@ -85,6 +85,52 @@ describe("PartProjector.onUserPrompt", () => {
     expect((imgParts[0]!.data.part as { url: string }).url).toBe("data:image/png;base64,abc");
     expect((imgParts[1]!.data.part as { mediaType: string }).mediaType).toBe("image/jpeg");
   });
+
+  /**
+   * 规格 2 §18.5：新消息的**数据库 part** 里不得出现完整文件内容。
+   *
+   * 这一条比「上传响应里没有 base64」重要得多：part 会落库、会进事件流、会被历史
+   * 加载反序列化，一个 25MB 的 PDF 塞进去等于让每条历史消息都背上它。所以这里钉住
+   * 落库的 file part 只有描述符（id + 名字 + 类型 + 大小），**没有 url 字段**。
+   */
+  it("v2 描述符只落成文件卡，part 里没有任何文件内容", () => {
+    const proj = new PartProjector(identity);
+    const { events, emit } = collect();
+    proj.onUserPrompt(emit, "看一下这份合同", undefined, undefined, undefined, undefined, [
+      { id: "att_0123456789abcdef", name: "contract.pdf", mediaType: "application/pdf", size: 1024, sha256: "a".repeat(64), kind: "document" },
+    ]);
+    const fileParts = events
+      .filter((e) => e.type === "message.part.updated")
+      .map((e) => e.data.part as Record<string, unknown>)
+      .filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+    expect(fileParts[0]).toMatchObject({
+      attachmentId: "att_0123456789abcdef",
+      filename: "contract.pdf",
+      mime: "application/pdf",
+      size: 1024,
+      kind: "document",
+      status: "ready",
+    });
+    expect(fileParts[0]).not.toHaveProperty("url");
+    expect(fileParts[0]).not.toHaveProperty("data");
+    expect(JSON.stringify(fileParts[0])).not.toContain("base64");
+  });
+
+  /** 旧链路（v1，data URL）仍要能重放——升级后老消息不能打不开（规格 §18.12）。 */
+  it("v1 data URL 附件仍原样落库（升级后老消息不失效）", () => {
+    const proj = new PartProjector(identity);
+    const { events, emit } = collect();
+    const data = `data:text/plain;base64,${Buffer.from("旧正文").toString("base64")}`;
+    proj.onUserPrompt(emit, "旧消息", undefined, undefined, undefined, [{ name: "old.txt", mediaType: "text/plain", data, size: 9 }]);
+    const fileParts = events
+      .filter((e) => e.type === "message.part.updated")
+      .map((e) => e.data.part as Record<string, unknown>)
+      .filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+    expect(fileParts[0]!.url).toBe(data);
+    expect(fileParts[0]).not.toHaveProperty("attachmentId");
+  });
 });
 
 // ---- PartProjector: assistant lifecycle ----
