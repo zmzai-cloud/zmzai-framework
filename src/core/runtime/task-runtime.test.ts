@@ -67,11 +67,14 @@ async function taskHarness(script: FauxResponseStep[], policy?: RunnerDeps["task
     session,
     faux,
     events,
-    deps,
-    // 这套 harness 就是为了任务层而存在的：把它需要的两个能力显式暴露出来，
+    // 这套 harness 就是为了任务层而存在的：把它需要的能力显式暴露出来，
     // 测试里不必到处写 `!` 断言「我知道它一定在」。
     tasks: store.task!,
     workflow: store.workflow!,
+    // 场景 C 要把沙箱换成「结果不确定」的替身。`SessionRunnerDeps.sandbox` 是
+    // 可选字段，直接从 `deps` 上取会带出 undefined 分支，于是断言行也得跟着写
+    // `!`——那正好把「这个 harness 一定装了沙箱」这件事从类型里抹掉了。
+    sandbox: deps.sandbox!,
     cleanup: () => rm(dataDir, { recursive: true, force: true }),
   };
 }
@@ -398,7 +401,7 @@ describe("§17.3 端到端场景", () => {
       fauxAssistantMessage("推送命令没有任何输出，无法确认是否已经提交到远端。"),
     ]);
     // 沙箱报告「结果不确定」：命令跑完了，但拿不到明确的成败结论。
-    h.deps.sandbox.run = vi.fn().mockResolvedValue({ ok: false, outcome: "unknown", durationMs: 30_000, outputText: "", artifacts: [] }) as never;
+    h.sandbox.run = vi.fn().mockResolvedValue({ ok: false, outcome: "unknown", durationMs: 30_000, outputText: "", artifacts: [] }) as never;
     try {
       await h.runner.prompt(h.session.id, { requestId: "req_scenario_c", text: "把改动推到远端" });
       await waitFor(async () => countOf(await h.events(), "permission.asked") === 1);
@@ -416,7 +419,7 @@ describe("§17.3 端到端场景", () => {
       expect(task.blocker!.resumable).toBe(true);
       expect(task.blocker!.requiredAction).toContain("确认外部系统");
       // 命令只跑了一次：没有把「无输出」当成失败去重试
-      expect(h.deps.sandbox.run).toHaveBeenCalledTimes(1);
+      expect(h.sandbox.run).toHaveBeenCalledTimes(1);
       expect(countOf(await h.events(), "task.delivered")).toBe(0);
       // 也不该落成 failed——它没坏，只是不知道
       expect(task.status).not.toBe("failed");
