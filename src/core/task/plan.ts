@@ -220,6 +220,7 @@ export function newTaskRecord(input: {
     revision: 1,
     attemptCount: 0,
     noProgressCount: 0,
+    activeMs: 0,
     constraints: [],
     createdAt: input.now,
     updatedAt: input.now,

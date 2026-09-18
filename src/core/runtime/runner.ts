@@ -34,8 +34,10 @@ import { randomUUID } from "node:crypto";
 import type { PromptDisposition, PromptReceipt, WorkflowState } from "../session/workflow.js";
 import {
   DEFAULT_MAX_ATTEMPTS,
+  durationBudgetBlocker,
   evaluateTaskCompletion,
   lifecycleForBlocker,
+  normalizeMaxDurationMs,
   normalizeNoProgressPolicy,
   type CompletionRuntimeState,
   type CompletionVerdict,
@@ -149,6 +151,9 @@ export type RunnerDeps = {
   taskPolicy?: {
     /** 单次任务最多跑几次 Attempt（含 continuation）。 */
     maxAttempts?: number;
+    /** 单次任务的时间预算：累计**实际执行**时间的上限（毫秒）。
+     *  只累加各 Attempt 真正在跑的时间，等用户的时间不算（见 `activeMs`）。 */
+    maxDurationMs?: number;
     noProgress?: Partial<NoProgressPolicy>;
   };
 };
@@ -284,16 +289,17 @@ type TaskResolution = {
   previous: TaskRecord | null;
 };
 
-/** 用户明确放行时重置的两个计数（新消息恢复、以及 `resumeTask`）。
+/** 用户明确放行时重置的三个保护计数（新消息恢复、以及 `resumeTask`）。
  *
  *  【为什么必须重置】不重置的话「继续」是个死按钮：因为 no_progress 停下来的任务
- *  计数仍是 3，下一次判定立刻再停；因为预算停下来的任务第 N+1 轮开头就超过上限，
- *  一步都不会跑。用户点「继续」就是明确授权再做一些，那一刻起保护阈值应当重新
- *  计时——由人来决定要不要继续，正是这类保护的设计前提（规格 §10.1 的三档策略
- *  本来就以「用户可以再来一轮」为前提）。
+ *  计数仍是 3，下一次判定立刻再停；因为轮数预算停下来的任务第 N+1 轮开头就超过
+ *  上限，一步都不会跑；时间预算同理——已经烧满一小时的 `activeMs` 会让放行后的
+ *  第一轮连起点都过不去。用户点「继续」就是明确授权再做一些，那一刻起保护阈值
+ *  应当重新计时——由人来决定要不要继续，正是这类保护的设计前提（规格 §10.1 的
+ *  三档策略本来就以「用户可以再来一轮」为前提）。
  *
  *  这不会让任务无限跑：每一次重置都需要一次显式的人工动作，不存在自触发路径。 */
-const RESET_GUARDS_ON_RESUME = { noProgressCount: 0, attemptCount: 0 } as const;
+const RESET_GUARDS_ON_RESUME = { noProgressCount: 0, attemptCount: 0, activeMs: 0 } as const;
 
 /** 人工放行时喂给模型的驱动文本（与 `continuation` 那条同源但不同话术）。
  *
@@ -518,6 +524,7 @@ export class SessionRunner {
       // 计数也要一起还原：恢复路径把它们清零了，而这次提交并没有发生。
       noProgressCount: previous.noProgressCount,
       attemptCount: previous.attemptCount,
+      activeMs: previous.activeMs ?? 0,
       // 显式区分「清空 blocker」与「保持原样」：undefined 是清除指令
       ...(previous.blocker ? { blocker: previous.blocker } : { blocker: undefined }),
     }).catch(() => undefined);
@@ -1478,6 +1485,10 @@ export class SessionRunner {
       acceptanceCriteria,
       lastFingerprint: progress.fingerprint,
       noProgressCount: progress.noProgressCount,
+      // 时间预算的累计口径：这一轮实际跑了多久（见 `TaskRecord.activeMs`）。
+      // 放在这里而不是 `settleTask`，是因为**每一轮**都要记账——只在结算时记，
+      // 一个连跑 20 轮才停的任务会把整段时间全部漏掉，预算永远不触发。
+      activeMs: (task.activeMs ?? 0) + outcome.durationMs,
     });
     await this.publishStepEvents(task.steps, updated, sessionId);
     return updated;
@@ -1566,6 +1577,7 @@ export class SessionRunner {
     if (isWaitingStatus(task.status)) return "completed";
 
     const maxAttempts = Math.min(MAX_ATTEMPT_CEILING, Math.max(1, Math.floor(this.deps.taskPolicy?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)));
+    const maxDurationMs = normalizeMaxDurationMs(this.deps.taskPolicy?.maxDurationMs);
     const noProgressPolicy = this.deps.taskPolicy?.noProgress;
 
     // 从第二轮起，驱动这台机器的是任务自己（`continuation`），不再是「用户按过
@@ -1581,6 +1593,11 @@ export class SessionRunner {
 
     while (true) {
       const attemptNumber = task.attemptCount + 1;
+      // 时间预算先于轮数预算：两者的消息都指向「看一眼轨迹、确认目标是否要收窄」，
+      // 但先报出的应该是**已经烧掉多少时间**——那是用户此刻最需要知道的事实，
+      // 而轮数只在所有轮都很快时才成为瓶颈。
+      const overTime = durationBudgetBlocker(task, maxDurationMs);
+      if (overTime) return await this.settleTask(task, { status: "blocked", blocker: overTime }, session, stats);
       if (attemptNumber > maxAttempts) {
         return await this.settleTask(task, {
           status: "blocked",

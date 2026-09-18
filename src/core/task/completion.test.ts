@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_MAX_DURATION_MS,
   DEFAULT_NO_PROGRESS_POLICY,
+  MAX_DURATION_CEILING_MS,
+  durationBudgetBlocker,
   evaluateTaskCompletion,
   lifecycleForBlocker,
+  normalizeMaxDurationMs,
   normalizeNoProgressPolicy,
   type CompletionRuntimeState,
 } from "./completion.js";
@@ -348,5 +352,33 @@ describe("lifecycleForBlocker", () => {
     expect(lifecycleForBlocker("unsafe_replay")).toBe("blocked");
     expect(lifecycleForBlocker("budget")).toBe("blocked");
     expect(lifecycleForBlocker("no_progress")).toBe("blocked");
+  });
+});
+
+describe("时间预算（规格 §10.2 / §16 阶段 D「最长运行时间」）", () => {
+  it("有余量时不拦；超了给 blocked(budget) 并说清烧了多少分钟", () => {
+    expect(durationBudgetBlocker(taskOf({ activeMs: 10 * 60_000 }), 60 * 60_000)).toBeNull();
+    const blocker = durationBudgetBlocker(taskOf({ activeMs: 90 * 60_000 }), 60 * 60_000);
+    expect(blocker?.kind).toBe("budget");
+    expect(blocker?.message).toContain("90 分钟");
+    expect(blocker?.message).toContain("时间预算");
+    // 每个 blocker 都必须写明用户能做什么，不能只说「请继续」（§14.4）
+    expect(blocker?.requiredAction.length).toBeGreaterThan(0);
+    expect(blocker?.resumable).toBe(true);
+  });
+
+  it("旧任务没有 activeMs 字段时按 0 处理，不会一上来就判超支", () => {
+    const legacy = taskOf();
+    delete (legacy as { activeMs?: number }).activeMs;
+    expect(durationBudgetBlocker(legacy, 60_000)).toBeNull();
+  });
+
+  it("预算可配置，但被夹在 (0, 24h] 之间——宿主调不到「永不拦截」", () => {
+    expect(normalizeMaxDurationMs(5 * 60_000)).toBe(5 * 60_000);
+    expect(normalizeMaxDurationMs(0)).toBe(DEFAULT_MAX_DURATION_MS);
+    expect(normalizeMaxDurationMs(-1)).toBe(DEFAULT_MAX_DURATION_MS);
+    expect(normalizeMaxDurationMs(Number.NaN)).toBe(DEFAULT_MAX_DURATION_MS);
+    expect(normalizeMaxDurationMs(Number.POSITIVE_INFINITY)).toBe(DEFAULT_MAX_DURATION_MS);
+    expect(normalizeMaxDurationMs(365 * 24 * 60 * 60_000)).toBe(MAX_DURATION_CEILING_MS);
   });
 });

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createFauxCore, fauxAssistantMessage, fauxToolCall, type FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
 
 import { AgentRegistry } from "../agent/registry.js";
 import { SessionRunner, createFrameworkSession, type RunnerDeps } from "../runtime/runner.js";
@@ -30,7 +30,7 @@ function fakeWorkspace(): WorkspaceFiles {
   };
 }
 
-async function taskHarness(script: ReturnType<typeof fauxAssistantMessage>[], policy?: RunnerDeps["taskPolicy"]) {
+async function taskHarness(script: FauxResponseStep[], policy?: RunnerDeps["taskPolicy"]) {
   const dataDir = await mkdtemp(path.join(tmpdir(), "task-runtime-"));
   const faux = createFauxCore({ models: [{ id: "test-model" }] });
   faux.setResponses(script);
@@ -427,6 +427,71 @@ describe("任务运行时：重启恢复与人工放行", () => {
       expect(after.constraints).toEqual([]);
       expect(after.attemptCount).toBe(before.attemptCount);
       expect(after.noProgressCount).toBe(before.noProgressCount);
+    } finally {
+      await h.runner.abort(h.session.id);
+      await h.cleanup();
+    }
+  }, 20_000);
+});
+
+describe("任务运行时：预算与上下文存续（§10.2 / §16 阶段 D / §17.1.12）", () => {
+  it("时间预算耗尽时停在 blocked(budget)，放行后重新计时", async () => {
+    const h = await taskHarness(
+      [
+        fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "in_progress" }] })]),
+        fauxAssistantMessage("先解析了 PDF，下一页再落网页。"),
+        fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "completed" }] })]),
+        fauxAssistantMessage("PDF 内容已铺到网页并通过构建。"),
+      ],
+      // 预算压到 1 毫秒：第一轮刚跑完就超。轮数给足，证明停下来的是时间而不是轮数。
+      { maxDurationMs: 1, maxAttempts: 8 },
+    );
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_time", text: "把 PDF 铺到网页" });
+      await waitFor(async () => countOf(await h.events(), "task.blocked") === 1);
+      const stopped = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(stopped.status).toBe("blocked");
+      expect(stopped.blocker!.kind).toBe("budget");
+      // 说清楚是**时间**预算，而不是笼统的「预算」：用户要知道自己撞上的是哪一堵墙
+      expect(stopped.blocker!.message).toContain("时间预算");
+      expect(stopped.attemptCount).toBe(1);
+      expect(stopped.activeMs).toBeGreaterThan(1);
+
+      // 放行 = 预算重新计时。不重置 activeMs 的话，放行后的第一轮连起点都过不去，
+      // 「继续」就又成了一个按不出反应的死按钮。
+      expect(await h.runner.resumeTask(h.session.id)).toBe(true);
+      await waitFor(async () => countOf(await h.events(), "task.delivered") === 1);
+      const done = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(done.status).toBe("delivered");
+    } finally {
+      await h.cleanup();
+    }
+  }, 20_000);
+
+  // §17.1.12：上下文压缩不得带走任务契约。机制上契约进的是 systemPrompt（每个
+  // Attempt 从**持久化的 TaskRecord** 重新渲染一次），而 compaction 的
+  // transformContext 只折叠 messages——两者根本不在同一个容器里。这条测试钉住
+  // 的正是这个性质：续跑那一轮拿到的指令里，目标、验收条件、剩余步骤一个不少。
+  it("续跑时任务契约仍在 systemPrompt 里（历史怎么折叠都带不走）", async () => {
+    const prompts: string[] = [];
+    const h = await taskHarness([
+      fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "迁移 6 张图片", status: "in_progress" }] })]),
+      fauxAssistantMessage("图片还没迁完。"),
+      // 第三条起（也就是续跑那一轮）换成工厂，好把这一次真正发给模型的
+      // systemPrompt 抓下来——它不落库、不进事件流，只能在这里观测。
+      (context) => {
+        prompts.push(context.systemPrompt ?? "");
+        return fauxAssistantMessage("还在迁移。");
+      },
+    ]);
+    try {
+      await h.runner.prompt(h.session.id, { requestId: "req_contract", text: "把站点里的图片迁到新图床" });
+      await waitFor(() => prompts.length > 0);
+      const contract = prompts[0]!;
+      expect(contract).toContain("<task-contract>");
+      expect(contract).toContain("目标：把站点里的图片迁到新图床");
+      expect(contract).toContain("验收条件");
+      expect(contract).toContain("剩余步骤：迁移 6 张图片");
     } finally {
       await h.runner.abort(h.session.id);
       await h.cleanup();

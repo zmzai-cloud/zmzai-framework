@@ -110,6 +110,17 @@ export type TaskRecord = {
   attemptCount: number;
   /** 连续无进展的 Attempt 次数（规格 §10.1）。 */
   noProgressCount: number;
+  /** 累计执行时间（毫秒）：各 Attempt 的 `durationMs` 之和。
+   *
+   *  【为什么不是「now - createdAt」】墙钟会把任务**停下来等用户**的空白也算
+   *  进去：一个因为缺授权停了一夜的任务，第二天点「继续」时若直接拿墙钟比对
+   *  预算，第一轮还没开始就超时了——那正是「继续」变死按钮的另一种写法。
+   *  规格 §10.2 的时间预算要防的是「任务在烧」，不是「任务存在得久」。
+   *
+   *  口径说清楚：**阻塞期间**（blocked / waiting_* 到下一次放行之间）run 已经
+   *  结束，那段空白天然不计；而**轮内的授权等待**是这一轮的一部分，计入。
+   *  旧版本落库的任务没有这个字段，读的时候按 0 处理。 */
+  activeMs?: number;
   /** 用户中途追加的约束（steering 消息累积），进 continuation 上下文。 */
   constraints: string[];
   createdAt: string;

@@ -79,6 +79,41 @@ export const DEFAULT_NO_PROGRESS_POLICY: NoProgressPolicy = { blockedAt: 3, swit
 /** 单次 Attempt 的硬上限（规格 §10.1 / §16 阶段 D「最大 Attempt 数配置」）。 */
 export const DEFAULT_MAX_ATTEMPTS = 24;
 
+/** 单次任务的时间预算：累计执行时间的上限（规格 §10.2 / §16 阶段 D
+ *  「最长运行时间」）。默认一小时。
+ *
+ *  【计量口径】累加各 Attempt 的 durationMs，不是 `now - createdAt`。任务阻塞
+ *  期间（等授权、等用户补信息）run 已经结束，那段空白不计入——按墙钟算会让
+ *  「停了一夜的任务第二天点继续立刻超时」，把恢复通路堵死。 */
+export const DEFAULT_MAX_DURATION_MS = 60 * 60 * 1000;
+
+/** 时间预算的硬上限：24 小时。宿主调不到「永不拦截」。 */
+export const MAX_DURATION_CEILING_MS = 24 * 60 * 60 * 1000;
+
+/** 归一化宿主传入的时间预算。非正数 / NaN 一律回落默认值，而不是当成
+ *  「不限」——0 和负数在这里最可能的意思是配置写错了。 */
+export function normalizeMaxDurationMs(value?: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.min(MAX_DURATION_CEILING_MS, Math.floor(value))
+    : DEFAULT_MAX_DURATION_MS;
+}
+
+/** 时间预算判定：还有余量返回 null，超了给一个 blocked(budget) 的 blocker。
+ *
+ *  与 Attempt 数上限并列，两者防的是不同形态的失控：轮数上限挡「每次都有一点
+ *  进展但永远做不完」，时间预算挡「单轮本身就很慢，轮数不多但总时长失控」。 */
+export function durationBudgetBlocker(task: TaskRecord, maxDurationMs: number): TaskBlocker | null {
+  const spent = task.activeMs ?? 0;
+  if (spent <= maxDurationMs) return null;
+  const minutes = (value: number) => Math.max(1, Math.round(value / 60_000));
+  return {
+    kind: "budget",
+    message: `任务已累计执行 ${minutes(spent)} 分钟，超过了单次任务的时间预算（${minutes(maxDurationMs)} 分钟）。`,
+    requiredAction: "看一眼执行轨迹，确认目标是否需要收窄或拆成几次；确认后可以继续。",
+    resumable: true,
+  };
+}
+
 /** 归一化宿主传入的策略：clamp 到 [1, 8]，越界一律回落默认值而不是
  *  悄悄放行——「把 blockedAt 设成 1e9 就不会被拦」正是要防的。 */
 export function normalizeNoProgressPolicy(policy?: Partial<NoProgressPolicy>): NoProgressPolicy {

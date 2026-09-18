@@ -55,8 +55,12 @@ export {
   evaluateTaskCompletion,
   lifecycleForBlocker,
   normalizeNoProgressPolicy,
+  normalizeMaxDurationMs,
+  durationBudgetBlocker,
   DEFAULT_NO_PROGRESS_POLICY,
   DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_MAX_DURATION_MS,
+  MAX_DURATION_CEILING_MS,
 } from "./completion.js";
 
 export type { ProgressFingerprintInput, ProgressAdvance } from "./progress.js";
