@@ -177,15 +177,22 @@ describe("evaluateTaskCompletion", () => {
   });
 
   it("外部登录失效进入 blocked(external_auth)", () => {
-    const verdict = evaluateTaskCompletion(taskOf(), stateOf({ externalAuthRequired: "GitHub 凭据已失效" }));
+    const verdict = evaluateTaskCompletion(taskOf(), stateOf({ externalAuthRequired: { message: "GitHub 凭据已失效", requiredAction: "在终端里完成 gh auth login" } }));
     expect(verdict.status).toBe("blocked");
-    if (verdict.status === "blocked") expect(verdict.blocker.kind).toBe("external_auth");
+    if (verdict.status === "blocked") {
+      expect(verdict.blocker.kind).toBe("external_auth");
+      // 模型给的具体动作必须原样带到界面上（§14.4：不许只说「请继续」）
+      expect(verdict.blocker.requiredAction).toBe("在终端里完成 gh auth login");
+    }
   });
 
   it("缺少只能由用户提供的信息进入 blocked(input)", () => {
-    const verdict = evaluateTaskCompletion(taskOf(), stateOf({ inputRequired: "需要目标仓库地址" }));
+    const verdict = evaluateTaskCompletion(taskOf(), stateOf({ inputRequired: { message: "需要目标仓库地址", requiredAction: "把仓库地址发过来" } }));
     expect(verdict.status).toBe("blocked");
-    if (verdict.status === "blocked") expect(verdict.blocker.kind).toBe("input");
+    if (verdict.status === "blocked") {
+      expect(verdict.blocker.kind).toBe("input");
+      expect(verdict.blocker.requiredAction).toBe("把仓库地址发过来");
+    }
   });
 
   it("面对不可逆的分支选择时进入 blocked(choice)", () => {

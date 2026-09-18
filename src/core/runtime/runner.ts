@@ -26,6 +26,7 @@ import { builtinTools } from "../tools/builtins.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
 import type { AnyToolDef } from "../tools/def.js";
 import { isExternalToolDef } from "../tools/def.js";
+import { TASK_BLOCK_TOOL_ID, readTaskBlock, type TaskBlockInput } from "../tools/task-block.js";
 import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type LifecycleHook } from "./lifecycle.js";
 import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
@@ -267,6 +268,12 @@ type RunOutcome = {
   finalText: string;
   /** 本轮模型最后投递的 todo 列表（步骤投影的输入）。 */
   todos: TodoItem[] | null;
+  /** 本轮模型用 `task_block` 声明的阻塞（规格 3 §11）。
+   *
+   *  只留**最后一次**声明：同一轮里模型可能先说「缺域名」后来又自己找到了，
+   *  那就不该再停。后一次声明覆盖前一次，与 `todos` 的口径一致（都是「本轮最后
+   *  的状态」，而不是「本轮发生过的事」）。 */
+  taskBlock: TaskBlockInput | null;
   /** 本轮的证据候选（工具热路径上只累积内存，此处统一落库）。 */
   evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[];
   /** 以失败告终时的错误消息（用于区分「可重试的上游抖动」与「真的没救」）。 */
@@ -902,6 +909,8 @@ export class SessionRunner {
     /** 本轮的证据候选。在工具热路径上只累积内存，Attempt 结束时一次性投影进
      *  任务并落库——否则每次工具调用都要 CAS 写一次任务表。 */
     const evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[] = [];
+    /** 本轮模型用 `task_block` 声明的阻塞（规格 3 §11）。见 `RunOutcome.taskBlock`。 */
+    let taskBlock: TaskBlockInput | null = null;
 
     const compactionTransform = await this.buildCompaction(session, emit);
     // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
@@ -1038,6 +1047,9 @@ export class SessionRunner {
         toolErrors.push(`${toolCall.name}: ${resultText.trim().slice(0, 160)}`);
         if (toolErrors.length > 3) toolErrors.shift();
       } else {
+        // 模型声明「需要用户介入」（规格 §11）。只认成功的调用：一次被拒绝或
+        // 崩溃的 task_block 没有资格把任务停下来等用户。
+        if (toolCall.name === TASK_BLOCK_TOOL_ID) taskBlock = readTaskBlock(args);
         const kind = evidenceKindForTool(toolCall.name);
         if (kind) {
           const path = (args as { path?: unknown } | undefined)?.path;
@@ -1277,6 +1289,7 @@ export class SessionRunner {
       toolErrors: [...toolErrors],
       finalText: attemptFinalText,
       todos: latestTodos,
+      taskBlock,
       evidenceCandidates: [...evidenceCandidates],
       errorMessage: runErrorMessage,
     };
@@ -1374,11 +1387,20 @@ export class SessionRunner {
    *
    *  权限等待不在此列：`beforeToolCall` 里的 `engine.ask()` 会一直挂到用户回复，
    *  所以一次 Attempt 收尾时不会有悬空请求（`engine.dispose()` 也会兜底）。
-   *  这里仍读一次实际值，是为了覆盖 abort / 异常路径。 */
+   *  这里仍读一次实际值，是为了覆盖 abort / 异常路径。
+   *
+   *  【`task_block` 是这条规则的例外吗】不是。它确实由模型发起，但**内容是结构化
+   *  的声明**，不是自述的结论：模型说的是「我缺 X」「请你在 A 和 B 之间选」
+   *  「你需要去登录」，而不是「我已完成」。前者是事实的输入（只有模型知道自己在
+   *  等什么），后者才是不能采信的东西——完成与否始终由 Completion Gate 按步骤、
+   *  验收条件与证据独立判定，模型无法用 task_block 换来一个 delivered。 */
   private completionStateOf(outcome: RunOutcome, session: SessionInfo): CompletionRuntimeState {
     // 只有「重试已经耗尽、且错误不是上游抖动」才算真的没救（规格 §10.2）。
     // runLoop 内部已对可重试错误做过 5 次退避重试，能走到这里说明它没救回来。
     const fatal = outcome.state === "failed" && !!outcome.errorMessage && !isRetryableError(outcome.errorMessage);
+    // `choice` 与 `input` 都落在 waiting_input，但文案与界面动作不同（§14.2），
+    // 所以在这里分派而不是揉成一个字符串。
+    const block = outcome.taskBlock;
     return {
       attemptSettled: outcome.settled,
       fatalError: fatal ? outcome.errorMessage : null,
@@ -1387,9 +1409,9 @@ export class SessionRunner {
       pendingPermissions: isSessionAwaitingPermission(session.id) ? 1 : 0,
       unsafeReplay: null,
       budgetExhausted: null,
-      externalAuthRequired: null,
-      inputRequired: null,
-      choiceRequired: null,
+      externalAuthRequired: block?.kind === "external_auth" ? { message: block.message, requiredAction: block.requiredAction } : null,
+      inputRequired: block?.kind === "input" ? { message: block.message, requiredAction: block.requiredAction } : null,
+      choiceRequired: block?.kind === "choice" ? { message: block.message, requiredAction: block.requiredAction } : null,
       unresolvedToolErrors: outcome.toolErrors,
       finalTextPresent: outcome.finalText.trim().length > 0,
       cancelled: outcome.aborted,

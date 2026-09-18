@@ -224,6 +224,125 @@ describe("任务运行时：权限等待", () => {
   });
 });
 
+describe("任务运行时：模型声明需要用户介入（§11 / §17.3 场景 B）", () => {
+  /** 这三条是 `task_block` 存在的理由：把「模型说它卡住了」变成**可执行的运行时
+   *  状态**。在此之前，模型停下来说「我需要仓库地址」会被当成一次正常收尾 →
+   *  自动续跑 → 同样的理由再停一次 → 连续三轮后落进 blocked(no_progress)，
+   *  用户看到的是「连续 3 轮没有实质进展」。原因被换成了一个性能问题。 */
+
+  it("缺信息：落 waiting_input，且阻塞文案用的是模型的原话", async () => {
+    const h = await taskHarness([
+      fauxAssistantMessage([
+        fauxToolCall("task_block", {
+          kind: "input",
+          message: "缺少目标仓库地址，无法确定推送到哪里。",
+          requiredAction: "把仓库地址（owner/repo）发过来。",
+        }),
+      ]),
+      fauxAssistantMessage("我需要仓库地址才能继续推送。"),
+    ]);
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_block_input", text: "把本地改动推到远端" });
+      await waitFor(async () => countOf(await h.events(), "task.blocked") === 1);
+
+      const task = await h.tasks.getTask(receipt.taskId!);
+      expect(task!.status).toBe("waiting_input");
+      expect(task!.blocker).toMatchObject({ kind: "input", resumable: true });
+      // §14.4：必须说清「缺什么」，而不是「补充必要信息后任务会自动继续」
+      expect(task!.blocker!.message).toContain("缺少目标仓库地址");
+      expect(task!.blocker!.requiredAction).toContain("owner/repo");
+      expect(task!.blocker!.requiredAction).not.toContain("补充必要信息后任务会自动继续");
+      // 声明阻塞不是交付
+      expect(countOf(await h.events(), "task.delivered")).toBe(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("外部登录：落 waiting_external；用户补齐后继续同一个 task 并交付", async () => {
+    const h = await taskHarness([
+      fauxAssistantMessage([
+        fauxToolCall("task_block", {
+          kind: "external_auth",
+          message: "推送时 GitHub 凭据已失效（401）。",
+          requiredAction: "在终端里完成 gh auth login，然后回来说一声。",
+        }),
+      ]),
+      fauxAssistantMessage("本地改动和构建都通过了，只差推送这一步。"),
+      // 用户回复之后这一轮跑的东西
+      fauxAssistantMessage("登录已生效，推送完成，远端页面检查通过。"),
+    ]);
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_block_ext", text: "推送并验证线上页面" });
+      await waitFor(async () => countOf(await h.events(), "task.blocked") === 1);
+
+      const waiting = await h.tasks.getTask(receipt.taskId!);
+      expect(waiting!.status).toBe("waiting_external");
+      expect(waiting!.blocker!.kind).toBe("external_auth");
+      // §17.3-B 的关键：登录之前不许出现任何「任务完成」
+      expect(countOf(await h.events(), "task.delivered")).toBe(0);
+
+      // 用户把外部状态处理完，回来说一句 → 同一 task 从等待处恢复。
+      // disposition 是 task_resumed 而不是 task_steered：区别在于任务当时**停在
+      // 等待上**，这条消息是把它解锁，而不是对一条正在跑的任务追加约束。
+      // 界面靠这个区分「你在回答我」与「你在改需求」（§12）。
+      const second = await h.runner.prompt(h.session.id, { requestId: "req_block_ext_reply", text: "已经登录好了，继续" });
+      expect(second.disposition).toBe("task_resumed");
+      expect(second.taskId).toBe(receipt.taskId);
+
+      await waitFor(async () => countOf(await h.events(), "task.delivered") === 1);
+      const delivered = await h.tasks.getTask(receipt.taskId!);
+      expect(delivered!.status).toBe("delivered");
+      // §18.5：恢复原 task，不创建新 root task
+      expect(await h.tasks.listTasks(h.session.id)).toHaveLength(1);
+      expect(countOf(await h.events(), "task.blocked")).toBe(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("声明阻塞换不来交付：步骤全做完但用户在等，仍然不是 delivered", async () => {
+    // §19 的反向保护——如果 task_block 能换来一个 delivered，它就成了逃生舱。
+    const h = await taskHarness([
+      fauxAssistantMessage([
+        fauxToolCall("todo", { todos: [{ content: "唯一的一步", status: "completed" }] }),
+        fauxToolCall("task_block", { kind: "choice", message: "两种发布方式结果不可逆。", requiredAction: "选直接覆盖还是保留旧版本。", options: ["直接覆盖", "保留旧版本"] }),
+      ]),
+      fauxAssistantMessage("这一步做完了，但发布方式需要你定。"),
+    ]);
+    try {
+      await h.runner.prompt(h.session.id, { requestId: "req_block_choice", text: "发布这个页面" });
+      await waitFor(async () => countOf(await h.events(), "task.blocked") === 1);
+
+      const task = (await h.tasks.listTasks(h.session.id))[0]!;
+      expect(task.status).toBe("waiting_input");
+      expect(task.blocker!.kind).toBe("choice");
+      expect(countOf(await h.events(), "task.delivered")).toBe(0);
+      expect(countOf(await h.events(), "task.failed")).toBe(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("参数不合法的声明不会把任务冻住", async () => {
+    // 一个格式不对的工具调用（模型常见的失误）不该让任务停下来等一个根本不存在的
+    // 需求。`readTaskBlock` 校验失败即视为没声明，任务照常往下跑。
+    const h = await taskHarness([
+      fauxAssistantMessage([fauxToolCall("task_block", { kind: "出去吃个饭" })]),
+      fauxAssistantMessage("这个工具我调错了，直接回答：页面已经铺好了。"),
+    ]);
+    try {
+      await h.runner.prompt(h.session.id, { requestId: "req_block_bad", text: "把页面铺好" });
+      await waitFor(async () => countOf(await h.events(), "task.delivered") === 1);
+      const task = (await h.tasks.listTasks(h.session.id))[0]!;
+      expect(task.status).toBe("delivered");
+      expect(countOf(await h.events(), "task.blocked")).toBe(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
 describe("任务运行时：停止与幂等", () => {
   // §11「用户主动停止」：任务必须落 cancelled，而不是停在等待里。
   it("用户停止时任务落 cancelled 并解除等待", async () => {

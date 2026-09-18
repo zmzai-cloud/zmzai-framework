@@ -38,10 +38,16 @@ export type CompletionRuntimeState = {
   unsafeReplay: string | null;
   /** 预算耗尽原因（时间/token/费用/Attempt 数）。null 表示未超。 */
   budgetExhausted: string | null;
-  /** 外部状态导致必须由用户完成的事（登录失效、验证码、付款）。 */
-  externalAuthRequired: string | null;
+  /** 外部状态导致必须由用户完成的事（登录失效、验证码、付款）。
+   *
+   *  【三个 `*Required` 为什么统一成形】`message` 回答「卡在哪」，`requiredAction`
+   *  回答「你具体要做什么」。后者不能由框架代写——原来 input 那条被写死成
+   *  「补充必要信息后任务会自动继续。」，那是规格 §14.4 明令禁止的模糊指示：
+   *  它描述了流程，却没有告诉用户缺的是什么。这三件事的内容只有模型知道
+   *  （它正是为此调用 task_block 的）。 */
+  externalAuthRequired: { message: string; requiredAction: string } | null;
   /** 缺失且只能由用户提供的信息。 */
-  inputRequired: string | null;
+  inputRequired: { message: string; requiredAction: string } | null;
   /** 两个会产生不可逆差异的方案需要用户拍板。 */
   choiceRequired: { message: string; requiredAction: string } | null;
   /** Attempt 结束时仍处于 error 状态、且模型未给出替代方案的工具调用摘要。
@@ -156,8 +162,8 @@ function firstBlocker(task: TaskRecord, state: CompletionRuntimeState): TaskBloc
   if (state.externalAuthRequired) {
     return {
       kind: "external_auth",
-      message: state.externalAuthRequired,
-      requiredAction: "完成登录或验证后任务会自动继续。",
+      message: state.externalAuthRequired.message,
+      requiredAction: state.externalAuthRequired.requiredAction,
       resumable: true,
     };
   }
@@ -172,8 +178,8 @@ function firstBlocker(task: TaskRecord, state: CompletionRuntimeState): TaskBloc
   if (state.inputRequired) {
     return {
       kind: "input",
-      message: state.inputRequired,
-      requiredAction: "补充必要信息后任务会自动继续。",
+      message: state.inputRequired.message,
+      requiredAction: state.inputRequired.requiredAction,
       resumable: true,
     };
   }
