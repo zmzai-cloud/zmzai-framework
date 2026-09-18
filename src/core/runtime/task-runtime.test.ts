@@ -67,6 +67,7 @@ async function taskHarness(script: FauxResponseStep[], policy?: RunnerDeps["task
     session,
     faux,
     events,
+    deps,
     // 这套 harness 就是为了任务层而存在的：把它需要的两个能力显式暴露出来，
     // 测试里不必到处写 `!` 断言「我知道它一定在」。
     tasks: store.task!,
@@ -341,6 +342,88 @@ describe("任务运行时：模型声明需要用户介入（§11 / §17.3 场�
       await h.cleanup();
     }
   });
+});
+
+describe("§17.3 端到端场景", () => {
+  // 场景 A：单条用户消息启动一个六步任务，模型中途正常停三次，全程用户不点任何东西。
+  //
+  // 这是整份规格的主命题，所以断言刻意压在「**中途没有一次交付**」上：如果系统
+  // 还是把「模型停了」当成「做完了」，这里会在第一次 attempt.finished 之后就出现
+  // task.delivered——而那正是用户投诉的那个现象。
+  it("场景 A：六步任务由一条消息跑完全程，中途停三次不算完成", async () => {
+    const script: FauxResponseStep[] = [];
+    const titles = ["读取 PDF 并拆页", "提取正文与图片", "把内容写进页面", "本地构建并启动", "浏览器检查关键内容与资源", "修复发现的问题并交付"];
+    // 三次「停下来」：每轮末尾都是一段纯文本，步骤却还没做完。
+    titles.forEach((title, index) => {
+      const done = titles.slice(0, index).map((content) => ({ content, status: "completed" as const }));
+      const current = { content: title, status: "in_progress" as const };
+      script.push(fauxAssistantMessage([fauxToolCall("todo", { todos: [...done, current, ...titles.slice(index + 1).map((content) => ({ content, status: "pending" as const }))] })]));
+      script.push(fauxAssistantMessage(`${title}这一步先到这里，接着往下做。`));
+    });
+    // 最后一次收尾才把六步全部标成完成——交付发生在这里，而不是前面任何一次停下。
+    script.push(fauxAssistantMessage([fauxToolCall("todo", { todos: titles.map((content) => ({ content, status: "completed" as const })) })]));
+    script.push(fauxAssistantMessage("六步都做完了：页面已铺好，构建通过，浏览器检查关键内容和资源都正常。"));
+
+    const h = await taskHarness(script);
+    try {
+      await h.runner.prompt(h.session.id, { requestId: "req_scenario_a", text: "把这个 PDF 的内容完整铺到网页上，并验证页面可用" });
+      await waitFor(async () => countOf(await h.events(), "task.delivered") === 1, 15_000);
+
+      const events = await h.events();
+      const task = (await h.tasks.listTasks(h.session.id))[0]!;
+
+      // 1) 用户只说了一句话，也没有第二次 run
+      expect(await userMessageCount(h.store, h.session.id)).toBe(1);
+      expect(await h.workflow.workflowRuns(h.session.id)).toHaveLength(1);
+      // 2) 六步全部完成，且从头到尾只有一个 task.delivered
+      expect(task.steps.map((step) => step.status)).toEqual(Array(6).fill("completed"));
+      expect(countOf(events, "task.delivered")).toBe(1);
+      // 3) 中途的每一次收尾都没有交付——这是「模型停止 ≠ 任务完成」的直接证据
+      const firstDeliveredAt = events.findIndex((event) => event.type === "task.delivered");
+      const settledBefore = events.slice(0, firstDeliveredAt).filter((event) => event.type === "task.attempt.finished");
+      expect(settledBefore.length).toBeGreaterThanOrEqual(3);
+      // 4) 交付文本来自最后一次尝试，而不是中途那句「先到这里」
+      const delivered = events[firstDeliveredAt]!;
+      expect((delivered.data as { result: string }).result).toContain("浏览器检查");
+      expect(task.result?.outcome).toBeTruthy();
+    } finally {
+      await h.cleanup();
+    }
+  }, 25_000);
+
+  // 场景 C：命令长时间无输出且副作用不明 → 先核对，不把「没输出」当成功，也不重复提交。
+  it("场景 C：写操作结果未知时落 blocked(unsafe_replay)，且不自动重放", async () => {
+    const h = await taskHarness([
+      fauxAssistantMessage([fauxToolCall("bash", { program: "git", args: ["push", "origin", "main"] })]),
+      fauxAssistantMessage("推送命令没有任何输出，无法确认是否已经提交到远端。"),
+    ]);
+    // 沙箱报告「结果不确定」：命令跑完了，但拿不到明确的成败结论。
+    h.deps.sandbox.run = vi.fn().mockResolvedValue({ ok: false, outcome: "unknown", durationMs: 30_000, outputText: "", artifacts: [] }) as never;
+    try {
+      await h.runner.prompt(h.session.id, { requestId: "req_scenario_c", text: "把改动推到远端" });
+      await waitFor(async () => countOf(await h.events(), "permission.asked") === 1);
+      const asked = (await h.events()).find((event) => event.type === "permission.asked")!;
+      await h.runner.replyPermission(h.session.id, (asked.data as { request: { id: string } }).request.id, "once");
+
+      // 等待的过程中会先出现一条 blocked(permission)（§11.1：对用户是「在等你」），
+      // 所以这里要等的是**授权之后**那条，别把前者当成终局。
+      await waitFor(async () => (await h.events()).some((event) => event.type === "task.blocked" && (event.data as { blocker: { kind: string } }).blocker.kind === "unsafe_replay"));
+      const task = (await h.tasks.listTasks(h.session.id))[0]!;
+
+      // §10.2：写操作结果未知 → 不自动重放，先核验外部状态
+      expect(task.status).toBe("blocked");
+      expect(task.blocker!.kind).toBe("unsafe_replay");
+      expect(task.blocker!.resumable).toBe(true);
+      expect(task.blocker!.requiredAction).toContain("确认外部系统");
+      // 命令只跑了一次：没有把「无输出」当成失败去重试
+      expect(h.deps.sandbox.run).toHaveBeenCalledTimes(1);
+      expect(countOf(await h.events(), "task.delivered")).toBe(0);
+      // 也不该落成 failed——它没坏，只是不知道
+      expect(task.status).not.toBe("failed");
+    } finally {
+      await h.cleanup();
+    }
+  }, 25_000);
 });
 
 describe("任务运行时：停止与幂等", () => {
