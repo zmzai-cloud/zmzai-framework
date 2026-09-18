@@ -3,12 +3,17 @@ import { describe, expect, it, vi } from "vitest";
 import { createMemoryEventLog } from "../events/bus.js";
 import type { Part, ToolState } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
+import { createMemoryTaskStore } from "../task/store.js";
+import type { TaskStore } from "../task/store.js";
+import type { TaskRecord } from "../task/types.js";
 import { finalizeInterruptedRun, reclaimExpiredLeases, startLeaseRecovery } from "./lease-recovery.js";
 
 /** Minimal in-memory store: only the parts surface finalization touches. */
 function memoryStore() {
   const parts = new Map<string, Part>();
+  const tasks: TaskStore = createMemoryTaskStore();
   const store: SessionStore = {
+    task: tasks,
     async createSession() {},
     async getSession() {
       return null;
@@ -36,7 +41,13 @@ function memoryStore() {
     },
     async clearQueuedPrompts() {},
   };
-  return { store, parts };
+  return { store, parts, tasks };
+}
+
+/** 造一个「崩溃时正在跑」的任务。 */
+async function runningTask(tasks: TaskStore, status: TaskRecord["status"] = "running"): Promise<TaskRecord> {
+  const created = await tasks.createTask({ sessionId, rootRequestId: "req_crash", rootUserMessageId: "msg_crash", goal: "生成并校验产物" });
+  return await tasks.updateTask(created.id, created.revision, { status });
 }
 
 const sessionId = "ses_test";
@@ -139,6 +150,85 @@ describe("finalizeInterruptedRun", () => {
     expect(events.some((event) => event.type === "permission.replied")).toBe(false);
     const todo = events.find((event) => event.type === "todo.updated")!;
     expect(todo.data.todos.map((item) => item.status)).toEqual(["completed"]);
+  });
+});
+
+describe("finalizeInterruptedRun：任务层对账（规格 3 §11 / §16 阶段 D）", () => {
+  // §17.1.13：有执行过却没收尾的工具调用 → unsafe_replay。
+  it("崩溃时有工具在执行中，任务落 blocked(unsafe_replay) 并要求先核对", async () => {
+    const { log } = await seedLeftovers();
+    const { store, tasks } = memoryStore();
+    const task = await runningTask(tasks);
+
+    await finalizeInterruptedRun({ sessionId, log, store });
+
+    const updated = (await tasks.getTask(task.id))!;
+    expect(updated.status).toBe("blocked");
+    expect(updated.blocker).toMatchObject({ kind: "unsafe_replay", resumable: true });
+    // 「先核对外部状态」必须写清楚，不能只说「请继续」（§14.4）
+    expect(updated.blocker!.requiredAction).toContain("核对");
+    const blocked = (await log.read(sessionId, 0, 200)).find((event) => event.type === "task.blocked")!;
+    expect((blocked.data as { blocker: { kind: string } }).blocker.kind).toBe("unsafe_replay");
+    expect((blocked.data as { taskId: string }).taskId).toBe(task.id);
+  });
+
+  // 等待授权时被杀掉的那次工具调用**从未执行**。把它算成「可能有副作用」会让用户
+  // 去核对一个根本没发生的变化——这是反向误报，同样是错误诊断。
+  it("只是卡在等待授权上时，任务落 waiting_input 而不是 unsafe_replay", async () => {
+    const log = createMemoryEventLog();
+    const now = new Date().toISOString();
+    await log.append({
+      sessionId,
+      type: "permission.asked",
+      data: {
+        request: {
+          id: "per_pending",
+          sessionId,
+          permission: "bash",
+          patterns: ["exec *"],
+          always: [],
+          tool: { messageId: "msg_test", callId: "call_prt_pending" },
+        },
+      },
+    });
+    await log.append({
+      sessionId,
+      type: "message.part.updated",
+      data: { part: toolPart("prt_pending", { status: "pending", input: { command: "python3 gen_ppt.py" } }) },
+    });
+    const { store, tasks } = memoryStore();
+    const task = await runningTask(tasks);
+
+    await finalizeInterruptedRun({ sessionId, log, store });
+
+    const updated = (await tasks.getTask(task.id))!;
+    expect(updated.status).toBe("waiting_input");
+    expect(updated.blocker).toMatchObject({ kind: "input", resumable: true });
+    expect(updated.blocker!.requiredAction).toContain("继续");
+  });
+
+  it("已交付的任务不被重启对账改动", async () => {
+    const { log } = await seedLeftovers();
+    const { store, tasks } = memoryStore();
+    const task = await runningTask(tasks, "delivered");
+
+    await finalizeInterruptedRun({ sessionId, log, store });
+
+    expect((await tasks.getTask(task.id))!.status).toBe("delivered");
+    expect((await log.read(sessionId, 0, 200)).some((event) => event.type === "task.blocked")).toBe(false);
+  });
+
+  // 幂等：第二次扫描不能把已经 blocked 的任务再改一遍（也不能重复发事件）。
+  it("第二次对账不再改动任务", async () => {
+    const { log } = await seedLeftovers();
+    const { store, tasks } = memoryStore();
+    const task = await runningTask(tasks);
+    await finalizeInterruptedRun({ sessionId, log, store });
+    const afterFirst = (await tasks.getTask(task.id))!.revision;
+
+    await finalizeInterruptedRun({ sessionId, log, store });
+
+    expect((await tasks.getTask(task.id))!.revision).toBe(afterFirst);
   });
 });
 

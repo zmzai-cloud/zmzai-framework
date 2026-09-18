@@ -4,7 +4,7 @@ import type { FrameworkEvent, PersistedFrameworkEvent } from "../events/manifest
 import type { Part } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
 import { lifecycleForBlocker } from "../task/completion.js";
-import { isTerminalStatus, type TaskBlocker } from "../task/types.js";
+import { isTerminalStatus, isWaitingStatus, type TaskBlocker } from "../task/types.js";
 
 /** Lease recovery (spec §3.2): the runner stamps a lease on the session
  *  document while it owns a run. A periodic scan reclaims sessions whose lease
@@ -124,7 +124,10 @@ export async function finalizeInterruptedRun(input: { sessionId: string; log: Ev
   const taskStore = input.store.task;
   if (taskStore) {
     const task = await taskStore.getActiveTask(input.sessionId).catch(() => null);
-    if (task && !isTerminalStatus(task.status)) {
+    // 终态不用动（任务已经结束）。**已经处于 waiting_* / blocked 的也不动**：
+    // 它本来就停在「等用户做点什么」，再写一遍只会白跳一次 revision 并重复发一条
+    // `task.blocked`，还可能用这里较笼统的原因盖掉先前更具体的那一个。
+    if (task && !isTerminalStatus(task.status) && !isWaitingStatus(task.status)) {
       const blocker: TaskBlocker = unknownSideEffect
         ? {
             kind: "unsafe_replay",

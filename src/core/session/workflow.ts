@@ -56,6 +56,13 @@ export interface WorkflowStore {
   claimPrompt(sessionId: string, owner: string): Promise<WorkflowRun | null>;
   finishPrompt(sessionId: string, runId: string, revision: number, state: WorkflowState): Promise<void>;
   recoverInterrupted(sessionId: string): Promise<void>;
+  /** 清掉「上一任务的外部副作用尚未确认」这道闸（规格 3 §13.2 的 resume）。
+   *
+   *  【为什么不复用 clearQueuedPrompts】那个把 `queued` 和 `recovery_required`
+   *  一起取消掉。用在「用户核对完，继续」上会顺手丢掉排队中的消息——而那些消息
+   *  的正文只存在于 run 的 payload 里，取消就是丢内容（`constraints` 只覆盖并入
+   *  当前任务的那种）。这里只放掉 `recovery_required` 的那一条。 */
+  clearRecoveryRequired(sessionId: string): Promise<number>;
   workflowRuns(sessionId: string): Promise<WorkflowRun[]>;
   findPrompt(sessionId: string, requestId: string): Promise<WorkflowRun | null>;
 }

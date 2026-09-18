@@ -343,3 +343,93 @@ describe("任务运行时：预算与防空转", () => {
     }
   }, 20_000);
 });
+
+describe("任务运行时：重启恢复与人工放行", () => {
+  // §16 阶段 D：恢复扫描给任务落了 blocked，用户核对完之后要能继续。
+  // 每个 blocker 都写着一句「先核对…再决定继续」，产品必须接得住这句话。
+  it("resumeTask 让 blocked 的任务继续，且不创建新用户消息", async () => {
+    const h = await taskHarness(
+      [
+        fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "in_progress" }] })]),
+        fauxAssistantMessage("先解析了 PDF，下一页再落网页。"),
+        fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "completed" }] })]),
+        fauxAssistantMessage("PDF 内容已铺到网页并通过构建。"),
+      ],
+      // 预算刻意只给 1 轮：第一轮做完就该停，等用户放行
+      { maxAttempts: 1 },
+    );
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_resume", text: "把 PDF 铺到网页" });
+      await waitFor(async () => countOf(await h.events(), "task.blocked") === 1);
+      const stopped = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(stopped.status).toBe("blocked");
+      expect(stopped.blocker!.kind).toBe("budget");
+      expect(stopped.attemptCount).toBe(1);
+
+      // 「继续」不是一条新消息：用户核对完点一下按钮而已
+      expect(await h.runner.resumeTask(h.session.id)).toBe(true);
+      await waitFor(async () => countOf(await h.events(), "task.delivered") === 1);
+
+      const resumed = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(resumed.status).toBe("delivered");
+      expect(resumed.blocker).toBeUndefined();
+      expect(resumed.id).toBe(receipt.taskId);
+      // 放行会重置预算与无进展计数：否则「继续」会立刻被同一个上限再挡一次，
+      // 成了一个按不出反应的死按钮。
+      expect(resumed.attemptCount).toBe(1);
+      // 用户消息仍然只有最初那一条
+      expect(await userMessageCount(h.store, h.session.id)).toBe(1);
+      // 也没有为「继续」新建 workflow run
+      expect(await h.workflow.workflowRuns(h.session.id)).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  }, 20_000);
+
+  it("任务在正常跑时 resumeTask 返回 false（正常运行不需要「继续」）", async () => {
+    const h = await taskHarness([fauxAssistantMessage("好了。")]);
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_noop", text: "随便做点什么" });
+      await waitFor(async () => (await h.tasks.getTask(receipt.taskId!))!.status === "delivered");
+      // 已交付的终态任务没什么可继续的
+      expect(await h.runner.resumeTask(h.session.id)).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  // 提交被 workflow 层的恢复闸拒掉时，任务必须回到原样。
+  // resolveTaskForPrompt 已经清掉 blocker、把状态放回 queued 了，而这次 prompt
+  // 根本没被接受——没有 run 会去推进它，任务会停在 queued 上永远等不到。
+  it("提交被 recovery 闸拒绝时，任务回到提交前的样子", async () => {
+    // 让运行卡在等待授权上：workflow run 会一直保持 running，正好可以模拟
+    // 「进程在跑的时候挂掉，恢复扫描接手」。
+    const h = await taskHarness([
+      fauxAssistantMessage([fauxToolCall("bash", { program: "npm", args: ["run", "build"] })]),
+      fauxAssistantMessage("不该跑到这里。"),
+    ]);
+    try {
+      const receipt = await h.runner.prompt(h.session.id, { requestId: "req_gate", text: "构建并验证" });
+      await waitFor(async () => countOf(await h.events(), "permission.asked") === 1);
+      const before = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(before.status).toBe("waiting_permission");
+      expect(before.constraints).toEqual([]);
+
+      await h.workflow.recoverInterrupted(h.session.id);
+
+      await expect(h.runner.prompt(h.session.id, { requestId: "req_gate_2", text: "补充一句不该被记下的话" }))
+        .rejects.toThrow("RECOVERY_REQUIRED");
+
+      // 被拒的提交不留痕迹：状态、blocker、约束、计数都回到提交前
+      const after = (await h.tasks.getTask(receipt.taskId!))!;
+      expect(after.status).toBe("waiting_permission");
+      expect(after.blocker).toMatchObject({ kind: "permission" });
+      expect(after.constraints).toEqual([]);
+      expect(after.attemptCount).toBe(before.attemptCount);
+      expect(after.noProgressCount).toBe(before.noProgressCount);
+    } finally {
+      await h.runner.abort(h.session.id);
+      await h.cleanup();
+    }
+  }, 20_000);
+});

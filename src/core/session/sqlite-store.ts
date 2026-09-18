@@ -361,6 +361,11 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       async recoverInterrupted(sessionId) {
         db.prepare("UPDATE workflow_runs SET status='recovery_required',revision=revision+1 WHERE session_id=? AND status='running'").run(sessionId);
       },
+      async clearRecoveryRequired(sessionId) {
+        // `.changes` 的类型是 number | bigint（Node 的 DatabaseSync 按配置回一种），
+        // 归一成 number 再交给调用方。
+        return transaction(() => Number(db.prepare("UPDATE workflow_runs SET status='cancelled',revision=revision+1 WHERE session_id=? AND status='recovery_required'").run(sessionId).changes));
+      },
       async workflowRuns(sessionId) {
         return (db.prepare("SELECT payload,receipt,status,revision FROM workflow_runs WHERE session_id=? ORDER BY ordinal").all(sessionId) as { payload: string; receipt: string; status: WorkflowRun["status"]; revision: number }[]).map(row => ({ input: JSON.parse(row.payload), receipt: JSON.parse(row.receipt), status: row.status, revision: row.revision }));
       },
