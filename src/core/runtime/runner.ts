@@ -12,7 +12,7 @@ import { AgentRegistry, type AgentInfo } from "../agent/registry.js";
 import type { AgentResolver, ResolvedAgent } from "../agent/resolver.js";
 import { leaseDurationMs } from "../../adapters/index.js";
 import { notifyEventLogListeners, type EventLog } from "../events/bus.js";
-import type { FrameworkEvent } from "../events/manifest.js";
+import type { FrameworkEvent, TodoItem } from "../events/manifest.js";
 import { PermissionEngine, RejectedError, type Reply } from "../permission/engine.js";
 import type { Ruleset } from "../permission/ruleset.js";
 import { confineWorkspaceFiles, writePathGuardRules } from "../permission/write-path.js";
@@ -31,7 +31,27 @@ import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
 import { randomUUID } from "node:crypto";
-import type { PromptReceipt, WorkflowState } from "../session/workflow.js";
+import type { PromptDisposition, PromptReceipt, WorkflowState } from "../session/workflow.js";
+import {
+  DEFAULT_MAX_ATTEMPTS,
+  evaluateTaskCompletion,
+  lifecycleForBlocker,
+  normalizeNoProgressPolicy,
+  type CompletionRuntimeState,
+  type CompletionVerdict,
+  type NoProgressPolicy,
+} from "../task/completion.js";
+import { advanceProgress } from "../task/progress.js";
+import {
+  appendEvidence,
+  evidenceKindForTool,
+  fallbackStep,
+  projectImplicitCriterion,
+  projectTodos,
+  pruneEvidenceRefs,
+} from "../task/plan.js";
+import { fallbackResult, remainingSteps, renderResult, taskContractText } from "../task/contract.js";
+import { isTerminalStatus, isWaitingStatus, type TaskBlocker, type TaskEvidenceKind, type TaskPatch, type TaskRecord, type TaskStep } from "../task/types.js";
 
 /** SessionRunner (spec §8.1): owns one session's full lifecycle — prompt →
  *  PI agent loop → persisted parts + framework events → terminal settlement
@@ -56,6 +76,15 @@ export type PromptInput = {
   effort?: ThinkingEffort;
   skill?: SelectedSkill;
   references?: readonly string[];
+  /** 归属的持久任务（规格 3 §6）。服务端在创建/复用任务后写入。 */
+  taskId?: string;
+  /** 内部续跑标记（规格 3 §8.2）。
+   *
+   *  【为什么这个字段决定「有没有多出一条用户消息」】它存在时，本次运行是
+   *  任务自动推进触发的，不是一个用户回合：runner 必须跳过用户消息的投影、
+   *  跳过新建 message，只在 systemPrompt 里注入任务契约。规格 §19 禁止的
+   *  「用新增一条伪用户消息作为内部 continuation」，防的就是这里做错。 */
+  continuation?: { attempt: number; advisory?: string };
 };
 
 /** Product-owned resolver. It must be session-root aware and return trusted, bounded text. */
@@ -104,6 +133,14 @@ export type RunnerDeps = {
   /** 附件正文读取器（规格 2 §9.2）。未注入时描述符只能渲染成清单，
    *  图片与小型文本附件也不会被内联——功能降级但不报错。 */
   attachments?: import("./attachments.js").AttachmentProvider;
+
+  /** 持续任务执行的保护阈值（规格 3 §10.1 / §16 阶段 D）。
+   *  两者都有上限（见 normalizeNoProgressPolicy），宿主调不到「永不拦截」。 */
+  taskPolicy?: {
+    /** 单次任务最多跑几次 Attempt（含 continuation）。 */
+    maxAttempts?: number;
+    noProgress?: Partial<NoProgressPolicy>;
+  };
 };
 
 type ActiveRun = {
@@ -191,6 +228,40 @@ function defaultToolContext(input: { session: SessionInfo; engine: PermissionEng
   };
 }
 
+/** 单次 Attempt（内部运行）的完整结果。
+ *
+ * 【为什么返回值从 `WorkflowState` 变成这个】任务层需要的不只是「成功还是
+ * 失败」：Completion Gate 要判断「有没有可能产生了副作用但结果未知」「哪些
+ * 文件被改了」「最后有没有产出交付文本」。这些信息原本散落在 runLoop 的
+ * 局部变量里，随函数返回一并丢弃——上层于是只能用 `completed` 这个笼统的
+ * 状态去猜用户目标是否达成，这正是规格 §3.1 的根因。 */
+type RunOutcome = {
+  state: WorkflowState;
+  /** 一次尝试是否正常跑到底（未抛错、未被中断）。 */
+  settled: boolean;
+  aborted: boolean;
+  unknownSideEffect: boolean;
+  /** 结果未知的副作用描述（喂给 Completion Gate 的 unsafe_replay）。 */
+  sideEffectDetail: string | null;
+  filesEdited: string[];
+  toolCalls: number;
+  durationMs: number;
+  /** 以 error 结束的工具调用摘要（只用于续跑提示，不单独构成阻塞）。 */
+  toolErrors: string[];
+  /** 本轮的最终 assistant 文本（交付说明的来源）。 */
+  finalText: string;
+  /** 本轮模型最后投递的 todo 列表（步骤投影的输入）。 */
+  todos: TodoItem[] | null;
+  /** 本轮的证据候选（工具热路径上只累积内存，此处统一落库）。 */
+  evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[];
+  /** 以失败告终时的错误消息（用于区分「可重试的上游抖动」与「真的没救」）。 */
+  errorMessage: string | null;
+};
+
+/** 终态判定：`continue` 是「还要再跑一轮」，不该走到落终态的地方。
+ *  用类型把它挡在外面，`settleTask` 里就不需要再防一次不可能的状态。 */
+type SettledVerdict = Exclude<CompletionVerdict, { status: "continue" }>;
+
 export class SessionRunner {
   constructor(private readonly deps: RunnerDeps) {}
   private draining = new Map<string, Promise<void>>();
@@ -211,7 +282,8 @@ export class SessionRunner {
           if (!session) {
             outcome = "failed";
           } else {
-            outcome = await this.runLoop(session, job.input, job.receipt.userMessageId);
+            // 走任务层：一次 claim 之后可能跑多轮 Attempt（规格 §8.2）
+            outcome = await this.runTask(session, job.input, job.receipt.userMessageId);
           }
           }
         } catch {
@@ -277,6 +349,58 @@ export class SessionRunner {
     await this.deps.leaseStore.clear(sessionId).catch(() => undefined);
   }
 
+  /** 为一条新消息决定它归属哪个任务，以及这次提交的处置（规格 §12 / §13.1）。
+   *
+   *  四种处置的判定依据是**任务当前状态**，不是模型对文本的猜测：
+   *  - 无活跃任务 → 开新任务；
+   *  - 任务在 waiting_permission / waiting_input / waiting_external / blocked
+   *    → 这条消息就是那个「用户动作」，任务恢复；
+   *  - 任务在 running → 这条消息是补充/纠正，并入约束。
+   *
+   *  【为什么不做「这是不是无关新目标」的语义分类】那需要模型判断，代价是一次
+   *  额外的往返，而且判错的后果不对称：把无关目标误并进当前任务，用户会看到
+   *  自己的话被当成补充说明；反过来把补充说明误判成新任务，则会产生两个抢同一
+   *  个工作区的任务（规格 §18.9 禁止的情况）。所以默认并入，并由约束文本明确
+   *  标注「这是用户在你执行期间补充的」，让模型自己决定是否改变方向。 */
+  private async resolveTaskForPrompt(
+    session: SessionInfo,
+    input: PromptInput,
+    userMessageId: string,
+  ): Promise<{ task: TaskRecord; disposition: PromptDisposition; startedTask: boolean } | null> {
+    const store = this.deps.store.task;
+    if (!store) return null;
+    const requestId = input.requestId!;
+
+    // 幂等：同一 requestId 重复提交返回同一任务，不创建第二个（§13.1 / §17.1.11）
+    // 重放时 disposition 描述的是「这条消息与任务的关系」，那是稳定的：
+    // 一条消息一旦开启过某个任务，它永远是那个任务的开启者。
+    const prior = await store.findTaskByRequestId(session.id, requestId);
+    if (prior) return { task: prior, disposition: "task_started", startedTask: false };
+
+    const active = await store.getActiveTask(session.id);
+    if (active) {
+      const resuming = active.status === "waiting_permission" || active.status === "waiting_input" || active.status === "waiting_external" || active.status === "blocked";
+      const text = input.text.trim();
+      const constraints = text ? [...active.constraints, text].slice(-8) : active.constraints;
+      const task = await this.casTask(active, {
+        constraints,
+        // 恢复：把任务放回可被认领的状态，drain 会接着推进它
+        ...(resuming ? { status: "queued" as const } : {}),
+        ...(resuming ? { blocker: undefined } : {}),
+      });
+      return { task, disposition: resuming ? "task_resumed" : "task_steered", startedTask: false };
+    }
+
+    const goal = input.text.trim().slice(0, 500) || "（未命名任务）";
+    const task = await store.createTask({
+      sessionId: session.id,
+      rootRequestId: requestId,
+      rootUserMessageId: userMessageId,
+      goal,
+    });
+    return { task, disposition: "task_started", startedTask: true };
+  }
+
   async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
     input = { ...input, attachments: validateAttachments(input.attachments), attachmentRefs: validateAttachmentRefs(input.attachmentRefs) };
     const session = await this.deps.store.getSession(sessionId);
@@ -289,10 +413,24 @@ export class SessionRunner {
       const message = projector.onUserPrompt(event => {
         if (event.type === "message.part.updated") parts.push(event.data.part);
       }, input.text,input.images,input.skill,input.references,input.attachments,input.attachmentRefs);
+      // 先建消息再建任务：TaskRecord.rootUserMessageId 需要真实的消息 id，
+      // 事后回填会多一次 CAS，也让「任务与首条消息同生」这条不变量出现空窗。
+      const resolution = await this.resolveTaskForPrompt(session, input, message.id);
+      if (resolution) input = { ...input, taskId: resolution.task.id };
       const accepted = await this.deps.store.workflow.acceptPrompt(sessionId,input,{ message,parts });
       for (const event of accepted.events) notifyEventLogListeners(event);
+      if (resolution?.startedTask) {
+        const task = resolution.task;
+        await this.publish(
+          { type: "task.started", data: { taskId: task.id, revision: task.revision, goal: task.goal, steps: [], acceptanceCriteria: task.acceptanceCriteria.map((criterion) => ({ id: criterion.id, description: criterion.description, required: criterion.required, status: criterion.status })) } },
+          sessionId,
+        );
+      }
       if (accepted.events.length) this.drain(sessionId);
-      return accepted.receipt;
+      return {
+        ...accepted.receipt,
+        ...(resolution ? { disposition: resolution.disposition, taskId: resolution.task.id } : {}),
+      };
     }
 
     if (activeRuns.has(sessionId)) {
@@ -348,7 +486,26 @@ export class SessionRunner {
       await active.done;
     }
     await this.draining.get(sessionId);
+    await this.cancelResidualTask(sessionId);
     this.stopRequested.delete(sessionId);
+  }
+
+  /** 停止时把任务层也收干净（规格 3 §11「用户停止任务」）。
+   *
+   *  正在跑的 run 不用管：`RunOutcome.aborted` 会让 Completion Gate 判 `cancelled`，
+   *  任务由 `settleTask` 落终态。这里处理的是**没有活 run 却仍停在非终态**的任务——
+   *  上一步已经 `blocked` / `waiting_*`、用户此时点「停止」，没有任何运行在跑；
+   *  不补这一刀，任务会永远停在等待里，而界面上的「停止」看起来毫无作用。
+   *
+   *  位置刻意放在 `draining` 之后：先让结算路径写完自己的结论，避免两边各发一次
+   *  `task.cancelled`（revision 白跳两次，客户端投影也会收到重复终态）。 */
+  private async cancelResidualTask(sessionId: string): Promise<void> {
+    const store = this.deps.store.task;
+    if (!store) return;
+    const task = await store.getActiveTask(sessionId);
+    if (!task || isTerminalStatus(task.status)) return;
+    const updated = await this.casTask(task, { status: "cancelled", blocker: undefined });
+    await this.publish({ type: "task.cancelled", data: { taskId: updated.id, revision: updated.revision, reason: "用户已停止任务。" } }, sessionId);
   }
 
   /** 手动触发一次上下文压缩（UI「压缩当前会话」）：无条件对当前历史跑一次
@@ -449,7 +606,19 @@ export class SessionRunner {
     }
   }
 
-  private async runLoop(session: SessionInfo, input: PromptInput, acceptedUserId?: string): Promise<WorkflowState> {
+  /** 一次 Attempt：从模型上下文构造到终态收尾的完整内部运行。
+   *
+   *  `taskContext` 存在时，任务契约会注入 systemPrompt（**不落成消息**，
+   *  规格 §19 禁止伪用户消息）。它同时携带 continuation 的 advisory，
+   *  保证「续跑指令」与「任务契约」在同一条系统指令里，不会互相矛盾。
+   *  它还携带 `loopGuard`：任务层自己持有一个跨 Attempt 的实例，避免每轮
+   *  重置循环防护的计数（见下方注释）。 */
+  private async runLoop(
+    session: SessionInfo,
+    input: PromptInput,
+    acceptedUserId?: string,
+    taskContext?: { task: TaskRecord; advisory?: string; continuation?: boolean; loopGuard?: LoopGuard } | null,
+  ): Promise<RunOutcome> {
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -468,14 +637,24 @@ export class SessionRunner {
     }
 
     const agentRulesets = resolved ? [registry.rulesetsFor("default")[0]!, resolved.agent.permission] : registry.rulesetsFor(agentInfo?.name ?? "default");
+    /** 本轮模型最后投递的 todo 列表（步骤投影的输入）。 */
+    let latestTodos: { content: string; status: string }[] | null = null;
     const engine = new PermissionEngine(session.id, agentRulesets, session.permission, {
       onAsked: async (request) => {
         await this.publish({ type: "session.status", data: { status: "waiting_permission" } }, session.id);
         await this.publish({ type: "permission.asked", data: { request } }, session.id);
+        // 权限等待必须让任务层可见（规格 §11.1）。否则用户在盯着授权卡的时候，
+        // 任务状态还是「运行中」——「在跑」和「在等你点授权」对用户是两件事，
+        // 而任务 API 会给出一个错的答案。
+        await this.markPermissionWait(taskContext?.task.id, request.permission, request.patterns, true);
       },
       onReplied: async (request, reply) => {
         await this.publish({ type: "permission.replied", data: { id: request.id, reply } }, session.id);
         await this.publish({ type: "session.status", data: { status: "running" } }, session.id);
+        // 授权通过或拒绝都解除等待：规格 §11.3 要求把拒绝结果交回模型去试替代
+        // 方案，只有模型也没有替代方案时才判 blocked/failed。留在
+        // waiting_permission 会把「已经拒绝了」误报成「还在等你授权」。
+        await this.markPermissionWait(taskContext?.task.id, request.permission, request.patterns, false);
       },
       onSessionRuleAdded: async (sessionId, rule) => {
         const latest = await this.deps.store.getSession(sessionId);
@@ -487,7 +666,22 @@ export class SessionRunner {
       },
     });
 
+    /** 本轮事件的公共漏斗——**模型流通路和工具通路都必须经过它**。
+     *
+     *  【为什么必须是一个共享函数】曾经把 todo 捕获写在下面 `serializeEmit` 的
+     *  包装器里，注释还写着「事件流是所有路径的漏斗，不会漏」。那是错的：默认
+     *  tool context 的 `setTodos` 拿到的 emit 直接调 `publish`，根本不经过包装器。
+     *  结果是 `latestTodos` 永远是 null，步骤数组永远为空，任务于是按「没有步骤」
+     *  的分支判定——模型刚说完一句试点性的开场白就被判成「已交付」。这类 bug
+     *  的危险之处在于它不报错，只是悄悄把完成判定放宽到形同虚设。 */
+    const observeRunEvent = async (event: FrameworkEvent): Promise<void> => {
+      if (event.type === "todo.updated") {
+        latestTodos = event.data.todos.map((todo) => ({ content: todo.content, status: todo.status }));
+      }
+    };
+
     const { emit, settled } = serializeEmit(async (event) => {
+      await observeRunEvent(event);
       await this.persist(event, session.id);
     });
 
@@ -509,6 +703,7 @@ export class SessionRunner {
     const rawWorkspace = this.deps.workspaceFor(session);
     const workspace = session.writePaths?.length ? confineWorkspaceFiles(rawWorkspace, session.writePaths) : rawWorkspace;
     const emitAsync = async (event: FrameworkEvent) => {
+      await observeRunEvent(event);
       await this.publish(event,session.id);
     };
     const toolContext = (this.deps.buildToolContext ?? defaultToolContext)({ session, engine, workspace, sandbox, emit: emitAsync });
@@ -519,6 +714,20 @@ export class SessionRunner {
     }
     const piTools = [...toolDefs.values()].map((def) => adaptAnyTool(def, toolContext));
     let unknownSideEffect = false;
+    let sideEffectDetail: string | null = null;
+    /** 以 error 结束的工具调用摘要（最多留最近三条）。
+     *  只用于续跑提示，**不构成阻塞**——工具失败后模型换条路走通是常态。 */
+    const toolErrors: string[] = [];
+    /** 本轮**自己的**最后一条 assistant 文本（交付文本的来源）。
+     *
+     *  【为什么不用「会话里最后一条」】续跑时那会取到上一轮的文本：一轮「我先看看
+     *  文件」之后，下一轮只用工具调完了全部步骤，交付卡上就会出现一句跟本次交付
+     *  无关、甚至自相矛盾的正文。连带 `finalTextPresent` 也会用陈旧文本为一次
+     *  没说话的运行开绿灯。这里只认本轮新增的消息。 */
+    let attemptFinalText = "";
+    /** 本轮的证据候选。在工具热路径上只累积内存，Attempt 结束时一次性投影进
+     *  任务并落库——否则每次工具调用都要 CAS 写一次任务表。 */
+    const evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[] = [];
 
     const compactionTransform = await this.buildCompaction(session, emit);
     // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
@@ -542,7 +751,14 @@ export class SessionRunner {
     const baseline = history.length;
     const agent = new Agent({
       initialState: {
-        systemPrompt: [agentInfo?.prompt ?? "", mandatorySkillContext, input.references?.length ? `<attached-resources>\nThe user attached these workspace paths. Read the relevant ones before acting:\n${input.references.join("\n")}\n</attached-resources>` : ""].filter(Boolean).join("\n\n"),
+        systemPrompt: [
+          agentInfo?.prompt ?? "",
+          mandatorySkillContext,
+          // 任务契约（规格 3 §6 / §8.2）：每个 Attempt 重新注入一次，因此
+          // 上下文被压缩掉也不影响任务目标的存续。续跑指令与它同源。
+          taskContext ? taskContractText(taskContext.task, taskContext.advisory) : "",
+          input.references?.length ? `<attached-resources>\nThe user attached these workspace paths. Read the relevant ones before acting:\n${input.references.join("\n")}\n</attached-resources>` : "",
+        ].filter(Boolean).join("\n\n"),
         model: this.deps.modelFor(model),
         // 推理力度（P1-8 复活）：relay 现已按模型白名单接受 reasoning_effort；
         // 仅当调用方显式选择且非 off 时下发（默认不设 = 完全不带该字段）。
@@ -567,7 +783,11 @@ export class SessionRunner {
     if (this.stopRequested.has(session.id)) abort();
     await this.stampLease(session.id);
 
-    const loopGuard = new LoopGuard();
+    // 循环防护在任务层跨 Attempt 复用（规格 3 §16 阶段 D）：一条任务会自己续跑
+    // 多轮，而「同一个工具一直以同样的方式失败」是不会因为换了一轮就消失的事实。
+    // 每轮新建一个 guard，会让上一轮的两次失败在这一轮从未发生，模型于是有机会
+    // 把同一个错误再撞一遍——续跑越多，这个洞越大。
+    const loopGuard = taskContext?.loopGuard ?? new LoopGuard();
     agent.beforeToolCall = async ({ toolCall, args }) => {
       if (unknownSideEffect) {
         return { block: true, reason: "上一个可能产生副作用的动作结果不确定，已暂停执行。请先确认外部系统状态，再决定继续或重试。", terminate: true };
@@ -629,11 +849,34 @@ export class SessionRunner {
     // 只碰工具结果，不碰 F6 模型级重试路径。
     agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
       const details = typeof result.details === "object" && result.details !== null ? result.details as Record<string, unknown> : null;
-      if (details?.outcome === "unknown") unknownSideEffect = true;
+      if (details?.outcome === "unknown") {
+        unknownSideEffect = true;
+        sideEffectDetail ??= `${toolCall.name} 的结果不确定`;
+      }
       const resultText = (result.content ?? [])
         .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
         .map((block) => block.text)
         .join("\n");
+      // 证据采集（规格 3 §9 条件 3）：只记**成功**的写 / 执行 / 外部核对类调用。
+      // 失败不是验证证据；读取类工具也不记（见 evidenceKindForTool 的说明）——
+      // 否则「有证据」会退化成「调过工具」。
+      if (isError) {
+        toolErrors.push(`${toolCall.name}: ${resultText.trim().slice(0, 160)}`);
+        if (toolErrors.length > 3) toolErrors.shift();
+      } else {
+        const kind = evidenceKindForTool(toolCall.name);
+        if (kind) {
+          const path = (args as { path?: unknown } | undefined)?.path;
+          const program = (args as { program?: unknown } | undefined)?.program;
+          const ref = typeof path === "string" ? path : typeof program === "string" ? program : undefined;
+          const title = typeof details?.title === "string" ? details.title : undefined;
+          evidenceCandidates.push({
+            kind,
+            summary: (title ?? resultText).trim().slice(0, 160) || toolCall.name,
+            ...(ref ? { ref } : {}),
+          });
+        }
+      }
       let advisory = loopGuard.onToolResult({ toolName: toolCall.name, isError, errorText: resultText });
       // 生命周期钩子（P0）：只读观测，不阻塞结果路径
       void Promise.all(fireAfterToolCall(this.hooks, {
@@ -723,6 +966,9 @@ export class SessionRunner {
     }, 15_000);
 
     let runErrored = false;
+    /** 本轮失败的错误消息。用来区分「上游抖动（可重试）」与「确定没救」——
+     *  两者在 Completion Gate 里走完全不同的分支（续跑 vs failed）。 */
+    let runErrorMessage: string | null = null;
     const runStartedAt = Date.now();
 
     // N6 长任务中途 checkpoint：运行超过阈值后周期性发布进度快照（已执行工具数 /
@@ -754,7 +1000,15 @@ export class SessionRunner {
         return match ? { type: "image" as const, data: match[2]!, mimeType: match[1]! } : null;
       }).filter((img): img is { type: "image"; data: string; mimeType: string } => img !== null);
       const attachmentParts = await attachmentRefContent(this.deps.attachments, input.attachmentRefs ?? [], { sessionId: session.id });
-      await agent.prompt({ role: "user", content: [{ type: "text", text: input.text }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() });
+      // 内部续跑喂给模型的驱动文本（规格 3 §8.2）。它**不落库**：上面那条
+      // `if (!acceptedUserId) projector.onUserPrompt(...)` 已经跳过，所以聊天
+      // 记录里看不到它（§18.2 验收要求「没有合成用户消息」）。但驱动模型本身
+      // 必须有个输入——规格 §19 禁止的是把「继续」做成一条**持久化的伪用户
+      // 消息**，不是禁止给模型一个继续的由头。
+      const driveText = taskContext?.continuation
+        ? "[继续执行任务] 上一轮结束时任务还没有完成。按上面的任务契约继续推进，不要中途把控制权交回用户。"
+        : input.text;
+      await agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() });
       await settled();
       let failed = agent.state.errorMessage;
       if (unknownSideEffect) {
@@ -787,6 +1041,7 @@ export class SessionRunner {
       }
       if (failed) {
         runErrored = true;
+        runErrorMessage = failed;
         await this.publish({ type: "session.error", data: { name: "APIError", message: failed } }, session.id);
       }
       await this.publish({ type: "session.status", data: { status: "idle" } }, session.id);
@@ -794,7 +1049,10 @@ export class SessionRunner {
     } catch (error) {
       await settled();
       const aborted = abortController.signal.aborted;
-      if (!aborted && !unknownSideEffect) runErrored = true;
+      if (!aborted && !unknownSideEffect) {
+        runErrored = true;
+        runErrorMessage = error instanceof Error ? error.message : "Agent 运行失败";
+      }
       await this.publish(
         unknownSideEffect
           ? { type: "session.status", data: { status: "waiting_input" } }
@@ -812,6 +1070,7 @@ export class SessionRunner {
       // Workflow settlement clears its lease atomically with the terminal run state.
       if (!acceptedUserId) await this.clearLease(session.id);
       const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
+      attemptFinalText = [...newMessages].reverse().find((message) => message.role === "assistant")?.text ?? "";
       // 任务终态小结（N5）：终态 status 已发布后补一条 session.summary，
       // 让「任务完成」有明确收尾（AI 一句总结 + 结构化统计）。await 保证
       // 落库后再 resolveDone（中断/失败场景不阻塞——内部有静默降级）。
@@ -827,7 +1086,22 @@ export class SessionRunner {
       resolveDone();
     }
 
-    const outcome = unknownSideEffect ? "recovery_required" : abortController.signal.aborted ? "cancelled" : runErrored ? "failed" : "completed";
+    const aborted = abortController.signal.aborted;
+    const outcome: RunOutcome = {
+      state: unknownSideEffect ? "recovery_required" : aborted ? "cancelled" : runErrored ? "failed" : "completed",
+      settled: !aborted && !runErrored && !unknownSideEffect,
+      aborted,
+      unknownSideEffect,
+      sideEffectDetail,
+      filesEdited: [...summaryEditedFiles],
+      toolCalls: summaryToolCalls,
+      durationMs: Date.now() - runStartedAt,
+      toolErrors: [...toolErrors],
+      finalText: attemptFinalText,
+      todos: latestTodos,
+      evidenceCandidates: [...evidenceCandidates],
+      errorMessage: runErrorMessage,
+    };
     if (acceptedUserId || unknownSideEffect) return outcome;
     // FIFO queued prompts (spec §13.3): settle fully, then take the next one.
     const next = await this.deps.store.dequeuePrompt(session.id);
@@ -845,6 +1119,351 @@ export class SessionRunner {
       });
     }
     return outcome;
+  }
+
+  // ---- 持续任务执行（规格 3 §8）----------------------------------------------
+
+  /** 带重试的 CAS 写入。
+   *
+   *  【为什么不「冲突就返回 latest」】那会让调用方以为补丁生效了，而库里没变——
+   *  结算路径尤其致命：它会照常发出 `task.delivered`，于是客户端显示「已完成」
+   *  而持久化状态还是 `running`，重启后任务像个卡住的僵尸。写不进去就必须知道。
+   *  重试几次是给「恰好撞上另一个 drain 的收尾写」留余地；仍然失败就是真的有人
+   *  在并发改同一个任务，那种情况必须浮出来（drain 会把它落成 recovery_required）。 */
+  private async casTask(task: TaskRecord, patch: TaskPatch): Promise<TaskRecord> {
+    const store = this.deps.store.task!;
+    let latest = task;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await store.updateTask(latest.id, latest.revision, patch);
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "TASK_REVISION_CONFLICT") throw error;
+        const fresh = await store.getTask(latest.id);
+        if (!fresh) throw error;
+        latest = fresh;
+      }
+    }
+    throw new Error("TASK_REVISION_CONFLICT");
+  }
+
+  /** 权限等待的进入 / 退出（规格 3 §11.1 / §11.2）。
+   *
+   *  进入时把任务置 `waiting_permission` 并挂 permission blocker；退出（授权通过
+   *  或被拒）时置回 `running` 并清 blocker。
+   *
+   *  【为什么退出后不是 blocked/failed】这次 Attempt 根本没被中断——`engine.ask()`
+   *  只是在 `beforeToolCall` 里挂住，决定一到就接着跑同一个工具循环。所以既不发
+   *  `task.attempt.finished`，也不创建用户消息、不新建 workflow run（§11.2 明文）。
+   *  唯一例外是被拒：拒绝结果会作为工具错误交回模型去试替代方案（§11.3）。
+   *
+   *  【为什么挂在引擎回调上，而不是 beforeToolCall 里】规则表已经允许的调用不会
+   *  弹卡（`ask()` 在 undecided 为空时直接返回），挂在调用点会为这些「秒过」的
+   *  调用也标一次等待再撤回，产生成对的假 blocker 事件。`onAsked` 只在真的抛出
+   *  一张授权卡时触发。
+   *
+   *  【为什么按 taskId 重读而不是接一个快照】`runLoop` 会被子代理嵌套调用
+   *  （`spawnSubagent`），同一个 runner 实例上同时存在两轮运行。用实例字段记
+   *  「当前任务」会被嵌套那轮清掉，父轮的权限等待于是静默丢失。按 id 重读没有
+   *  这个共享状态，代价是一次读，而权限询问本来就不是热路径。 */
+  private async markPermissionWait(taskId: string | undefined, permission: string, patterns: readonly string[], waiting: boolean): Promise<void> {
+    const store = this.deps.store.task;
+    if (!taskId || !store) return;
+    const blocker: TaskBlocker = {
+      kind: "permission",
+      message: `需要你授权才能执行：${permission}${patterns.length ? `（${patterns.join("、")}）` : ""}`,
+      requiredAction: "在授权卡片上选择允许或拒绝；任务会带着你的决定接着跑。",
+      resumable: true,
+    };
+    try {
+      const task = await store.getTask(taskId);
+      if (!task || isTerminalStatus(task.status)) return;
+      const updated = await this.casTask(task, waiting ? { status: "waiting_permission", blocker } : { status: "running", blocker: undefined });
+      await this.publish(
+        waiting
+          ? { type: "task.blocked", data: { taskId: updated.id, revision: updated.revision, blocker } }
+          : // 协议里没有 task.resumed；`task.recovery.started` 是唯一表示「任务离开
+            // 等待、重新开始推进」的事件，用它并让 message 说清是哪一种。
+            { type: "task.recovery.started", data: { taskId: updated.id, revision: updated.revision, message: "授权已处理，继续执行。", attempt: Math.max(1, updated.attemptCount) } },
+        updated.sessionId,
+      );
+    } catch {
+      // 等待状态的记账失败不该打断一次正在跑的工具调用——权限本身已经问出去了，
+      // 用户点了允许就该让工具跑。任务状态退化成「running」，是保守的那一侧。
+    }
+  }
+
+  /** 完成判定用的运行时事实。全部来自本轮可观测结果，**不接受模型自述**。
+   *
+   *  权限等待不在此列：`beforeToolCall` 里的 `engine.ask()` 会一直挂到用户回复，
+   *  所以一次 Attempt 收尾时不会有悬空请求（`engine.dispose()` 也会兜底）。
+   *  这里仍读一次实际值，是为了覆盖 abort / 异常路径。 */
+  private completionStateOf(outcome: RunOutcome, session: SessionInfo): CompletionRuntimeState {
+    // 只有「重试已经耗尽、且错误不是上游抖动」才算真的没救（规格 §10.2）。
+    // runLoop 内部已对可重试错误做过 5 次退避重试，能走到这里说明它没救回来。
+    const fatal = outcome.state === "failed" && !!outcome.errorMessage && !isRetryableError(outcome.errorMessage);
+    return {
+      attemptSettled: outcome.settled,
+      fatalError: fatal ? outcome.errorMessage : null,
+      lastError: outcome.errorMessage,
+      unknownSideEffect: outcome.unknownSideEffect ? (outcome.sideEffectDetail ?? "存在结果不确定的操作") : null,
+      pendingPermissions: isSessionAwaitingPermission(session.id) ? 1 : 0,
+      unsafeReplay: null,
+      budgetExhausted: null,
+      externalAuthRequired: null,
+      inputRequired: null,
+      choiceRequired: null,
+      unresolvedToolErrors: outcome.toolErrors,
+      finalTextPresent: outcome.finalText.trim().length > 0,
+      cancelled: outcome.aborted,
+    };
+  }
+
+  /** 步骤变化 → 事件。粒度按「状态真的变了」算，重放时不会重复累计。 */
+  private async publishStepEvents(previous: readonly TaskStep[], next: TaskRecord, sessionId: string): Promise<void> {
+    const before = new Map(previous.map((step) => [step.id, step.status]));
+    const completed = next.steps.filter((step) => step.status === "completed").length;
+    for (const step of next.steps) {
+      if (before.get(step.id) === step.status) continue;
+      const type = step.status === "completed" ? "task.step.completed" : step.status === "in_progress" ? "task.step.started" : null;
+      if (!type) continue;
+      await this.publish(
+        { type, data: { taskId: next.id, revision: next.revision, stepId: step.id, message: step.title, completedSteps: completed, totalSteps: next.steps.length } },
+        sessionId,
+      );
+    }
+    if (before.size !== next.steps.length) {
+      await this.publish(
+        {
+          type: "task.plan.updated",
+          data: {
+            taskId: next.id,
+            revision: next.revision,
+            goal: next.goal,
+            steps: next.steps.map((step) => ({ id: step.id, title: step.title, status: step.status })),
+            completedSteps: completed,
+            totalSteps: next.steps.length,
+          },
+        },
+        sessionId,
+      );
+    }
+  }
+
+  /** 把本轮的可观测事实投影进任务契约：步骤、证据、隐式验收条件、进度指纹。
+   *
+   *  顺序不能换：证据先于验收条件（条件要引用 evidence id），而指纹最后算
+   *  （它是对「投影后的完整状态」取摘要）。 */
+  private async syncTaskFromAttempt(task: TaskRecord, outcome: RunOutcome, sessionId: string): Promise<TaskRecord> {
+    const now = new Date().toISOString();
+
+    // 1) 步骤（来自模型的 todo 拆解）
+    const steps = outcome.todos
+      ? projectTodos({ taskId: task.id, steps: task.steps, todos: outcome.todos, now })
+      : task.steps;
+
+    // 2) 证据（只收成功的写/执行/外部核对）
+    let evidence = task.evidence;
+    const dropped: string[] = [];
+    let addedThisAttempt = 0;
+    for (const candidate of outcome.evidenceCandidates) {
+      const before = evidence.length;
+      const appended = appendEvidence({ evidence, kind: candidate.kind, summary: candidate.summary, ...(candidate.ref ? { ref: candidate.ref } : {}), now });
+      evidence = appended.evidence;
+      dropped.push(...appended.dropped);
+      addedThisAttempt += evidence.length - before;
+    }
+
+    // 本轮没有任何可验证证据，却产出了最终答复 → 把答复本身记成 model_observation
+    // （规格 §9 末段）。纯解释 / 写作 / 问答类任务没有工具可跑，最终内容就是它唯一
+    // 可验证的东西；不记它，这类任务会被条件 3（每个关键条件至少一条证据）挡死，
+    // 一路空转到 Attempt 上限——把最简单的问答变成最贵的任务。
+    // **只在「本轮一条证据都没有」时补**：有工具证据的任务不该靠模型的自述文本
+    // 通过验证，那会让「有证据」重新退化成「说过话」。
+    const answer = outcome.finalText.trim();
+    if (addedThisAttempt === 0 && answer) {
+      const appended = appendEvidence({ evidence, kind: "model_observation", summary: answer.slice(0, 160), now });
+      evidence = appended.evidence;
+      dropped.push(...appended.dropped);
+    }
+
+    // 3) 引用清理 + 隐式验收条件。淘汰证据后必须同步清引用，否则条件会因为
+    //    悬空引用永远不满足（Completion Gate 的条件 3 只认能对上号的证据）。
+    const prunedSteps = pruneEvidenceRefs(steps, dropped);
+    const prunedCriteria = pruneEvidenceRefs(task.acceptanceCriteria, dropped);
+    const acceptanceCriteria = projectImplicitCriterion({
+      criteria: prunedCriteria,
+      steps: prunedSteps,
+      evidenceIds: evidence.map((item) => item.id),
+      answerPresent: answer.length > 0,
+    });
+
+    // 4) 进度指纹（含本轮的文件改动）
+    const projected: TaskRecord = { ...task, steps: prunedSteps, evidence, acceptanceCriteria };
+    const progress = advanceProgress(projected, { editedFiles: outcome.filesEdited, toolCalls: outcome.toolCalls });
+
+    const updated = await this.casTask(task, {
+      steps: prunedSteps,
+      evidence,
+      acceptanceCriteria,
+      lastFingerprint: progress.fingerprint,
+      noProgressCount: progress.noProgressCount,
+    });
+    await this.publishStepEvents(task.steps, updated, sessionId);
+    return updated;
+  }
+
+  /** 任务进入终态（或阻塞）：落库 + 发事件，返回这次 run 的 workflow 状态。
+   *
+   *  blocked 返回 `"completed"` 而不是 `"failed"`：这次运行本身正常结束了，
+   *  任务是在等外部动作。返回 failed 会让 workflow 层把它当成运行崩溃处理
+   *  （还会触发 recovery 路径），那是错的。 */
+  private async settleTask(
+    task: TaskRecord,
+    verdict: SettledVerdict,
+    session: SessionInfo,
+    stats: { filesEdited: string[]; toolCalls: number; durationMs: number },
+  ): Promise<WorkflowState> {
+    const now = new Date().toISOString();
+    const taskId = task.id;
+
+    if (verdict.status === "delivered") {
+      const result = task.result ?? fallbackResult({ task, filesEdited: stats.filesEdited, toolCalls: stats.toolCalls });
+      const updated = await this.casTask(task, { status: "delivered", deliveredAt: now, result });
+      await this.publish(
+        {
+          type: "task.delivered",
+          data: {
+            taskId,
+            revision: updated.revision,
+            result: renderResult(result),
+            evidenceIds: updated.evidence.map((item) => item.id),
+            filesEdited: stats.filesEdited.length,
+            toolCalls: stats.toolCalls,
+            durationMs: stats.durationMs,
+          },
+        },
+        session.id,
+      );
+      return "completed";
+    }
+
+    if (verdict.status === "failed") {
+      const updated = await this.casTask(task, { status: "failed" });
+      await this.publish({ type: "task.failed", data: { taskId, revision: updated.revision, reason: verdict.reason } }, session.id);
+      return "failed";
+    }
+
+    if (verdict.status === "cancelled") {
+      const updated = await this.casTask(task, { status: "cancelled" });
+      await this.publish({ type: "task.cancelled", data: { taskId, revision: updated.revision, reason: verdict.reason } }, session.id);
+      return "cancelled";
+    }
+
+    // blocked / waiting_*：阻塞种类决定状态，UI 据此给对应按钮（规格 §14.2）
+    const status = lifecycleForBlocker(verdict.blocker.kind);
+    const updated = await this.casTask(task, { status, blocker: verdict.blocker });
+    await this.publish({ type: "task.blocked", data: { taskId, revision: updated.revision, blocker: verdict.blocker } }, session.id);
+    return "completed";
+  }
+
+  /** 一个持久任务的执行循环（规格 §8.1 总流程）。
+   *
+   *  【为什么续跑在同一次调用内循环，而不是每轮新建一个 workflow run】
+   *  1. lease 与串行队列：任务执行期间必须持有 session 的执行权。每轮重建 run
+   *     意味着每轮都要重新 claim/lease，中间会出现「谁都没持有」的窗口——那
+   *     正是两个 runner 并行改同一工作区的入口。
+   *  2. 规格 §8.2.5 要求「继续使用 session 级串行队列和 lease」，循环是最直接
+   *     的实现。轮次计数落在 `TaskRecord.attemptCount` 上，所以进程重启后恢复
+   *     扫描仍能知道跑到第几轮。
+   *
+   *  出口只有两个：任务进入终态，或需要用户/外部动作。单次模型停止、step 上限、
+   *  本轮没有工具调用，**都不是**出口（规格 §8.3 逐条列出）。 */
+  private async runTask(session: SessionInfo, input: PromptInput, acceptedUserId?: string): Promise<WorkflowState> {
+    const taskStore = this.deps.store.task;
+    // 没有 TaskStore：退化为一次性运行。工具、权限、事件全部照常，只是没有
+    // 「跨运行的目标」这层语义——这不是错误路径，而是宿主未启用该能力的降级。
+    if (!taskStore) return (await this.runLoop(session, input, acceptedUserId)).state;
+
+    let task = input.taskId ? await taskStore.getTask(input.taskId) : await taskStore.getActiveTask(session.id);
+    if (!task) return (await this.runLoop(session, input, acceptedUserId)).state;
+
+    // `waiting_*` / `blocked` 意味着「在等用户做一个具体动作」，唯一有权解除它的
+    // 是 `resolveTaskForPrompt`——那条新消息本身就是用户动作。这里再挡一道，是因为
+    // **排队中的补充消息可能在阻塞之后才被 drain 到**：用户写下它的时候还没看到
+    // 阻塞原因，把它当成「已经看过并响应了」会静默清掉用户根本没读到的提示。
+    // （那条消息的正文已经并进了 `constraints`，不会丢，用户真正回应时会被带上。）
+    if (isWaitingStatus(task.status)) return "completed";
+
+    const maxAttempts = Math.max(1, Math.floor(this.deps.taskPolicy?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS));
+    const noProgressPolicy = this.deps.taskPolicy?.noProgress;
+
+    let attemptInput: PromptInput = input;
+    let advisory: string | undefined;
+    let continuation = false;
+    // 整个任务共用一个循环防护实例（规格 §16 阶段 D「loop-guard 扩展为跨 Attempt」）
+    const loopGuard = new LoopGuard();
+    let stats = { filesEdited: [] as string[], toolCalls: 0, durationMs: 0 };
+
+    while (true) {
+      const attemptNumber = task.attemptCount + 1;
+      if (attemptNumber > maxAttempts) {
+        return await this.settleTask(task, {
+          status: "blocked",
+          blocker: {
+            kind: "budget",
+            message: `已达单次任务的最大执行轮数（${maxAttempts} 轮）。`,
+            requiredAction: "看一眼执行轨迹，确认目标是否需要收窄；确认后可以继续。",
+            resumable: true,
+          },
+        }, session, stats);
+      }
+
+      task = await this.casTask(task, { status: "running", attemptCount: attemptNumber, blocker: undefined });
+      // 续跑时明确告诉用户「系统在自己接着做」，而不是又开了一轮对话
+      if (continuation) {
+        await this.publish(
+          { type: "task.recovery.started", data: { taskId: task.id, revision: task.revision, message: advisory ?? "继续推进任务", attempt: attemptNumber } },
+          session.id,
+        );
+      }
+
+      const outcome = await this.runLoop(session, attemptInput, acceptedUserId, {
+        task,
+        loopGuard,
+        ...(advisory ? { advisory } : {}),
+        ...(continuation ? { continuation: true } : {}),
+      });
+      stats = { filesEdited: outcome.filesEdited, toolCalls: outcome.toolCalls, durationMs: outcome.durationMs };
+
+      task = await this.syncTaskFromAttempt(task, outcome, session.id);
+
+      // 一次 Attempt 结束——**不是**任务完成（规格 §8.3）。UI 只能拿它画轨迹。
+      await this.publish(
+        {
+          type: "task.attempt.finished",
+          data: {
+            taskId: task.id,
+            revision: task.revision,
+            attempt: attemptNumber,
+            outcome: outcome.aborted ? "aborted" : outcome.state === "failed" ? "error" : "completed",
+            toolCalls: outcome.toolCalls,
+            filesEdited: outcome.filesEdited.length,
+            durationMs: outcome.durationMs,
+          },
+        },
+        session.id,
+      );
+
+      const verdict = evaluateTaskCompletion(task, this.completionStateOf(outcome, session), noProgressPolicy);
+      if (verdict.status !== "continue") return await this.settleTask(task, verdict, session, stats);
+
+      // ---- 内部续跑：不创建用户消息，不新建 workflow run ----
+      advisory = verdict.advisory;
+      continuation = true;
+      attemptInput = { ...input, continuation: { attempt: attemptNumber + 1, ...(advisory ? { advisory } : {}) } };
+      // 上一轮是上游抖动的话，立刻重打一次没有意义——给它一个短退避
+      if (outcome.state === "failed") await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
   }
 
   /** Spawns a subagent child session (spec §6.4): depth-capped, permission

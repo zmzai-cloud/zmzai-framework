@@ -3,6 +3,8 @@ import { notifyEventLogListeners } from "../events/bus.js";
 import type { FrameworkEvent, PersistedFrameworkEvent } from "../events/manifest.js";
 import type { Part } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
+import { lifecycleForBlocker } from "../task/completion.js";
+import { isTerminalStatus, type TaskBlocker } from "../task/types.js";
 
 /** Lease recovery (spec §3.2): the runner stamps a lease on the session
  *  document while it owns a run. A periodic scan reclaims sessions whose lease
@@ -52,11 +54,19 @@ export async function finalizeInterruptedRun(input: { sessionId: string; log: Ev
 
   // 1. Pending permission: a `permission.asked` with no later `replied` for
   //    the same request id. Fold it to `reject` so the card clears.
+  //
+  //    被折叠的请求对应的工具调用记进 `rejectedCallIds`：这些调用**从未真正
+  //    执行过**（授权卡在 beforeToolCall 上），下面判定「有没有未知副作用」时
+  //    必须把它们排除，否则「等待授权时退出应用」会被误报成「可能有写操作
+  //    已经落地」，让用户去核对一个根本没发生的变化（规格 §10.2 的反向误报）。
+  const rejectedCallIds = new Set<string>();
   for (const asked of events) {
     if (asked.type !== "permission.asked") continue;
     const requestId = asked.data.request.id;
     const repliedAfter = events.some((event) => event.type === "permission.replied" && event.data.id === requestId);
     if (repliedAfter) continue;
+    const callId = asked.data.request.tool?.callId;
+    if (callId) rejectedCallIds.add(callId);
     await append({ type: "permission.replied", data: { id: requestId, reply: "reject" } });
   }
 
@@ -72,6 +82,11 @@ export async function finalizeInterruptedRun(input: { sessionId: string; log: Ev
     if (part.state.status === "running" || part.state.status === "pending") runningParts.set(part.id, part);
     else runningParts.delete(part.id);
   }
+  // 判定「有没有未知副作用」：真正**执行过**却没收尾的工具调用。等待授权时被
+  // 折叠成 reject 的那些从未开始执行，不算。这个布尔值决定任务恢复成
+  // unsafe_replay（必须先核对外部状态）还是 input（确认一次即可继续）。
+  const unknownSideEffect = [...runningParts.values()].some((part) => !rejectedCallIds.has(part.callId));
+
   for (const part of runningParts.values()) {
     const started = part.state.status === "pending" ? new Date().toISOString() : part.state.time.start;
     const terminal: Part = {
@@ -95,6 +110,38 @@ export async function finalizeInterruptedRun(input: { sessionId: string; log: Ev
     if (todos.some((item) => item.status === "pending" || item.status === "in_progress")) {
       const settled = todos.map((item) => (item.status === "pending" || item.status === "in_progress" ? { ...item, status: "cancelled" as const } : item));
       await append({ type: "todo.updated", data: { todos: settled } });
+    }
+  }
+
+  // 4. 任务层对账（规格 3 §11 / §16 阶段 D）。崩溃时正在跑的任务必须在这里
+  //    落一个「说得清」的状态，否则 `TaskRecord.status` 会永远停在 `running`：
+  //    界面会一直转圈，用户既看不到原因也没有可点的按钮。
+  //
+  //    不判 failed——一次崩溃不等于用户目标不可达（规格 §10.2 把这类归为
+  //    recovering）。落成「等人拍板」：有执行过却没收尾的工具调用 → unsafe_replay，
+  //    重放前必须核对外部状态（§10.2 明令不得自动重放未知副作用）；否则只是被
+  //    打断 → input，用户确认一次就从中断处继续。两种都可恢复，只是要求不同。
+  const taskStore = input.store.task;
+  if (taskStore) {
+    const task = await taskStore.getActiveTask(input.sessionId).catch(() => null);
+    if (task && !isTerminalStatus(task.status)) {
+      const blocker: TaskBlocker = unknownSideEffect
+        ? {
+            kind: "unsafe_replay",
+            message: "应用在任务完成前中断，有一个动作可能已经产生了副作用但没有拿到结果。",
+            requiredAction: "先核对工作区与外部系统（文件、提交、远端页面）的实际状态，再决定继续或重做。",
+            resumable: true,
+          }
+        : {
+            kind: "input",
+            message: "应用在任务完成前中断，任务停在了中途。",
+            requiredAction: "确认工作区状态没有异常后继续，任务会从中断处接着做，不会从头重做。",
+            resumable: true,
+          };
+      const updated = await taskStore
+        .updateTask(task.id, task.revision, { status: lifecycleForBlocker(blocker.kind), blocker })
+        .catch(() => null);
+      if (updated) await append({ type: "task.blocked", data: { taskId: updated.id, revision: updated.revision, blocker } });
     }
   }
 }

@@ -8,6 +8,9 @@ export interface SessionStore {
   getReadState?(sessionId: string): Promise<{ lastReadMessageSeq: number; unreadCount: number; latestMessageSeq: number; historyRevision: number }>;
   markRead?(sessionId: string, sequence: number, revision: number): Promise<{ lastReadMessageSeq: number; unreadCount: number; latestMessageSeq: number; historyRevision: number }>;
   workflow?: import("./workflow.js").WorkflowStore;
+  /** 持久任务契约（规格 3 §13.4）。缺失时 runner 退化为无任务语义的一次性
+   *  运行——工具、权限、事件全部照常，「自动续跑」与「可信完成判定」不可用。 */
+  task?: import("../task/store.js").TaskStore;
   persistEvent?(event: import("../events/manifest.js").FrameworkEvent & { sessionId: string }): Promise<import("../events/manifest.js").PersistedFrameworkEvent>;
   createSession(info: SessionInfo): Promise<void>;
   getSession(id: string): Promise<SessionInfo | null>;
@@ -31,6 +34,9 @@ export interface SessionStore {
     readState: { lastReadMessageSeq: number; unreadCount: number; latestMessageSeq: number; historyRevision: number };
     stateEvents: import("../events/manifest.js").PersistedFrameworkEvent[];
     runs: { runId: string; status: import("./workflow.js").WorkflowState; revision: number }[];
+    /** 当前任务契约（规格 3 §13.3）：活跃任务优先，无活跃则最近一个终态任务。
+     *  断线重连后 UI 靠它恢复「任务做到哪了」，无需回放全部 task 事件。 */
+    task?: import("../task/types.js").TaskRecord | null;
     hasMore: boolean;
     nextBefore: number | null;
     hasMoreAfter: boolean;

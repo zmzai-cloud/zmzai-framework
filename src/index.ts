@@ -93,6 +93,67 @@ export {
   type ExtractionLocator,
   type SectionHit,
 } from "./core/runtime/extraction.js";
+
+// core: 持续任务执行（规格 3）
+export type {
+  TaskLifecycleStatus,
+  TaskStepStatus,
+  AcceptanceCriterionStatus,
+  AcceptanceCriterion,
+  TaskStep,
+  TaskEvidence,
+  TaskEvidenceKind,
+  TaskBlocker,
+  TaskBlockerKind,
+  TaskRecord,
+  TaskResult,
+  TaskPatch,
+  CreateTaskInput,
+  TaskStore,
+  CompletionRuntimeState,
+  CompletionVerdict,
+  NoProgressPolicy,
+  ProgressAdvance,
+} from "./core/task/index.js";
+export {
+  newTaskId,
+  newTaskStepId,
+  newCriterionId,
+  newEvidenceId,
+  isTerminalStatus,
+  isWaitingStatus,
+  isActiveStatus,
+  createMemoryTaskStore,
+  createTaskRecord,
+  applyTaskPatch,
+  TASK_REVISION_CONFLICT,
+  IMPLICIT_CRITERION_ID,
+  MAX_EVIDENCE,
+  defaultCriteriaFor,
+  stepIdForContent,
+  projectTodos,
+  projectImplicitCriterion,
+  evidenceKindForTool,
+  appendEvidence,
+  pruneEvidenceRefs,
+  fallbackStep,
+  evaluateTaskCompletion,
+  lifecycleForBlocker,
+  normalizeNoProgressPolicy,
+  DEFAULT_NO_PROGRESS_POLICY,
+  DEFAULT_MAX_ATTEMPTS,
+  taskFingerprint,
+  advanceProgress,
+  taskContractText,
+  initialTaskContract,
+  fallbackResult,
+  renderResult,
+  remainingSteps,
+} from "./core/task/index.js";
+
+// core: workflow（调度契约，规格 3 §8.2 / §13.1）
+export type { PromptDisposition, PromptReceipt, WorkflowRunKind, WorkflowState, WorkflowRun, WorkflowStore, AcceptedPrompt } from "./core/session/workflow.js";
+export { promptHash } from "./core/session/workflow.js";
 export { createAttachmentTools } from "./core/tools/attachments.js";
 export type { LifecycleHook } from "./core/runtime/lifecycle.js";
 export { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./core/runtime/run-transcript.js";

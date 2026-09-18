@@ -247,8 +247,12 @@ describe("SessionRunner", () => {
       await store.appendPart({ id: "part_legacy_assistant",sessionId: session.id,messageId: "msg_legacy_assistant",type: "text",text: "legacy answer" });
       const first = await runner.prompt(session.id,{ requestId: "request_fifo_1", text: "first user" });
       const second = await runner.prompt(session.id,{ requestId: "request_fifo_2", text: "future queued user" });
-      expect(first.disposition).toBe("started");
-      expect(second.disposition).toBe("queued");
+      // 规格 3 之后 disposition 描述的是「与任务的关系」：第一条开了任务，
+      // 第二条是在任务进行中送进来的，按 §12 归为 steering。它「排在后面」
+      // 这件事由 receipt 的 queued 字段表达——两个轴各说各的，不再挤一个值。
+      expect(first.disposition).toBe("task_started");
+      expect(second.disposition).toBe("task_steered");
+      expect(second.queued).toBe(true);
       await waitFor(() => contexts.length === 2,5_000);
       expect(contexts[0]).toContain("first user");
       expect(contexts[0]).toContain("legacy user");

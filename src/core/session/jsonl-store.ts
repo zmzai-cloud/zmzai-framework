@@ -4,6 +4,8 @@ import path from "node:path";
 
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
+import { applyTaskPatch, createTaskRecord, TASK_REVISION_CONFLICT } from "../task/store.js";
+import type { CreateTaskInput, TaskPatch, TaskRecord } from "../task/types.js";
 
 /** JSONL SessionStore (spec §3.1 / §11 M4): the zero-dependency local demo
  *  backend. Persists sessions/messages/parts as JSON files under a data dir so
@@ -20,16 +22,19 @@ export function createJsonlSessionStore(options: JsonlStoreOptions): SessionStor
   const sessionsDir = path.join(dataDir, "sessions");
   const messagesDir = path.join(dataDir, "messages");
   const partsDir = path.join(dataDir, "parts");
+  const tasksDir = path.join(dataDir, "tasks");
 
   async function ensureDirs(): Promise<void> {
     await mkdir(sessionsDir, { recursive: true });
     await mkdir(messagesDir, { recursive: true });
     await mkdir(partsDir, { recursive: true });
+    await mkdir(tasksDir, { recursive: true });
   }
 
   const sessions = new Map<string, SessionInfo>();
   const messages = new Map<string, MessageInfo>();
   const parts = new Map<string, Part>();
+  const tasks = new Map<string, TaskRecord>();
   let hydrated = false;
 
   async function hydrate(): Promise<void> {
@@ -48,6 +53,17 @@ export function createJsonlSessionStore(options: JsonlStoreOptions): SessionStor
           const record = JSON.parse(await readFile(path.join(dir, file), "utf8")) as { id?: string } & (SessionInfo | MessageInfo | Part);
           const id = ("sessionId" in record && file.startsWith("ses_")) || file.startsWith("ses_") ? (record as SessionInfo).id : (record as { id?: string }).id;
           if (id) (map as Map<string, unknown>).set(id, record);
+        } catch {
+          // skip corrupt files
+        }
+      }
+    }
+    if (existsSync(tasksDir)) {
+      for (const file of await readdir(tasksDir)) {
+        if (!file.endsWith(".json")) continue;
+        try {
+          const record = JSON.parse(await readFile(path.join(tasksDir, file), "utf8")) as TaskRecord;
+          if (record.id) tasks.set(record.id, record);
         } catch {
           // skip corrupt files
         }
@@ -176,6 +192,63 @@ export function createJsonlSessionStore(options: JsonlStoreOptions): SessionStor
       if (!session) return;
       session.queuedPrompts = [];
       await persist(sessionsDir, session);
+    },
+
+    // ---- 持久任务契约（规格 3 §13.4）：与 SQLite 实现逐条对齐 ----
+    task: {
+      async createTask(input: CreateTaskInput) {
+        await hydrate();
+        const prior = [...tasks.values()].find((task) => task.sessionId === input.sessionId && task.rootRequestId === input.rootRequestId);
+        if (prior) return structuredClone(prior);
+        if ([...tasks.values()].some((task) => task.sessionId === input.sessionId && task.status !== "delivered" && task.status !== "failed" && task.status !== "cancelled")) {
+          throw new Error("TASK_ALREADY_ACTIVE");
+        }
+        const record = createTaskRecord(input, new Date().toISOString());
+        tasks.set(record.id, record);
+        await persist(tasksDir, record);
+        return structuredClone(record);
+      },
+      async getTask(taskId) {
+        await hydrate();
+        const task = tasks.get(taskId);
+        return task ? structuredClone(task) : null;
+      },
+      async getActiveTask(sessionId) {
+        await hydrate();
+        const active = [...tasks.values()]
+          .filter((task) => task.sessionId === sessionId && task.status !== "delivered" && task.status !== "failed" && task.status !== "cancelled")
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        return active[0] ? structuredClone(active[0]) : null;
+      },
+      async getLatestTask(sessionId) {
+        await hydrate();
+        const done = [...tasks.values()]
+          .filter((task) => task.sessionId === sessionId && (task.status === "delivered" || task.status === "failed" || task.status === "cancelled"))
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+        return done[0] ? structuredClone(done[0]) : null;
+      },
+      async updateTask(taskId: string, expectedRevision: number, patch: TaskPatch) {
+        await hydrate();
+        const current = tasks.get(taskId);
+        if (!current) throw new Error("TASK_NOT_FOUND");
+        if (current.revision !== expectedRevision) throw new Error(TASK_REVISION_CONFLICT);
+        const updated = applyTaskPatch(current, patch, new Date().toISOString());
+        tasks.set(taskId, updated);
+        await persist(tasksDir, updated);
+        return structuredClone(updated);
+      },
+      async listTasks(sessionId) {
+        await hydrate();
+        return [...tasks.values()]
+          .filter((task) => task.sessionId === sessionId)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+          .map((task) => structuredClone(task));
+      },
+      async findTaskByRequestId(sessionId, requestId) {
+        await hydrate();
+        const task = [...tasks.values()].find((value) => value.sessionId === sessionId && value.rootRequestId === requestId);
+        return task ? structuredClone(task) : null;
+      },
     },
   };
 }

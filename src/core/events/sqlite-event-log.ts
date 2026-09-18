@@ -2,7 +2,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { EventLog } from "./bus.js";
-import { frameworkEventSchemas } from "./manifest.js";
+import { frameworkEventSchemas, toPersistedEvent } from "./manifest.js";
 import type { FrameworkEventType, PersistedFrameworkEvent } from "./manifest.js";
 import { newEventId } from "../session/ids.js";
 
@@ -60,11 +60,11 @@ export function createSqliteEventLog(options: SqliteEventLogOptions): EventLog {
       if (!parsed.success) throw new Error(`INVALID_FRAMEWORK_EVENT: ${event.type} ${parsed.error.issues[0]?.message ?? ""}`);
       return transaction(() => {
         const seq = (nextSeq.get(event.sessionId) as { n: number }).n;
-        const persisted: PersistedFrameworkEvent = {
+        const persisted = toPersistedEvent({
           id: newEventId(), sessionId: event.sessionId, seq,
-          type: event.type as FrameworkEventType, data: parsed.data as never,
+          type: event.type as FrameworkEventType, data: parsed.data,
           at: new Date().toISOString(),
-        };
+        });
         insert.run(event.sessionId, seq, persisted.id, persisted.type, persisted.at, JSON.stringify(persisted));
         return persisted;
       });

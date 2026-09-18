@@ -3,9 +3,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { promptHash, type PromptReceipt, type WorkflowRun } from "./workflow.js";
-import { frameworkEventSchemas, type FrameworkEventType, type PersistedFrameworkEvent } from "../events/manifest.js";
+import { frameworkEventSchemas, toPersistedEvent, type FrameworkEventType, type PersistedFrameworkEvent } from "../events/manifest.js";
 import { newEventId } from "./ids.js";
 import { searchablePart, searchSnippet, type MessageSearchHit } from "./message-search.js";
+import { applyTaskPatch, createTaskRecord, TASK_REVISION_CONFLICT } from "../task/store.js";
+import type { TaskRecord } from "../task/types.js";
 
 import type { SessionStore } from "./store.js";
 import type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo } from "./types.js";
@@ -96,6 +98,18 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
     );
     CREATE INDEX IF NOT EXISTS idx_search_session ON message_search(session_id,message_id,part_id);
     CREATE TABLE IF NOT EXISTS session_reads (session_id TEXT PRIMARY KEY, last_read_seq INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1,
+      created TEXT NOT NULL,
+      updated TEXT NOT NULL,
+      json TEXT NOT NULL,
+      UNIQUE(session_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks (session_id, created);
   `);
   function transaction<T>(body: () => T): T {
     if (db.isTransaction) return body();
@@ -160,7 +174,7 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       if (row) data.message = { ...data.message, messageSeq: row.message_seq };
     }
     const seq = (db.prepare("SELECT COALESCE(MAX(seq),0)+1 AS n FROM events WHERE session_id=?").get(sessionId) as { n: number }).n;
-    const persisted = { id: newEventId(), sessionId, seq, type: event.type as FrameworkEventType, data: parsed.data as never, at: new Date().toISOString() } satisfies PersistedFrameworkEvent;
+    const persisted = toPersistedEvent({ id: newEventId(), sessionId, seq, type: event.type as FrameworkEventType, data: parsed.data, at: new Date().toISOString() });
     db.prepare("INSERT INTO events(session_id,seq,id,type,at,json) VALUES (?,?,?,?,?,?)").run(sessionId,seq,persisted.id,persisted.type,persisted.at,JSON.stringify(persisted));
     return persisted;
   }
@@ -260,6 +274,15 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
     upsert("sessions", session as unknown as { id: string });
   }
 
+  /** tasks 表的写入口。json 是权威副本，取出单独列只为查询与 UNIQUE 约束——
+   *  与 sessions/messages/parts 的存储策略一致。 */
+  function writeTask(task: TaskRecord): void {
+    db.prepare(
+      "INSERT INTO tasks (id, session_id, request_id, status, revision, created, updated, json) VALUES (?,?,?,?,?,?,?,?) " +
+        "ON CONFLICT(id) DO UPDATE SET status=excluded.status, revision=excluded.revision, updated=excluded.updated, json=excluded.json",
+    ).run(task.id, task.sessionId, task.rootRequestId, task.status, task.revision, task.createdAt, task.updatedAt, JSON.stringify(task));
+  }
+
   return {
     async getReadState(sessionId) { return transaction(() => readState(sessionId)); },
     async markRead(sessionId, sequence, revision) {
@@ -344,6 +367,56 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       async findPrompt(sessionId,requestId) {
         const row = db.prepare("SELECT payload,receipt,status,revision FROM workflow_runs WHERE session_id=? AND request_id=?").get(sessionId,requestId) as { payload: string; receipt: string; status: WorkflowRun["status"]; revision: number } | undefined;
         return row ? { input: JSON.parse(row.payload),receipt: JSON.parse(row.receipt),status: row.status,revision: row.revision } : null;
+      },
+    },
+    // ---- 持久任务契约（规格 3 §13.4）----------------------------------------
+    // CAS 用 UPDATE ... WHERE revision=? 而不是读改写：读改写在同一连接内
+    // 也挡不住「另一个进程在我读完之后更新过」——而 lease 过期后的双 runner
+    // 竞争正是这条路径最需要防的场景。
+    task: {
+      async createTask(input) {
+        return transaction(() => {
+          const prior = db.prepare("SELECT json FROM tasks WHERE session_id=? AND request_id=?").get(input.sessionId, input.rootRequestId) as { json: string } | undefined;
+          if (prior) return JSON.parse(prior.json) as TaskRecord;
+          // 同 session 最多一个 active root task（规格 §6 / §18.9）
+          if (db.prepare("SELECT 1 FROM tasks WHERE session_id=? AND status NOT IN ('delivered','failed','cancelled')").get(input.sessionId)) {
+            throw new Error("TASK_ALREADY_ACTIVE");
+          }
+          const record = createTaskRecord(input, new Date().toISOString());
+          writeTask(record);
+          return record;
+        });
+      },
+      async getTask(taskId) {
+        const row = db.prepare("SELECT json FROM tasks WHERE id=?").get(taskId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as TaskRecord) : null;
+      },
+      async getActiveTask(sessionId) {
+        const row = db.prepare("SELECT json FROM tasks WHERE session_id=? AND status NOT IN ('delivered','failed','cancelled') ORDER BY created DESC LIMIT 1").get(sessionId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as TaskRecord) : null;
+      },
+      async getLatestTask(sessionId) {
+        const row = db.prepare("SELECT json FROM tasks WHERE session_id=? AND status IN ('delivered','failed','cancelled') ORDER BY updated DESC LIMIT 1").get(sessionId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as TaskRecord) : null;
+      },
+      async updateTask(taskId, expectedRevision, patch) {
+        return transaction(() => {
+          const row = db.prepare("SELECT json FROM tasks WHERE id=?").get(taskId) as { json: string } | undefined;
+          if (!row) throw new Error("TASK_NOT_FOUND");
+          const current = JSON.parse(row.json) as TaskRecord;
+          if (current.revision !== expectedRevision) throw new Error(TASK_REVISION_CONFLICT);
+          const updated = applyTaskPatch(current, patch, new Date().toISOString());
+          const result = db.prepare("UPDATE tasks SET status=?,revision=?,updated=?,json=? WHERE id=? AND revision=?").run(updated.status, updated.revision, updated.updatedAt, JSON.stringify(updated), taskId, expectedRevision);
+          if (result.changes !== 1) throw new Error(TASK_REVISION_CONFLICT);
+          return updated;
+        });
+      },
+      async listTasks(sessionId) {
+        return (db.prepare("SELECT json FROM tasks WHERE session_id=? ORDER BY created").all(sessionId) as { json: string }[]).map((row) => JSON.parse(row.json) as TaskRecord);
+      },
+      async findTaskByRequestId(sessionId, requestId) {
+        const row = db.prepare("SELECT json FROM tasks WHERE session_id=? AND request_id=?").get(sessionId, requestId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as TaskRecord) : null;
       },
     },
     async createSession(info) {
@@ -437,7 +510,12 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
         ) ORDER BY seq`).all(sessionId,sessionId,rewoundAt,previousSummary?.seq ?? rewoundAt,rewoundAt) as { json: string }[];
         const stateEvents = stateRows.map(row => JSON.parse(row.json) as PersistedFrameworkEvent);
         const runs = db.prepare("SELECT run_id AS runId,status,revision FROM workflow_runs WHERE session_id=? ORDER BY ordinal").all(sessionId) as { runId: string; status: WorkflowRun["status"]; revision: number }[];
-        return { messages,revision,snapshotSeq,stateEvents,runs,readState: readState(sessionId),hasMore,nextBefore: hasMore ? first! : null,hasMoreAfter,nextAfter: hasMoreAfter ? last! : null };
+        // 任务状态随快照一起给出（规格 3 §13.3）：断线重连后 UI 必须能从持久存储
+        // 恢复「任务做到哪了」，而不是从当前页面内存里猜。只给事件流不够——断线期间
+        // 错过的 task.step.* 需要回放才能重建，而快照直接给出权威终态。
+        // ORDER BY 的布尔项让活跃任务（0）排在终态任务（1）前面。
+        const taskRow = db.prepare("SELECT json FROM tasks WHERE session_id=? ORDER BY (status IN ('delivered','failed','cancelled')) ASC, created DESC LIMIT 1").get(sessionId) as { json: string } | undefined;
+        return { messages,revision,snapshotSeq,stateEvents,runs,task: taskRow ? (JSON.parse(taskRow.json) as TaskRecord) : null,readState: readState(sessionId),hasMore,nextBefore: hasMore ? first! : null,hasMoreAfter,nextAfter: hasMoreAfter ? last! : null };
       });
     },
     async deleteSession(id) {
@@ -450,6 +528,7 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       db.prepare("DELETE FROM workflow_runs WHERE session_id=?").run(id);
       db.prepare("DELETE FROM message_search WHERE session_id=?").run(id);
       db.prepare("DELETE FROM session_reads WHERE session_id=?").run(id);
+      db.prepare("DELETE FROM tasks WHERE session_id=?").run(id);
       });
     },
     async truncateFrom(sessionId, fromMessageId) {

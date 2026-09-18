@@ -1,5 +1,5 @@
 import type { FrameworkEvent, FrameworkEventType, PersistedFrameworkEvent } from "./manifest.js";
-import { frameworkEventSchemas } from "./manifest.js";
+import { frameworkEventSchemas, toPersistedEvent } from "./manifest.js";
 import { newEventId } from "../session/ids.js";
 
 /** EventLog (spec §4.1 abstracted for M5): the durable per-session event log.
@@ -26,14 +26,14 @@ export function createMemoryEventLog(): EventLog {
       const parsed = schema.safeParse(event.data);
       if (!parsed.success) throw new Error(`INVALID_FRAMEWORK_EVENT: ${event.type} ${parsed.error.issues[0]?.message ?? ""}`);
       const list = store.get(event.sessionId) ?? [];
-      const persisted: PersistedFrameworkEvent = {
+      const persisted = toPersistedEvent({
         id: newEventId(),
         sessionId: event.sessionId,
         seq: list.length + 1,
         type: event.type as FrameworkEventType,
-        data: parsed.data as never,
+        data: parsed.data,
         at: new Date().toISOString(),
-      };
+      });
       list.push(persisted);
       store.set(event.sessionId, list);
       return persisted;
