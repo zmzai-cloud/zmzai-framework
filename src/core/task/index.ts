@@ -20,6 +20,7 @@ export type {
   TaskBlockerKind,
   TaskRecord,
   TaskResult,
+  TaskDeliveryDeclaration,
   TaskPatch,
   CreateTaskInput,
 } from "./types.js";
@@ -42,7 +43,7 @@ export {
   defaultCriteriaFor,
   stepIdForContent,
   projectTodos,
-  projectImplicitCriterion,
+  applyDelivery,
   evidenceKindForTool,
   appendEvidence,
   pruneEvidenceRefs,

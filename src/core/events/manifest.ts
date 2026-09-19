@@ -167,7 +167,22 @@ export const frameworkEventSchemas = {
   "task.blocked": taskEventBase.extend({ blocker: taskBlockerSchema }),
   "task.verification.started": taskEventBase.extend({ message: z.string() }),
   "task.delivered": taskEventBase.extend({
+    /** 渲染好的交付文本（通知 / 复制 / 旧客户端）。 */
     result: z.string(),
+    /** 同一份信息的结构化形态（规格 §14.1 四问）。交付卡按四问分别渲染，
+     *  不去解析 `result` 那个字符串——那正是「剩余项」出现两次的原因。 */
+    delivery: z.object({
+      outcome: z.string(),
+      changes: z.array(z.string()),
+      verification: z.array(z.string()),
+      remaining: z.array(z.string()),
+    }),
+    /** 交付时的验收条件终态。**交付卡上「验收 x/y」的权威来源**：事件流里
+     *  没有别的 task.* 事件携带条件状态，此前客户端只能拿 `task.started` 那一刻
+     *  的快照（恒为全 pending）去画，于是界面上永远是 0/n。 */
+    criteria: z.array(taskCriterionSchema),
+    /** 交付时的证据条数。与 `criteria` 同理：「证据 n 条」此前无从取得。 */
+    evidenceCount: z.number(),
     evidenceIds: z.array(z.string()),
     filesEdited: z.number(),
     toolCalls: z.number(),

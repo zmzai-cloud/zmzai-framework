@@ -90,6 +90,32 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
 const typesOf = (events: Published): string[] => events.map((event) => event.type);
 const countOf = (events: Published, type: string): number => events.filter((event) => event.type === type).length;
 
+/** 交付声明（`task_deliver`）的脚本片段。
+ *
+ *  【为什么每个「期望交付」的用例都必须写它】Completion Gate 的条件 6：交付由模型
+ *  **显式声明**，`TaskRecord.result` 是那次声明唯一的产物。脚本里只写一句收尾文本
+ *  不再是交付——那正是 2026-09-19 修掉的事故形状（模型回一句停在冒号上的话，
+ *  任务照样 delivered，用户那句「继续执行」被吞掉）。
+ *
+ *  【为什么是两条消息】工具调用之后模型还要再被问一次，给出不含工具调用的回复，
+ *  一次 Attempt 才算结束（`RunOutcome.finalText` 取的就是这段文本，条件 5 依赖它）。 */
+function deliver(
+  input: { summary: string; verification?: string[]; changes?: string[]; remaining?: string[] },
+  closing = "已交付，说明见上。",
+): FauxResponseStep[] {
+  return [
+    fauxAssistantMessage([
+      fauxToolCall("task_deliver", {
+        summary: input.summary,
+        verification: input.verification ?? ["本地构建通过"],
+        ...(input.changes ? { changes: input.changes } : {}),
+        ...(input.remaining ? { remaining: input.remaining } : {}),
+      }),
+    ]),
+    fauxAssistantMessage(closing),
+  ];
+}
+
 async function userMessageCount(store: ReturnType<typeof createSqliteSessionStore>, sessionId: string): Promise<number> {
   const entries = await store.getMessages(sessionId);
   return entries.filter((entry) => entry.info.role === "user").length;
@@ -103,15 +129,22 @@ describe("任务运行时：续跑与交付", () => {
   // §17.1.3 / §17.1.4：模型连续正常 stop，但每次仍有剩余步骤时自动续跑，
   // 且续跑沿用同一个 task 与 rootRequestId，**不新增用户消息**。
   it("模型一次正常停止不算完成：仍有未完成步骤时自动续跑，且不新增用户消息", async () => {
-    // 【脚本为什么是四段而不是三段】一次 Attempt 内部是一个 agent 循环：模型只要
-    // 还在调工具就一直跑下去，直到它给出一个不含工具调用的回复才算停。所以
-    // 「模型停了」必须用一个**纯文本回复**来表达，而不是「一次 todo 调用结束」。
-    // 这里第 2 段就是那个停止点：它停了，但步骤还没做完。
+    // 【脚本为什么这样分段】一次 Attempt 内部是一个 agent 循环：模型只要还在调
+    // 工具就一直跑下去，直到它给出一个不含工具调用的回复才算停。所以「模型停了」
+    // 必须用一个**纯文本回复**来表达，而不是「一次 todo 调用结束」。这里第 2 段
+    // 就是那个停止点：它停了，但步骤还没做完。
+    //
+    // 第 4 段起是第二轮的交付：`todo` 收尾 + 显式 `task_deliver`（两条消息，见
+    // 上面 `deliver` 的注释）。第一轮结束时既没有交付声明、步骤也没做完，所以
+    // 它必须被当作「未完成」续跑——这正是这条用例要盯住的事。
     const h = await taskHarness([
       fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "解析 PDF", status: "in_progress" }] })]),
       fauxAssistantMessage("PDF 已解析 12 页，先把正文落下来，下一步补图片。"),
       fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "解析 PDF", status: "completed" }] })]),
-      fauxAssistantMessage("PDF 正文与图片已铺到网页，本地构建通过。"),
+      ...deliver({
+        summary: "PDF 正文与图片已铺到网页，本地构建通过。",
+        verification: ["本地构建通过", "浏览器打开页面确认正文与图片都在"],
+      }),
     ]);
     try {
       const receipt = await h.runner.prompt(h.session.id, { requestId: "req_continuation", text: "把这份 PDF 的内容铺到网页并验证可用" });
@@ -145,8 +178,17 @@ describe("任务运行时：续跑与交付", () => {
 
   // §8.3 的反向：不能因为「模型停了」就判完成，也不能因为「没拆步骤」就永远
   // 不判完成。一句普通问答应当**一次**交付——否则最简单的问答会变成最贵的任务。
+  //
+  // 【这条同时是「显式交付没有把问答拖贵」的证明】要求模型调一次 `task_deliver`
+  // 换来的是：交付内容与验收结论终于有了权威来源。代价固定为一次工具调用，与
+  // 任务规模无关，所以「没有步骤的问答」仍然是一轮结束。
   it("普通问答一次交付，不因为「没有步骤」而空转", async () => {
-    const h = await taskHarness([fauxAssistantMessage("42 是生命、宇宙与万物的终极答案。")]);
+    const h = await taskHarness(
+      deliver({
+        summary: "42 是生命、宇宙与万物的终极答案。",
+        verification: ["复述《银河系漫游指南》里的原句并核对"],
+      }),
+    );
     try {
       await h.runner.prompt(h.session.id, { requestId: "req_qa", text: "42 是什么" });
       await waitFor(async () => countOf(await h.events(), "task.delivered") === 1);
@@ -172,7 +214,10 @@ describe("任务运行时：权限等待", () => {
   it("权限等待时任务进入 waiting_permission，回复后继续同一个 task", async () => {
     const h = await taskHarness([
       fauxAssistantMessage([fauxToolCall("bash", { program: "npm", args: ["run", "build"] })]),
-      fauxAssistantMessage("构建通过，页面可用。"),
+      ...deliver({
+        summary: "构建通过，页面可用。",
+        verification: ["npm run build 退出码 0"],
+      }),
     ]);
     try {
       const receipt = await h.runner.prompt(h.session.id, { requestId: "req_permission", text: "构建并验证页面" });
@@ -208,7 +253,10 @@ describe("任务运行时：权限等待", () => {
   it("权限被拒后模型改走替代方案，任务仍然交付", async () => {
     const h = await taskHarness([
       fauxAssistantMessage([fauxToolCall("bash", { program: "rm", args: ["-rf", "dist"] })]),
-      fauxAssistantMessage("收到，我不删除目录，改为只清理构建缓存并重新构建。"),
+      ...deliver({
+        summary: "收到，我不删除目录，改为只清理构建缓存并重新构建。",
+        verification: ["清理缓存后重新构建通过"],
+      }),
     ]);
     try {
       await h.runner.prompt(h.session.id, { requestId: "req_reject", text: "清理 dist 后重新构建" });
@@ -273,8 +321,12 @@ describe("任务运行时：模型声明需要用户介入（§11 / §17.3 场�
         }),
       ]),
       fauxAssistantMessage("本地改动和构建都通过了，只差推送这一步。"),
-      // 用户回复之后这一轮跑的东西
-      fauxAssistantMessage("登录已生效，推送完成，远端页面检查通过。"),
+      // 用户回复之后这一轮跑的东西。注意阻塞轮的收尾文本换不来交付——那个
+      // `task_block` 已经把任务按在 waiting_external 上了，交付只能发生在这里。
+      ...deliver({
+        summary: "登录已生效，推送完成，远端页面检查通过。",
+        verification: ["git push 成功", "打开远端页面确认本次改动已生效"],
+      }),
     ]);
     try {
       const receipt = await h.runner.prompt(h.session.id, { requestId: "req_block_ext", text: "推送并验证线上页面" });
@@ -331,9 +383,16 @@ describe("任务运行时：模型声明需要用户介入（§11 / §17.3 场�
   it("参数不合法的声明不会把任务冻住", async () => {
     // 一个格式不对的工具调用（模型常见的失误）不该让任务停下来等一个根本不存在的
     // 需求。`readTaskBlock` 校验失败即视为没声明，任务照常往下跑。
+    //
+    // 【交付侧同一条纪律】`readTaskDelivery` 校验失败同样读成「没有声明」，
+    // 而不是抛错或当成交付。所以这轮必须再补一次**合法**的 `task_deliver`——
+    // 顺手证明「读不出来」与「没有」在两条路径上是一个意思。
     const h = await taskHarness([
       fauxAssistantMessage([fauxToolCall("task_block", { kind: "出去吃个饭" })]),
-      fauxAssistantMessage("这个工具我调错了，直接回答：页面已经铺好了。"),
+      ...deliver({
+        summary: "这个工具我调错了，直接回答：页面已经铺好了。",
+        verification: ["打开页面确认内容已经铺好"],
+      }),
     ]);
     try {
       await h.runner.prompt(h.session.id, { requestId: "req_block_bad", text: "把页面铺好" });
@@ -363,9 +422,17 @@ describe("§17.3 端到端场景", () => {
       script.push(fauxAssistantMessage([fauxToolCall("todo", { todos: [...done, current, ...titles.slice(index + 1).map((content) => ({ content, status: "pending" as const }))] })]));
       script.push(fauxAssistantMessage(`${title}这一步先到这里，接着往下做。`));
     });
-    // 最后一次收尾才把六步全部标成完成——交付发生在这里，而不是前面任何一次停下。
+    // 最后一次收尾才把六步全部标成完成，并在这时提交交付声明——交付发生在这里，
+    // 而不是前面任何一次停下。前面每一次停下都既没有做完步骤、也没有交付声明，
+    // 两者各自都足以让门把这一轮打回续跑。
     script.push(fauxAssistantMessage([fauxToolCall("todo", { todos: titles.map((content) => ({ content, status: "completed" as const })) })]));
-    script.push(fauxAssistantMessage("六步都做完了：页面已铺好，构建通过，浏览器检查关键内容和资源都正常。"));
+    script.push(
+      ...deliver({
+        summary: "六步都做完了：页面已铺好，构建通过，浏览器检查关键内容和资源都正常。",
+        verification: ["本地构建通过", "浏览器打开页面，检查关键内容与资源都正常"],
+        changes: titles.slice(2),
+      }),
+    );
 
     const h = await taskHarness(script);
     try {
@@ -457,9 +524,15 @@ describe("任务运行时：停止与幂等", () => {
 
   // §17.1.10 / §17.1.11：并发与重复提交都不会造出第二个任务或第二条用户消息。
   it("补充消息并入当前任务，重复 requestId 不重复建任务", async () => {
+    // 第一轮只是一句收尾文本：没有交付声明，所以任务不会停在它上面（见上面
+    // `deliver` 的注释）——补充消息因此还有机会并进**同一个**任务，而不是
+    // 撞在一个已经进终态的任务上被开成第二条。
     const h = await taskHarness([
       fauxAssistantMessage("先给一版结论。"),
-      fauxAssistantMessage("按补充的约束重做了一版。"),
+      ...deliver({
+        summary: "按补充的约束重做了一版。",
+        verification: ["逐条核对结论是否都带上了引用"],
+      }),
     ]);
     try {
       const first = await h.runner.prompt(h.session.id, { requestId: "req_steer_1", text: "给我一版结论" });
@@ -558,7 +631,10 @@ describe("任务运行时：重启恢复与人工放行", () => {
         fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "in_progress" }] })]),
         fauxAssistantMessage("先解析了 PDF，下一页再落网页。"),
         fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "completed" }] })]),
-        fauxAssistantMessage("PDF 内容已铺到网页并通过构建。"),
+        ...deliver({
+          summary: "PDF 内容已铺到网页并通过构建。",
+          verification: ["本地构建通过", "浏览器打开页面确认内容都在"],
+        }),
       ],
       // 预算刻意只给 1 轮：第一轮做完就该停，等用户放行
       { maxAttempts: 1 },
@@ -592,7 +668,7 @@ describe("任务运行时：重启恢复与人工放行", () => {
   }, 20_000);
 
   it("任务在正常跑时 resumeTask 返回 false（正常运行不需要「继续」）", async () => {
-    const h = await taskHarness([fauxAssistantMessage("好了。")]);
+    const h = await taskHarness(deliver({ summary: "好了。", verification: ["看一眼结果就行"] }));
     try {
       const receipt = await h.runner.prompt(h.session.id, { requestId: "req_noop", text: "随便做点什么" });
       await waitFor(async () => (await h.tasks.getTask(receipt.taskId!))!.status === "delivered");
@@ -646,7 +722,10 @@ describe("任务运行时：预算与上下文存续（§10.2 / §16 阶段 D / 
         fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "in_progress" }] })]),
         fauxAssistantMessage("先解析了 PDF，下一页再落网页。"),
         fauxAssistantMessage([fauxToolCall("todo", { todos: [{ content: "把 PDF 铺到网页", status: "completed" }] })]),
-        fauxAssistantMessage("PDF 内容已铺到网页并通过构建。"),
+        ...deliver({
+          summary: "PDF 内容已铺到网页并通过构建。",
+          verification: ["本地构建通过", "浏览器打开页面确认内容都在"],
+        }),
       ],
       // 预算压到 1 毫秒：第一轮刚跑完就超。轮数给足，证明停下来的是时间而不是轮数。
       { maxDurationMs: 1, maxAttempts: 8 },

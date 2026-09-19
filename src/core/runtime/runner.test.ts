@@ -221,7 +221,12 @@ describe("SessionRunner", () => {
   it("runs registered prompts FIFO without leaking future queued users into model context", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "runner-workflow-"));
     try {
+      // 第一条要**交付**：这个用例的主题是 FIFO 与上下文隔离，不是完成判定。
+      // 不交付的话第一轮会被 Completion Gate 打回续跑，模型调用的次数与时序
+      // 就不再由「排队消息何时 drain」决定，断言会跟着抖（见 `task_deliver`）。
+      // 交付需要两次模型调用（工具调用 + 收尾文本），所以这里是三条脚本。
       const h = makeHarness([
+        fauxAssistantMessage([fauxToolCall("task_deliver", { summary: "第一条答复", verification: ["核对过"] })]),
         fauxAssistantMessage("first answer"),
         fauxAssistantMessage("second answer"),
       ]);
@@ -253,13 +258,22 @@ describe("SessionRunner", () => {
       expect(first.disposition).toBe("task_started");
       expect(second.disposition).toBe("task_steered");
       expect(second.queued).toBe(true);
-      await waitFor(() => contexts.length === 2,5_000);
+      // 等到排队消息被 drain 起来跑——它驱动的那一次调用一定能看见它自己。
+      await waitFor(() => contexts.some((context) => context.includes("future queued user")),5_000);
+      // 【为什么不写 `contexts.length === 2` 再按下标断言】调用次数是交付机制的
+      // 函数（显式交付要两次模型调用、续跑会再加），拿它当前提会让这条断言随
+      // 完成判定的改动一起抖。真正要钉的性质与次数无关：**排队消息只出现在它
+      // 自己驱动的那一次调用里，在它之前的所有调用都看不见它。**
+      const queuedAt = contexts.findIndex((context) => context.includes("future queued user"));
+      expect(queuedAt).toBeGreaterThan(0);
+      for (const context of contexts.slice(0, queuedAt)) {
+        expect(context).not.toContain("future queued user");
+      }
       expect(contexts[0]).toContain("first user");
       expect(contexts[0]).toContain("legacy user");
-      expect(contexts[0]).not.toContain("future queued user");
-      expect(contexts[1]).toContain("first user");
-      expect(contexts[1]).toContain("first answer");
-      expect(contexts[1]).toContain("future queued user");
+      // 轮到它跑时，前面的对话一条不少
+      expect(contexts[queuedAt]).toContain("first user");
+      expect(contexts[queuedAt]).toContain("first answer");
     } finally {
       await rm(dataDir,{ recursive: true, force: true });
     }

@@ -146,8 +146,31 @@ export type TaskResult = {
   remaining: string[];
 };
 
-export type CreateTaskInput = {
-  sessionId: string;
+/** 交付声明：模型调用 `task_deliver` 时提交的结构化信息（规格 §9 条件 1/5、
+ *  §14.1 四问、§18.7）。
+ *
+ *  【为什么它是领域类型而不是「工具的参数类型」】验收条件的结论是任务契约的一部分，
+ *  会被持久化进 `TaskRecord.acceptanceCriteria`；把它声明在 `core/tools/` 里会让
+ *  「任务契约长什么样」依赖工具层的实现细节，方向反了。工具层的 zod schema 负责
+ *  校验模型给的参数，形状与此结构对齐。 */
+export type TaskDeliveryDeclaration = {
+  /** 问 1：做成了什么。 */
+  summary: string;
+  /** 问 2：改了哪些主要内容。省略时框架用本轮实际编辑过的文件补。 */
+  changes?: string[];
+  /** 问 3：怎么验证的。至少一条。 */
+  verification: string[];
+  /** 问 4：还有哪些没做完。省略等价于「无」。 */
+  remaining?: string[];
+  /** 逐条验收条件的结论。省略 = 隐式条件按通过处理。 */
+  criteria?: {
+    id: string;
+    status: Exclude<AcceptanceCriterionStatus, "pending">;
+    evidence: string;
+  }[];
+};
+
+export type CreateTaskInput = {  sessionId: string;
   rootRequestId: string;
   rootUserMessageId: string;
   goal: string;

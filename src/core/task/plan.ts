@@ -5,10 +5,12 @@ import {
   newEvidenceId,
   newTaskStepId,
   type AcceptanceCriterion,
+  type TaskDeliveryDeclaration,
   type TaskEvidence,
   type TaskEvidenceKind,
   type TaskPatch,
   type TaskRecord,
+  type TaskResult,
   type TaskStep,
   type TaskStepStatus,
 } from "./types.js";
@@ -98,36 +100,97 @@ export function projectTodos(input: {
 
 /** 让隐式条件跟随步骤推进。
  *
- * 为什么需要这一条：隐式条件没有模型显式声明「我达成了」，它的达成只能从
- * 「模型自己拆的步骤都做完了」推导。显式声明的条件（如果将来引入）不受影响。 */
-export function projectImplicitCriterion(input: {
+ * 【2026-09-19 已删除】这里原来有一个 `projectImplicitCriterion`：看「本轮有没有
+ * 输出文本」/「步骤是否都做完了」，据此把隐式条件判 passed。它是一条从**可观测
+ * 的弱事实**到**只有当事人知道的结论**之间的跳跃，而且跳得没有依据——
+ *
+ * 事故：用户发「继续执行」，模型回「继续。跑自检验证前面改动的正确性：」，一句话
+ * 停在冒号上、零工具调用、28 个输出 token；`answerPresent` 为真，隐式条件判 passed，
+ * Completion Gate 五条件全过，`task.delivered` 照发，交付卡写着「完成了 0 个步骤、
+ * 0 次工具调用」「剩余项：无」。任务进终态，用户那句「继续执行」被吞掉。
+ *
+ * 规格 §3.1 的根因就是「一次运行正常结束 ≠ 用户目标已实现」，而这条推导犯的是同一个
+ * 错，只是把「运行结束」换成了「文本非空」。替代方案是 `applyDelivery`：验收条件的
+ * 结论只有一个来源——模型在 `task_deliver` 里的**显式声明**；框架不再从任何东西推导
+ * 它。这与 `task_block` 注释里那条判断（不猜最终文本，让模型显式声明）是同一条原则
+ * 在交付侧的应用。 */
+export type DeliveryProjection = {
+  criteria: AcceptanceCriterion[];
+  result: TaskResult;
+  /** 声明里提到、但任务契约里不存在的条件 id（模型写错了）。 */
+  unknownCriterionIds: string[];
+  /** 仍没有拿到 passed 结论的 required 条件 id——门会据此打回续跑并点名。 */
+  unfulfilledRequiredIds: string[];
+};
+
+/** 把一次交付声明投影进任务契约（规格 §9 条件 1/3、§14.1 四问）。
+ *
+ * 【为什么证据是「整份任务集合」而不是按条件挑】工具调用与验收条件之间没有可靠
+ * 映射：框架不知道第 3 次 `pnpm build` 服务的是哪一条条件。后果只有两种：全都挂
+ * 上，或都不挂。都不挂会让条件 3 永远不满足（每个 passed 条件至少要一条有效证据），
+ * 完成判定直接失效；全都挂是保守的那一侧——它不会让**不该通过**的条件通过，只会
+ * 让「有证据」这条判定比理想情况宽一点。而真正会骗人的那一步（把模型自己的话当
+ * 证据）另有约束：只有任务里**一条别的证据都没有**时，才用声明本身顶上。 */
+export function applyDelivery(input: {
   criteria: readonly AcceptanceCriterion[];
-  steps: readonly TaskStep[];
-  evidenceIds: readonly string[];
-  /** 本轮是否产出了最终答复（交付文本）。 */
-  answerPresent: boolean;
-}): AcceptanceCriterion[] {
-  const { criteria, steps, evidenceIds, answerPresent } = input;
-  if (!criteria.some((criterion) => criterion.id === IMPLICIT_CRITERION_ID)) return [...criteria];
+  delivery: TaskDeliveryDeclaration;
+  evidence: readonly TaskEvidence[];
+  /** 交付声明自身被记成的证据 id（仅当任务没有任何工具证据时存在）。 */
+  declarationEvidenceId?: string;
+  /** 本轮实际编辑过的文件。模型没给 `changes` 时用它兜底。 */
+  observedChanges: readonly string[];
+}): DeliveryProjection {
+  const { criteria, delivery, evidence, declarationEvidenceId, observedChanges } = input;
+  // 空数组按「没给」处理：`criteria: []` 与省略是同一个意思，不该因为写了对方括号
+  // 就让隐式条件掉进「未声明」分支。
+  const declaredList = delivery.criteria?.length ? delivery.criteria : null;
+  const declared = new Map((declaredList ?? []).map((item) => [item.id, item]));
+  const known = new Set(criteria.map((criterion) => criterion.id));
+  const unknownCriterionIds = (declaredList ?? []).filter((item) => !known.has(item.id)).map((item) => item.id);
 
-  const hasOpenSteps = steps.some((step) => step.status === "pending" || step.status === "in_progress" || step.status === "blocked");
-  // 有步骤时要求全部完成（步骤是模型的 todo 拆解，它说做完了才算做完）。
-  //
-  // 没有步骤时（纯解释 / 写作 / 问答，模型没拆 todo）**不能一律判未满足**：
-  // 这类任务的真实完成信号就是「有没有给出答复」。曾经这里恒为 false，配合
-  // Completion Gate 的条件 1（所有 required 条件必须 passed）会让每一个纯问答
-  // 都永远交付不了——空转到 Attempt 上限后报一个 budget blocked。规格 §9 末段
-  // 说的就是这个口子：没有工具可跑的任务，最终内容本身是唯一可验证的东西。
-  const satisfied = steps.length === 0 ? answerPresent : !hasOpenSteps;
+  // 工具证据优先；一条都没有时（纯解释 / 写作 / 问答，规格 §9 末段）才用交付
+  // 声明本身。顺序不能反：反了就是「说过话」压过「做过事」。
+  const toolEvidenceIds = evidence.filter((item) => item.kind !== "model_observation").map((item) => item.id);
+  const attachable = toolEvidenceIds.length ? toolEvidenceIds : declarationEvidenceId ? [declarationEvidenceId] : [];
 
-  return criteria.map((criterion) => {
-    if (criterion.id !== IMPLICIT_CRITERION_ID) return criterion;
-    if (satisfied) {
-      return { ...criterion, status: "passed" as const, evidenceIds: [...evidenceIds] };
+  const next = criteria.map((criterion) => {
+    const item = declared.get(criterion.id);
+    if (!item) {
+      // 只有隐式条件、且模型没逐条写：`summary` + `verification` 已经回答了同一个
+      // 问题（描述就是用户的目标），视为通过。这是「省略 = 隐式条件通过」的实现处。
+      if (!declaredList && criterion.id === IMPLICIT_CRITERION_ID) {
+        return { ...criterion, status: "passed" as const, evidenceIds: [...attachable] };
+      }
+      // 其余未覆盖的保持原状（pending）——门会以「验收条件未通过」打回续跑，
+      // 并在 advisory 里点名。不在这里自动补一个结论。
+      return { ...criterion };
     }
-    // 未满足时不保存证据引用，避免「没通过却有证据」的中间态被误读
-    return { ...criterion, status: "pending" as const, evidenceIds: [] };
+    // required 条件不接受 not_applicable：那等于用一句话把一整条验收条件抹掉，
+    // 而 §9 条件 1 要的是「所有 required 条件 passed」。非 required 条件（将来由
+    // 宿主显式添加）允许豁免。
+    if (item.status === "not_applicable") {
+      return criterion.required ? { ...criterion } : { ...criterion, status: "not_applicable" as const, evidenceIds: [] };
+    }
+    if (item.status === "failed") {
+      // failed 不挂证据：挂上会让「这条条件有证据」与「这条条件没通过」同时为真，
+      // 而 §9 条件 3 只对 passed 的条件要求证据。
+      return { ...criterion, status: "failed" as const, evidenceIds: [] };
+    }
+    return { ...criterion, status: "passed" as const, evidenceIds: [...attachable] };
   });
+
+  return {
+    criteria: next,
+    result: {
+      outcome: delivery.summary,
+      changes: delivery.changes?.length ? [...delivery.changes] : [...observedChanges],
+      verification: [...delivery.verification],
+      // §18.7：无剩余项时也要显式给空数组，"没写" 与 "没有" 不能糊在一起。
+      remaining: delivery.remaining ? [...delivery.remaining] : [],
+    },
+    unknownCriterionIds,
+    unfulfilledRequiredIds: next.filter((criterion) => criterion.required && criterion.status !== "passed").map((criterion) => criterion.id),
+  };
 }
 
 /** 工具 → 证据种类。没列出的工具（读文件、搜索、列目录等）返回 null：

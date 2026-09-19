@@ -17,7 +17,7 @@ describe("task 事件 schema", () => {
     "task.recovery.started": { ...base, message: "服务重启后继续", attempt: 3 },
     "task.blocked": { ...base, blocker: { kind: "external_auth", message: "凭据失效", requiredAction: "登录", resumable: true } },
     "task.verification.started": { ...base, message: "开始验证" },
-    "task.delivered": { ...base, result: "铺好了", evidenceIds: ["evd_1"], filesEdited: 3, toolCalls: 7, durationMs: 12_000 },
+    "task.delivered": { ...base, result: "铺好了", delivery: { outcome: "铺好了", changes: [], verification: ["pnpm build 通过"], remaining: [] }, criteria: [], evidenceCount: 1, evidenceIds: ["evd_1"], filesEdited: 3, toolCalls: 7, durationMs: 12_000 },
     "task.failed": { ...base, reason: "需求本身无法完成" },
     "task.cancelled": { ...base, reason: "用户停止" },
   };
@@ -60,6 +60,23 @@ describe("task 事件 schema", () => {
   it("parseFrameworkEvent 能识别任务事件", () => {
     const parsed = parseFrameworkEvent({ type: "task.delivered", data: samples["task.delivered"] });
     expect(parsed?.type).toBe("task.delivered");
+  });
+
+  // 交付卡上「验收 x/y · 证据 n 条」这两个数字此前**无从取得**：事件流里没有任何
+  // task.* 事件携带验收条件终态或证据条数，客户端只能拿 task.started 那一刻的快照
+  // （恒为全 pending）去画，于是界面上永远显示 0/n——与实际相反，而那一行恰恰是
+  // 规格 §18.4 给用户「不必相信这句完成」的核对依据。
+  // 三个字段因此都是**必填**：缺失时宁可让帧解析失败，也不要让客户端静默退回一个
+  // 恒错的默认值。
+  it("task.delivered 必须带上四问、验收条件终态与证据条数", () => {
+    const schema = frameworkEventSchemas["task.delivered"];
+    // `samples` 是 unknown 值表，spread 前要先收窄——三个反例都是「抽掉一个字段」，
+    // 直接写 `{ ...full, delivery: undefined }` 会在 tsc 层就报 TS2698。
+    const full = samples["task.delivered"] as Record<string, unknown>;
+    expect(schema.safeParse(full).success).toBe(true);
+    expect(schema.safeParse({ ...full, delivery: undefined }).success).toBe(false);
+    expect(schema.safeParse({ ...full, criteria: undefined }).success).toBe(false);
+    expect(schema.safeParse({ ...full, evidenceCount: undefined }).success).toBe(false);
   });
 
   it("parseFrameworkEvent 对非法载荷返回 null（SSE 帧可能被截断）", () => {

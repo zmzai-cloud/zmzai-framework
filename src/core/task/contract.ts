@@ -33,8 +33,13 @@ export function taskContractText(task: TaskRecord, advisory?: string): string {
   }
   const required = task.acceptanceCriteria.filter((criterion) => criterion.required);
   if (required.length) {
-    lines.push("验收条件（全部满足才算完成）：");
-    for (const criterion of required) lines.push(`- ${criterion.description}${criterion.status === "passed" ? "（已通过）" : ""}`);
+    // id 印出来是**功能必需**的：`task_deliver` 的 `criteria[].id` 要引用它。
+    // 不印 id 的话模型只能猜，而猜错的后果是那条条件的结论落不到契约上、
+    // 任务被门无限打回。方括号的形式与 steps 的 checkbox 区分开。
+    lines.push("验收条件（逐条给出结论才算完成；方括号里是交付时要引用的 id）：");
+    for (const criterion of required) {
+      lines.push(`- [${criterion.id}] ${criterion.description}${criterion.status === "passed" ? "（已通过）" : ""}`);
+    }
   }
   if (task.steps.length) {
     lines.push("任务计划：");
@@ -54,7 +59,12 @@ export function taskContractText(task: TaskRecord, advisory?: string): string {
   }
   lines.push(
     "继续执行这件事，直到验收条件全部满足并留下证据。不要在中途把控制权交回用户——",
-    "只有确实需要用户授权、补充信息或处理外部状态（登录、验证码、付款）时才停下，并说明卡在哪里、需要用户做什么。",
+    "只有确实需要用户授权、补充信息或处理外部状态（登录、验证码、付款）时才停下（用 `task_block`），并说明卡在哪里、需要用户做什么。",
+    // 显式交付的指示必须每次 Attempt 都出现：它是交付的唯一入口，模型忘了它，
+    // 任务会一路空转到 no_progress，用户看到的是一个「什么都没做就卡住」的任务。
+    "做完之后**必须调用 `task_deliver`** 提交交付信息（做成了什么 / 改了哪些内容 / 怎么验证的 / 还有哪些没做完，"
+    + "并逐条给出上面每个验收条件的结论）。结束一轮、说一句「已完成」、把 todo 勾完都**不能**让任务结束——",
+    "没有这次声明，任务不会交付。如果你发现还有没做完的，先别调用它，继续做。",
   );
   if (advisory) lines.push("", advisory);
   lines.push("</task-contract>");
@@ -66,10 +76,16 @@ export function initialTaskContract(task: TaskRecord): string {
   return taskContractText(task);
 }
 
-/** 交付摘要的兜底文本：模型没产出结构化交付信息时，由任务记录本身生成
- *  「做了什么」。此时**不使用任何完成性措辞**——规格 §18.7 要求交付信息
- *  必须包含结果/改动/验证/剩余项，一段编出来的「已全部完成」比一段朴实的
- *  统计更糟。 */
+/** 交付摘要的兜底文本。
+ *
+ *  【2026-09-19 起它基本不可达】`task_deliver` 是 `TaskRecord.result` 的唯一生产者，
+ *  而 Completion Gate 的条件 6 要求没有 `result` 就不能交付——所以走到交付那一步时
+ *  `result` 一定在。保留它是为了两种残留：升级前就已 delivered 的旧记录（读回来渲染
+ *  历史卡片），以及宿主自己写入 result 的极端情况。
+ *
+ *  措辞刻意**不含任何完成性描述**：规格 §18.7 要求交付信息包含结果/改动/验证/剩余项，
+ *  而一段编出来的「已全部完成」比一段朴实的统计更糟——旧版本那句「完成了 0 个步骤、
+ *  0 次工具调用。」正是被用户当场抓到的那一行。 */
 export function fallbackResult(input: {
   task: TaskRecord;
   filesEdited: readonly string[];
@@ -79,7 +95,7 @@ export function fallbackResult(input: {
   const completed = task.steps.filter((step) => step.status === "completed");
   const remaining = remainingSteps(task).map((step) => step.title);
   return {
-    outcome: `完成了 ${completed.length} 个步骤、${toolCalls} 次工具调用。`,
+    outcome: `这条任务没有留下交付说明（记录到 ${completed.length} 个已完成步骤、${toolCalls} 次工具调用）。`,
     changes: [...filesEdited],
     verification: task.evidence.slice(-6).map((item) => item.summary),
     remaining,

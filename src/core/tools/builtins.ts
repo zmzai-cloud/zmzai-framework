@@ -230,6 +230,10 @@ export const bashTool: ToolDef = {
 
 import { taskTool } from "../tools/task.js";
 import { taskBlockTool } from "../tools/task-block.js";
+import { taskDeliverTool } from "../tools/task-deliver.js";
 import { webfetchTool } from "../tools/webfetch.js";
 
-export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, qaCheckTool, webfetchTool, taskTool, taskBlockTool];
+// `task_block`（我卡住了）与 `task_deliver`（我做完了）是一对：规格 3 §11 要求
+// 「需要用户介入」是**声明**出来的状态，§9 要求「目标已实现」同样是声明出来的。
+// 两者都不产生副作用，因此都不走授权。
+export const builtinTools: ToolDef[] = [readTool, globTool, grepTool, writeTool, editTool, todoTool, bashTool, qaCheckTool, webfetchTool, taskTool, taskBlockTool, taskDeliverTool];

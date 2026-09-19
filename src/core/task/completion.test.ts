@@ -12,7 +12,7 @@ import {
   normalizeNoProgressPolicy,
   type CompletionRuntimeState,
 } from "./completion.js";
-import type { AcceptanceCriterion, TaskEvidence, TaskRecord, TaskStep } from "./types.js";
+import type { AcceptanceCriterion, TaskEvidence, TaskRecord, TaskResult, TaskStep } from "./types.js";
 
 function criterion(overrides: Partial<AcceptanceCriterion> = {}): AcceptanceCriterion {
   return { id: "crit_implicit", description: "把 PDF 内容铺到网页", required: true, status: "pending", evidenceIds: [], ...overrides };
@@ -24,6 +24,16 @@ function step(overrides: Partial<TaskStep> = {}): TaskStep {
 
 function evidence(overrides: Partial<TaskEvidence> = {}): TaskEvidence {
   return { id: "evd_1", kind: "command", summary: "pnpm build 通过", createdAt: "2026-09-18T00:00:00.000Z", ...overrides };
+}
+
+/** 一份交付声明。**条件 6 要求 `TaskRecord.result` 存在**——它是模型调用
+ *  `task_deliver` 的产物、也是 `applyDelivery` 的唯一写入点。
+ *
+ *  本文件绝大多数用例关心的是**其它**条件，所以 `taskOf` 默认带上它，把条件 6
+ *  从它们身上移开；条件 6 本身另有一组用例，其中「没有声明就不交付」那条显式
+ *  用 `result: undefined` 覆盖掉这个默认值。 */
+function resultOf(overrides: Partial<TaskResult> = {}): TaskResult {
+  return { outcome: "已铺好", changes: [], verification: ["pnpm build 通过"], remaining: [], ...overrides };
 }
 
 function taskOf(overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -43,6 +53,7 @@ function taskOf(overrides: Partial<TaskRecord> = {}): TaskRecord {
     constraints: [],
     createdAt: "2026-09-18T00:00:00.000Z",
     updatedAt: "2026-09-18T00:00:00.000Z",
+    result: resultOf(),
     ...overrides,
   };
 }
@@ -131,11 +142,13 @@ describe("evaluateTaskCompletion", () => {
     if (verdict.status === "continue") expect(verdict.reason).toContain("最终交付说明");
   });
 
-  it("纯问答（无步骤）靠最终文本与隐式条件判定，不因为没拆计划而被判未完成", () => {
+  // 纯问答的完成信号是「模型显式交付了它的答复」，不是「它开口了」。没有 todo 拆解
+  // 不该被判未完成，但也不因此获得一条免检通道——两条都由这一组钉住。
+  it("纯问答（无步骤）不因为没拆计划而被判未完成", () => {
     const verdict = evaluateTaskCompletion(
       taskOf({
         acceptanceCriteria: [criterion({ status: "passed", evidenceIds: ["evd_1"] })],
-        evidence: [evidence({ kind: "model_observation", summary: "解释已给出" })],
+        evidence: [evidence({ kind: "model_observation", summary: "解释已给出", ref: "task_deliver" })],
       }),
       stateOf(),
     );
@@ -347,6 +360,75 @@ describe("evaluateTaskCompletion", () => {
       stateOf(),
     );
     expect(verdict.status).toBe("delivered");
+  });
+
+  // ── §9 条件 6：交付必须是一次显式声明（2026-09-19）────────────────────────────
+  //
+  // 这一组是那次事故的回归防线：模型回了一句「继续。跑自检验证前面改动的正确性：」
+  // ——停在冒号上、零工具调用——旧实现从「文本非空」推导出隐式条件通过，任务照常
+  // 交付，用户那句「继续执行」被吞掉。删除那条推导之后，交付的唯一入口是模型调用
+  // `task_deliver`，它的产物就是 `TaskRecord.result`。
+  describe("条件 6 · 交付声明", () => {
+    it("所有条件都满足但没有交付声明时，仍然不交付", () => {
+      const verdict = evaluateTaskCompletion(
+        taskOf({
+          acceptanceCriteria: [criterion({ status: "passed", evidenceIds: ["evd_1"] })],
+          evidence: [evidence()],
+          result: undefined,
+        }),
+        stateOf(),
+      );
+      expect(verdict.status).toBe("continue");
+      if (verdict.status === "continue") {
+        expect(verdict.reason).toContain("尚未提交交付声明");
+        // advisory 必须点名工具，否则模型看到「条件未通过」只会重复做已经做完的事
+        expect(verdict.advisory).toContain("task_deliver");
+      }
+    });
+
+    // 平凡漏洞的回归：一条 required 条件都没有的任务，条件 1/2/3/5 会全部平凡通过，
+    // 交付就退回到「文本非空即完成」。单列条件 6 之后这条口子被堵上。
+    it("一条 required 条件都没有时，也不能靠「文本非空」交付", () => {
+      const verdict = evaluateTaskCompletion(
+        taskOf({
+          acceptanceCriteria: [{ id: "crit_optional", description: "可选", required: false, status: "passed", evidenceIds: ["evd_1"] }],
+          evidence: [evidence()],
+          steps: [],
+          result: undefined,
+        }),
+        stateOf(),
+      );
+      expect(verdict.status).toBe("continue");
+      if (verdict.status === "continue") expect(verdict.reason).toContain("尚未提交交付声明");
+    });
+
+    it("交付声明里漏掉 required 条件时打回，并点名是哪一条", () => {
+      const verdict = evaluateTaskCompletion(
+        taskOf({
+          acceptanceCriteria: [criterion({ status: "passed", evidenceIds: ["evd_1"] }), criterion({ id: "crit_extra", description: "另外还要写文档" })],
+          evidence: [evidence()],
+        }),
+        stateOf(),
+      );
+      expect(verdict.status).toBe("continue");
+      if (verdict.status === "continue") {
+        expect(verdict.reason).toContain("另外还要写文档");
+        expect(verdict.advisory).toContain("crit_extra");
+        expect(verdict.advisory).toContain("task_deliver");
+      }
+    });
+
+    it("已提交交付声明时不再重复要求（声明跨 Attempt 有效）", () => {
+      const verdict = evaluateTaskCompletion(
+        taskOf({
+          acceptanceCriteria: [criterion({ status: "passed", evidenceIds: ["evd_1"] })],
+          evidence: [evidence()],
+        }),
+        stateOf(),
+      );
+      expect(verdict.status).toBe("delivered");
+      if (verdict.status === "delivered") expect(verdict.reason).toContain("显式声明");
+    });
   });
 });
 

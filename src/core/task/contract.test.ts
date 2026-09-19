@@ -107,7 +107,10 @@ describe("renderResult", () => {
 });
 
 describe("fallbackResult", () => {
-  it("模型没给结构化交付信息时，用任务记录本身生成，且不含完成性断言", () => {
+  // 它现在是「升级前遗留记录 / 宿主自写 result」的兜底，正常路径走不到（条件 6 要求
+  // TaskRecord.result 存在才能交付，而那是 task_deliver 的产物）。断言的重点因此是
+  // **它不冒充交付说明**。
+  it("没有交付说明时如实说明，而不是编一句「完成了 N 个步骤」", () => {
     const result = fallbackResult({
       task: taskOf({
         steps: [{ id: "s1", title: "解析 PDF", status: "completed", order: 0, evidenceIds: [] }],
@@ -116,8 +119,9 @@ describe("fallbackResult", () => {
       filesEdited: ["index.html"],
       toolCalls: 7,
     });
-    expect(result.outcome).toContain("1 个步骤");
+    expect(result.outcome).toContain("1 个已完成步骤");
     expect(result.outcome).toContain("7 次工具调用");
+    expect(result.outcome).toContain("没有留下交付说明");
     expect(result.changes).toEqual(["index.html"]);
     expect(result.verification).toEqual(["pnpm build 通过"]);
     expect(result.remaining).toEqual([]);

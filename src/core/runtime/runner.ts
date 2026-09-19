@@ -27,6 +27,7 @@ import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
 import type { AnyToolDef } from "../tools/def.js";
 import { isExternalToolDef } from "../tools/def.js";
 import { TASK_BLOCK_TOOL_ID, readTaskBlock, type TaskBlockInput } from "../tools/task-block.js";
+import { TASK_DELIVER_TOOL_ID, readTaskDelivery, type TaskDeliverInput } from "../tools/task-deliver.js";
 import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type LifecycleHook } from "./lifecycle.js";
 import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
@@ -47,9 +48,9 @@ import {
 import { advanceProgress } from "../task/progress.js";
 import {
   appendEvidence,
+  applyDelivery,
   evidenceKindForTool,
   fallbackStep,
-  projectImplicitCriterion,
   projectTodos,
   pruneEvidenceRefs,
 } from "../task/plan.js";
@@ -274,6 +275,15 @@ type RunOutcome = {
    *  那就不该再停。后一次声明覆盖前一次，与 `todos` 的口径一致（都是「本轮最后
    *  的状态」，而不是「本轮发生过的事」）。 */
   taskBlock: TaskBlockInput | null;
+  /** 本轮模型用 `task_deliver` 提交的交付声明（规格 3 §9 条件 6）。
+   *
+   *  【为什么它不是「本轮结束的原因」而是一份输入】声明的内容（每条验收条件的
+   *  结论、怎么验证的、还剩什么）会由 `applyDelivery` 投影进任务契约；能不能真的
+   *  交付，仍由 Completion Gate 独立判定。模型无法用一次调用换来 delivered。
+   *
+   *  与 `taskBlock` 同口径：只留**最后一次**声明。模型在一轮里先说「交付了」又
+   *  发现自己漏了东西、再补一次，应该以最后一次为准。 */
+  delivery: TaskDeliverInput | null;
   /** 本轮的证据候选（工具热路径上只累积内存，此处统一落库）。 */
   evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[];
   /** 以失败告终时的错误消息（用于区分「可重试的上游抖动」与「真的没救」）。 */
@@ -911,6 +921,8 @@ export class SessionRunner {
     const evidenceCandidates: { kind: TaskEvidenceKind; summary: string; ref?: string }[] = [];
     /** 本轮模型用 `task_block` 声明的阻塞（规格 3 §11）。见 `RunOutcome.taskBlock`。 */
     let taskBlock: TaskBlockInput | null = null;
+    /** 本轮模型用 `task_deliver` 提交的交付声明（规格 3 §9 条件 6）。见 `RunOutcome.delivery`。 */
+    let delivery: TaskDeliverInput | null = null;
 
     const compactionTransform = await this.buildCompaction(session, emit);
     // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
@@ -1050,6 +1062,9 @@ export class SessionRunner {
         // 模型声明「需要用户介入」（规格 §11）。只认成功的调用：一次被拒绝或
         // 崩溃的 task_block 没有资格把任务停下来等用户。
         if (toolCall.name === TASK_BLOCK_TOOL_ID) taskBlock = readTaskBlock(args);
+        // 模型声明「我交付了」（规格 §9 条件 6）。同样只认成功的调用——参数过不了
+        // schema 的交付声明必须当成「没有声明」，否则一次格式错误就能换来 delivered。
+        if (toolCall.name === TASK_DELIVER_TOOL_ID) delivery = readTaskDelivery(args);
         const kind = evidenceKindForTool(toolCall.name);
         if (kind) {
           const path = (args as { path?: unknown } | undefined)?.path;
@@ -1290,6 +1305,7 @@ export class SessionRunner {
       finalText: attemptFinalText,
       todos: latestTodos,
       taskBlock,
+      delivery,
       evidenceCandidates: [...evidenceCandidates],
       errorMessage: runErrorMessage,
     };
@@ -1464,38 +1480,60 @@ export class SessionRunner {
     // 2) 证据（只收成功的写/执行/外部核对）
     let evidence = task.evidence;
     const dropped: string[] = [];
-    let addedThisAttempt = 0;
     for (const candidate of outcome.evidenceCandidates) {
-      const before = evidence.length;
       const appended = appendEvidence({ evidence, kind: candidate.kind, summary: candidate.summary, ...(candidate.ref ? { ref: candidate.ref } : {}), now });
       evidence = appended.evidence;
       dropped.push(...appended.dropped);
-      addedThisAttempt += evidence.length - before;
     }
 
-    // 本轮没有任何可验证证据，却产出了最终答复 → 把答复本身记成 model_observation
-    // （规格 §9 末段）。纯解释 / 写作 / 问答类任务没有工具可跑，最终内容就是它唯一
-    // 可验证的东西；不记它，这类任务会被条件 3（每个关键条件至少一条证据）挡死，
-    // 一路空转到 Attempt 上限——把最简单的问答变成最贵的任务。
-    // **只在「本轮一条证据都没有」时补**：有工具证据的任务不该靠模型的自述文本
-    // 通过验证，那会让「有证据」重新退化成「说过话」。
-    const answer = outcome.finalText.trim();
-    if (addedThisAttempt === 0 && answer) {
-      const appended = appendEvidence({ evidence, kind: "model_observation", summary: answer.slice(0, 160), now });
+    // 2b) 交付声明必须留下可追溯的证据（规格 §9 条件 3 的口子，§9 末段）。
+    //
+    // 【这里原来是「本轮只要有最终文本就记一条 model_observation」】那条规则把
+    // 「文本非空」直接变成了「有证据」，而证据又是条件 3 的输入——两个弱事实串起来
+    // 就凑出了一次交付。删掉它之后，纯解释 / 写作 / 问答类任务（没有工具可跑，
+    // 最终内容本身是唯一可验证的东西）靠**交付声明**拿到那一条证据：声明里
+    // `verification` 至少一条是 schema 强制的，也就是说模型必须先说清「怎么验证的」，
+    // 才拿得到这个口子——从「说过话」变成「说清了验证方式」，这是那条放宽能成立的下限。
+    //
+    // 【ref 固定为 task_deliver】`appendEvidence` 的去重键是 (kind, ref)，固定 ref
+    // 让重复交付**更新同一条**而不是不断新增。这不是省空间：进度指纹里
+    // `criteria.evidenceIds.length` 参与计算，每次交付都新增一条会让「反复交付」
+    // 看起来像在推进，no-progress 保护就失效了。
+    //
+    // 【只在任务没有任何工具证据时补】有工具证据的任务不该靠模型的自述通过验证，
+    // 那会让「有证据」重新退化成「说过话」。
+    const hasToolEvidence = evidence.some((item) => item.kind !== "model_observation");
+    let declarationEvidenceId: string | undefined;
+    if (outcome.delivery && !hasToolEvidence) {
+      const appended = appendEvidence({
+        evidence,
+        kind: "model_observation",
+        summary: outcome.delivery.verification.join("；").slice(0, 160),
+        ref: TASK_DELIVER_TOOL_ID,
+        now,
+      });
       evidence = appended.evidence;
       dropped.push(...appended.dropped);
+      declarationEvidenceId = evidence.find((item) => item.kind === "model_observation" && item.ref === TASK_DELIVER_TOOL_ID)?.id;
     }
 
-    // 3) 引用清理 + 隐式验收条件。淘汰证据后必须同步清引用，否则条件会因为
+    // 3) 引用清理 + 验收条件。淘汰证据后必须同步清引用，否则条件会因为
     //    悬空引用永远不满足（Completion Gate 的条件 3 只认能对上号的证据）。
     const prunedSteps = pruneEvidenceRefs(steps, dropped);
     const prunedCriteria = pruneEvidenceRefs(task.acceptanceCriteria, dropped);
-    const acceptanceCriteria = projectImplicitCriterion({
-      criteria: prunedCriteria,
-      steps: prunedSteps,
-      evidenceIds: evidence.map((item) => item.id),
-      answerPresent: answer.length > 0,
-    });
+    // 验收条件的结论只有一个来源：模型在 `task_deliver` 里的显式声明。此前这里的
+    // `projectImplicitCriterion` 会从「模型这轮有没有输出文本」推导出结论——那次
+    // 推导就是「一句话停在冒号上也能交付」的成因（见 `plan.ts`）。
+    const projection = outcome.delivery
+      ? applyDelivery({
+          criteria: prunedCriteria,
+          delivery: outcome.delivery,
+          evidence,
+          ...(declarationEvidenceId ? { declarationEvidenceId } : {}),
+          observedChanges: outcome.filesEdited,
+        })
+      : null;
+    const acceptanceCriteria = projection?.criteria ?? prunedCriteria;
 
     // 4) 进度指纹（含本轮的文件改动）
     const projected: TaskRecord = { ...task, steps: prunedSteps, evidence, acceptanceCriteria };
@@ -1505,6 +1543,7 @@ export class SessionRunner {
       steps: prunedSteps,
       evidence,
       acceptanceCriteria,
+      ...(projection ? { result: projection.result } : {}),
       lastFingerprint: progress.fingerprint,
       noProgressCount: progress.noProgressCount,
       // 时间预算的累计口径：这一轮实际跑了多久（见 `TaskRecord.activeMs`）。
@@ -1539,7 +1578,30 @@ export class SessionRunner {
           data: {
             taskId,
             revision: updated.revision,
+            // `result` 是渲染好的文本（通知、复制、旧客户端都在用它）；
+            // `delivery` 是同一份信息的结构化形态，给交付卡按四问分别渲染。
+            // 【为什么两份都给】把结构化数据塞进一个字符串再让客户端解析，是此前
+            // 「剩余项」出现两次的原因（`lib/chat-projector.ts` 把整段文本当成
+            // `outcome`，四问里剩下的位置自然全空）。发两份比让客户端做字符串解析稳。
             result: renderResult(result),
+            delivery: {
+              outcome: result.outcome,
+              changes: [...result.changes],
+              verification: [...result.verification],
+              remaining: [...result.remaining],
+            },
+            // 交付卡上「验收 x/y · 证据 n 条」两个数字的**权威来源**。此前它们
+            // 只能靠客户端从 task.started（那一刻的条件永远全是 pending）和证据
+            // 数组（事件流里根本没有）拼出来，于是界面上恒显示「验收 0/1 · 证据
+            // 0 条」，与实际相反——而这一行恰恰是规格 §18.4 给用户「不必相信这句
+            // 完成」的核对依据，一个恒错的核对依据比没有更糟。
+            criteria: updated.acceptanceCriteria.map((criterion) => ({
+              id: criterion.id,
+              description: criterion.description,
+              required: criterion.required,
+              status: criterion.status,
+            })),
+            evidenceCount: updated.evidence.length,
             evidenceIds: updated.evidence.map((item) => item.id),
             filesEdited: stats.filesEdited.length,
             toolCalls: stats.toolCalls,

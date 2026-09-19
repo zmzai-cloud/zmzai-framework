@@ -9,7 +9,14 @@ import type { TaskBlocker, TaskRecord } from "./types.js";
  * 都回答不了（规格 §8.3 把这三条逐一列为**不能**触发的依据）。
  *
  * 本模块是纯函数：无 IO、无时钟、无全局状态。同一输入恒得同一结论，因此
- * 规格 §17.1 的 13 条单测可以逐条钉住它。 */
+ * 规格 §17.1 的 13 条单测可以逐条钉住它。
+ *
+ * 【2026-09-19 新增条件 6：必须提交显式交付声明】原来的条件 1（所有 required
+ * 验收条件 passed）依赖 `projectImplicitCriterion` 从「模型这轮有没有输出文本」
+ * 推导出条件结论。那次推导被删掉了（原因见 `plan.ts` 的 `applyDelivery` 注释），
+ * 条件 1 因此需要一个**新的输入来源**：模型在 `task_deliver` 里的显式声明。
+ * 它同时补上了一个此前存在的平凡漏洞——没有 required 条件的任务会让条件 1/2/3/5
+ * 全部平凡通过。 */
 
 /** 判定输入里「运行时事实」的那一半。任务契约那一半来自 TaskRecord。
  *
@@ -235,6 +242,34 @@ function noProgressAdvisory(task: TaskRecord, count: number, policy: NoProgressP
   );
 }
 
+/** 交付相关的恢复指令。
+ *
+ *  这两条 advisory 是「显式交付」能落地的关键：门把交付打回去的时候，必须让模型
+ *  知道**缺的是那一次声明**，否则它看到「验收条件未通过」只会重复做已经做完的事，
+ *  一路空转到 no_progress——把一次本可以一轮解决的问题变成三倍成本。
+ *
+ *  【为什么不能说「输出一段总结就算交付」】那正是被删掉的那条推导。这里的措辞刻意
+ *  指向工具：`task_deliver`。 */
+function deliveryAdvisory(task: TaskRecord, unmetIds: readonly string[]): string | undefined {
+  if (task.result === undefined) {
+    return (
+      "[交付未声明] 你还没有提交交付声明，所以任务不能结束——结束本轮、说一句「已完成」、把 todo 标记完成都不算。" +
+      "如果目标已经达成，现在调用 `task_deliver`，按四个问题回答：做成了什么、改了哪些主要内容、怎么验证的、还有哪些没做完" +
+      "（无剩余项也要显式给空数组），并逐条给出验收条件的结论。" +
+      "如果还没达成，继续做，不要调用它。"
+    );
+  }
+  if (unmetIds.length) {
+    return (
+      `[验收未完成] 你的交付声明里这些验收条件没有拿到通过结论：${unmetIds.join("、")}。` +
+      "两种可能：工作还没做完（那就继续做，做完再交付一次）；或者你只是漏写了结论" +
+      "（那就补齐 `task_deliver` 的 `criteria`，id 用任务契约里印出的那一个）。" +
+      "注意 required 条件不能用 `not_applicable` 绕过。"
+    );
+  }
+  return undefined;
+}
+
 /** 把阻塞原因映射到任务生命周期状态。
  *
  *  `waiting_*` 与 `blocked` 的分界是「谁该动」：等用户做一件明确的事 →
@@ -320,24 +355,34 @@ export function evaluateTaskCompletion(
   const unmet = unmetRequiredCriteria(task);
   const open = openSteps(task);
   const missingEvidence = criteriaMissingEvidence(task);
+  // 6) 显式交付声明（§9 条件 6）。交付是一次动作，不是一个可以被推断出来的语气。
+  //
+  //  【为什么单列一条而不是并进条件 1】任务可能一条 required 验收条件都没有
+  //  （宿主显式添加的条件全为 optional 时），此时条件 1/2/3/5 会**全部平凡通过**，
+  //  交付又退回到「文本非空即完成」。单列之后，「交付必须由模型明确声明」这条
+  //  不变量与条件集无关地成立——它是 §3.1 那条根因（一次运行正常结束 ≠ 目标已实现）
+  //  的最终落点。`task.result` 由 `applyDelivery` 写入，那是它的唯一生产者。
+  const deliveryDeclared = task.result !== undefined;
   const reasons: string[] = [];
   if (unmet.length) reasons.push(`验收条件未通过：${unmet.map((item) => item.description).join("、")}`);
   if (open.length) reasons.push(`仍有未完成的步骤：${open.map((step) => step.title).join("、")}`);
   if (missingEvidence.length) reasons.push(`验收条件缺少验证证据：${missingEvidence.map((item) => item.description).join("、")}`);
   if (!state.finalTextPresent) reasons.push("尚未生成最终交付说明");
+  if (!deliveryDeclared) reasons.push("尚未提交交付声明");
 
   if (reasons.length === 0) {
-    return { status: "delivered", reason: "全部验收条件已通过并留有证据。" };
+    return { status: "delivered", reason: "全部验收条件已通过、留有条目证据，并由模型显式声明交付。" };
   }
 
   // 5) 未完成 → 内部续跑（不创建用户消息）
   const advisory = noProgressAdvisory(task, task.noProgressCount, policy);
+  const delivery = deliveryAdvisory(task, unmet.map((item) => item.id));
   const unresolved = state.unresolvedToolErrors.length
     ? `上一轮有工具调用以失败告终（${state.unresolvedToolErrors.join("；")}），如果它们挡在路上，先换一条路。`
     : "";
   return {
     status: "continue",
     reason: reasons.join("；"),
-    ...(advisory || unresolved ? { advisory: [advisory, unresolved].filter(Boolean).join("\n") } : {}),
+    ...(advisory || delivery || unresolved ? { advisory: [delivery, advisory, unresolved].filter(Boolean).join("\n") } : {}),
   };
 }
