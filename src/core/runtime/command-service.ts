@@ -8,6 +8,7 @@ import type { Part, SessionInfo } from "../session/types.js";
 import type { PromptDisposition, PromptInput, PromptReceipt } from "../session/workflow.js";
 import { isWaitingStatus, type TaskPatch, type TaskRecord } from "../task/types.js";
 import { defaultActiveRunRegistry } from "./active-run-registry.js";
+import { RESET_GUARDS_ON_RESUME } from "./task-lifecycle.js";
 import type { RunScheduler } from "./run-scheduler.js";
 
 /** 一条新消息与任务的关系（`resolveTaskForPrompt` 的结论）。
@@ -22,17 +23,6 @@ type TaskResolution = {
   previous: TaskRecord | null;
 };
 
-/** 用户明确放行时重置的三个保护计数（新消息恢复、以及 `resumeTask`）。
- *
- *  【为什么必须重置】不重置的话「继续」是个死按钮：因为 no_progress 停下来的任务
- *  计数仍是 3，下一次判定立刻再停；因为轮数预算停下来的任务第 N+1 轮开头就超过
- *  上限，一步都不会跑；时间预算同理——已经烧满一小时的 `activeMs` 会让放行后的
- *  第一轮连起点都过不去。用户点「继续」就是明确授权再做一些，那一刻起保护阈值
- *  应当重新计时——由人来决定要不要继续，正是这类保护的设计前提（规格 §10.1 的
- *  三档策略本来就以「用户可以再来一轮」为前提）。
- *
- *  这不会让任务无限跑：每一次重置都需要一次显式的人工动作，不存在自触发路径。 */
-export const RESET_GUARDS_ON_RESUME = { noProgressCount: 0, attemptCount: 0, activeMs: 0 } as const;
 
 export type CommandDeps = {
   store: SessionStore;
