@@ -1,4 +1,5 @@
 import { createFsWorkspaceFiles } from "../adapters/fs-workspace.js";
+import { subagentTools } from "../core/subagents/tools.js";
 import { noopSandboxExecutor, type ModelProvider, type SandboxExecutor } from "../adapters/index.js";
 import { createSubprocessSandbox } from "../adapters/subprocess-sandbox.js";
 import type { EventLog } from "../core/events/bus.js";
@@ -62,7 +63,9 @@ export type AgentRuntimePreset = {
    *  memoryContextFor / hooks / leaseStore / compaction /
    *  loadWorkspaceAgents / sessionRuleTtlMs…），是渐进迁移的兜底出口。
    *  streamFnFor/modelFor 传入时覆盖 modelProvider 派生（适配旧式双函数装配）。 */
-  runnerOptions?: Partial<Omit<RunnerDeps, "store" | "registry" | "eventLog" | "workspaceFor" | "sandbox" | "localTools" | "subagentDepth" | "tools">>;
+  runnerOptions?: Partial<Omit<RunnerDeps, "store" | "registry" | "eventLog" | "workspaceFor" | "sandbox" | "localTools" | "subagentDepth" | "tools" | "subagentCoordinator">>;
+  /** M3-S21：子代理协调器（注入后 agent_* 工具自动拼装）。 */
+  subagentCoordinator?: import("../core/subagents/coordinator.js").SubagentCoordinator;
 };
 
 /** createAgentRuntime 的返回：与 createServer 相同的框架门面。 */
@@ -129,7 +132,12 @@ export function createAgentRuntime(preset: AgentRuntimePreset): AgentFramework {
     workspaceFor,
     sandbox,
     localTools: [...capabilityTools, ...(preset.localTools ?? [])],
+    // M3-S21：协调器注入时自动拼 agent_* 工具族（宿主无须手工带 subagentTools）
+    ...(preset.subagentCoordinator
+      ? { localTools: [...capabilityTools, ...subagentTools, ...(preset.localTools ?? [])] }
+      : {}),
     subagentDepth,
     ...preset.runnerOptions,
+    ...(preset.subagentCoordinator ? { subagentCoordinator: preset.subagentCoordinator } : {}),
   });
 }

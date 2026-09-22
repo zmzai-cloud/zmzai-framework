@@ -108,6 +108,9 @@ export type RunnerDeps = {
   agentResolver?: AgentResolver;
   /** Max subagent nesting depth (spec §6.4, default 1). */
   subagentDepth: number;
+  /** 子代理协调器（M3-S21）：注入后 agent_* 工具可用，spawnSubagent 走
+   *  持久协调（SubagentRecord/限额队列）；未注入时保持旧嵌套 runLoop 行为。 */
+  subagentCoordinator?: import("../subagents/coordinator.js").SubagentCoordinator;
   /** Auto-compaction (spec §8.3). Disabled when summaryModel is null. */
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: Model<Api> | null };
   /** 生命周期钩子（P0）：observe/block。抛错只告警不中断运行。 */
@@ -372,10 +375,43 @@ export class SessionRunner {
    *  tool's result. Awaits the nested runLoop directly. */
   private async spawnSubagent(
     parent: SessionInfo,
-    input: { description: string; prompt: string; subagentType: string },
+    input: { description: string; prompt: string; subagentType: string; spawnRequestId?: string; mode?: "read_only" | "workspace_write" },
     registry: AgentRegistry,
     parentEngine: PermissionEngine,
   ): Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }> {
+    // M3-S21：协调器路径——SubagentRecord 持久化 + 限额队列 + 事件桥保留
+    const coordinator = this.deps.subagentCoordinator;
+    if (coordinator) {
+      const depth = await this.sessionDepth(parent);
+      if (depth >= this.deps.subagentDepth) throw new Error(`子代理嵌套深度超过限制（${this.deps.subagentDepth}）`);
+      const subagent = registry.get(input.subagentType);
+      if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) throw new Error(`未知或非子代理类型：${input.subagentType}`);
+      await parentEngine.ask({ sessionId: parent.id, permission: "task", patterns: [input.subagentType], always: ["*"], metadata: { subagent: input.subagentType, description: input.description } });
+      // 权限 stamp 的子会话创建 + 事件桥（与旧路径同构）
+      const childSession = await createFrameworkSession({
+        store: this.deps.store, userId: parent.userId, workspaceId: parent.workspaceId,
+        agent: input.subagentType, model: subagent.model ?? parent.model, prompt: input.prompt,
+        parentId: parent.id, title: input.description,
+        // read_only 模式：父权限为上限，写工具全 deny（writePathGuardRules([]) 空集 +
+        // preset 无 writePaths → 圈禁为空 → executor 的 confine 会拒绝全部写路径）
+        permission: input.mode === "read_only" ? [...parent.permission] : [...parent.permission, ...writePathGuardRules(subagent.writePaths ?? [])],
+        ...(input.mode !== "read_only" && subagent.writePaths?.length ? { writePaths: subagent.writePaths } : {}),
+      });
+      await this.publish({ type: "subagent.started", data: { id: childSession.id, agent: input.subagentType, task: input.description, parentSessionId: parent.id } }, parent.id);
+      const activeTask = await this.deps.store.task?.getActiveTask(parent.id);
+      const record = await coordinator.spawn(parent, activeTask?.id ?? "task_adhoc", activeTask?.rootRequestId ?? activeTask?.id ?? "task_adhoc", {
+        description: input.description, prompt: input.prompt, subagentType: input.subagentType,
+        ...(input.mode ? { mode: input.mode } : {}),
+        ...(input.spawnRequestId ? { spawnRequestId: input.spawnRequestId } : {}),
+      });
+      const { changed } = await coordinator.wait([record.childId], 300_000);
+      const final = changed.find((r) => r.childId === record.childId);
+      const summary = final?.result?.summary ?? ((await this.lastAssistantText(childSession.id)) || `(状态 ${final?.status ?? "unknown"})`);
+      await this.recordSubtask(parent, { prompt: input.prompt, description: input.description, agent: input.subagentType, childSessionId: childSession.id });
+      const terminalState = final && (final.status === "completed") ? "completed" : "error";
+      await this.publish({ type: "subagent.finished", data: { id: childSession.id, state: terminalState, durationMs: Date.now() - Date.parse(record.times.spawnedAt), toolCalls: 0 } }, parent.id);
+      return { childSessionId: childSession.id, summary, state: terminalState };
+    }
     const depth = await this.sessionDepth(parent);
     if (depth >= this.deps.subagentDepth) {
       throw new Error(`子代理嵌套深度超过限制（${this.deps.subagentDepth}）`);

@@ -88,6 +88,7 @@ export type AttemptCollaborators = {
   contextBuilder: ContextBuilder;
   publish: (event: FrameworkEvent, sessionId: string) => Promise<void>;
   persist: (event: FrameworkEvent, fallbackSessionId: string) => Promise<void>;
+  subagentCoordinator?: import("../subagents/coordinator.js").SubagentCoordinator;
   spawnSubagent: (session: SessionInfo, input: { description: string; prompt: string; subagentType: string }, registry: AgentRegistry, parentEngine: PermissionEngine) => Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }>;
 };
 
@@ -228,6 +229,17 @@ export class AttemptExecutor {
     // only when the runner can host a nested run (spec §6.4).
     if (!session.parentId) {
       toolContext.spawnSubagent = (spawnInput) => this.collabs.spawnSubagent(session, spawnInput, registry, engine);
+      // M3-S21：协调器可用时注入 agent_* 工具族（宿主须先在 tools 里带上
+      // subagentTools——这里只注入运行期上下文：coordinator + 任务归属）
+      const coordinator = this.deps.subagentCoordinator;
+      if (coordinator) {
+        const activeTask = await this.deps.store.task?.getActiveTask(session.id).catch(() => null);
+        (toolContext as unknown as { subagents?: unknown }).subagents = {
+          coordinator,
+          rootTaskId: activeTask?.rootRequestId ?? activeTask?.id ?? "task_adhoc",
+          parentTaskId: activeTask?.id ?? "task_adhoc",
+        };
+      }
     }
     const piTools = [...toolDefs.values()].map((def) => adaptAnyTool(def, toolContext));
     let unknownSideEffect = false;
