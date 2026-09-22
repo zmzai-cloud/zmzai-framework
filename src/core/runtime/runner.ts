@@ -401,6 +401,7 @@ export class SessionRunner {
       const activeTask = await this.deps.store.task?.getActiveTask(parent.id);
       const record = await coordinator.spawn(parent, activeTask?.id ?? "task_adhoc", activeTask?.rootRequestId ?? activeTask?.id ?? "task_adhoc", {
         description: input.description, prompt: input.prompt, subagentType: input.subagentType,
+        childSessionId: childSession.id,
         ...(input.mode ? { mode: input.mode } : {}),
         ...(input.spawnRequestId ? { spawnRequestId: input.spawnRequestId } : {}),
       });

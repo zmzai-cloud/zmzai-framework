@@ -60,18 +60,17 @@ export class SubagentCoordinator {
   }
 
   /** agent_spawn：登记（幂等）→ 入队 → 立即返回 childId（不等待执行）。 */
-  async spawn(parent: SessionInfo, parentTaskId: string, rootTaskId: string, input: SpawnInput): Promise<SubagentRecord> {
+  async spawn(parent: SessionInfo, parentTaskId: string, rootTaskId: string, input: SpawnInput & { childSessionId?: string }): Promise<SubagentRecord> {
     const spawnRequestId = input.spawnRequestId ?? randomUUID();
     const prior = await this.store.findSubagentBySpawnRequest(parent.id, spawnRequestId);
     if (prior) return prior; // A14：重试返回同一 child
 
-    const registry = this.deps.registry;
-    const subagent = registry.get(input.subagentType);
-    if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) {
-      throw new Error(`未知或非子代理类型：${input.subagentType}`);
-    }
+    // runner 协调路径预建了权限 stamp 的子会话（registry/engine 在 runner 侧）——
+    // 直接采用，不再自建（自建会绕过 stamp 造成第二个孤儿会话）
+    const child = input.childSessionId
+      ? ({ id: input.childSessionId, userId: parent.userId, workspaceId: parent.workspaceId } as SessionInfo)
+      : await this.resolveViaRegistry(parent, input);
     const mode = input.mode ?? "read_only";
-    const child = await this.deps.createChildSession({ parent, agentType: input.subagentType, prompt: input.prompt, description: input.description, mode });
     const record: SubagentRecord = {
       childId: child.id,
       childSessionId: child.id,
@@ -92,6 +91,15 @@ export class SubagentCoordinator {
     this.queue.push({ childId: created.childId, rootTaskId, prompt: input.prompt });
     this.pump();
     return created;
+  }
+
+  /** 无预建会话时的原路径：registry 类型检查 + deps.createChildSession。 */
+  private async resolveViaRegistry(parent: SessionInfo, input: SpawnInput): Promise<SessionInfo> {
+    const subagent = this.deps.registry.get(input.subagentType);
+    if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) {
+      throw new Error(`未知或非子代理类型：${input.subagentType}`);
+    }
+    return this.deps.createChildSession({ parent, agentType: input.subagentType, prompt: input.prompt, description: input.description, mode: input.mode ?? "read_only" });
   }
 
   /** agent_list：当前树内子代理 + 最近进度。 */

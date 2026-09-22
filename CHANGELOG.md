@@ -1,5 +1,13 @@
 # @zmzai/agent-framework
 
+## 0.11.0
+
+### Minor Changes
+
+- **子代理持久协调（M3，spec §8）**：`SubagentCoordinator`（限额队列 perRoot 3/global 6、根间轮转根内 FIFO、spawn 幂等/agent_list/send/wait/cancel 五面、取消树）；SubagentRecord + mailbox 双 SQLite 表（CAS 状态机 11 态、messageId 去重、父消费水位）；parked/mailbox/父唤醒（水位幂等合并、终态父拒绝复活）；`agent_*` 五工具族 + 旧 task 兼容封装。
+- **装配面**：`RunnerDeps.subagentCoordinator` 可选注入（注入即 agent_* 工具自动拼装、spawnSubagent 走持久协调）；coordinator.spawn 支持预建 childSessionId（runner 侧权限 stamp 路径）；TaskRecord 新增可选 parkedReason。
+- `SubagentStore` 经 `SessionStore.subagents` 可选面提供；未提供时子代理能力明确降级（SUBAGENTS_UNSUPPORTED）。
+
 ## 0.10.0
 
 ### Minor Changes
