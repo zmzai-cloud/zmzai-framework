@@ -135,3 +135,20 @@ export type Part =
 export type MessageWithParts = { info: MessageInfo; parts: Part[]; messageSeq?: number };
 
 export type SessionStatus = "idle" | "running" | "waiting_permission" | "waiting_input";
+
+/** 跨 Attempt 复用的压缩投影状态（规格 §9.1 CompactionRecord 的 W7-S8 子集）。
+ *
+ *  prefixHash 是复用的唯一安全判据：重建出的 canonical 前缀逐字节一致才可
+ *  播种 transform；任何不一致（rewind、记忆召回变化、重建口径变化）都放弃
+ *  复用、重新摘要——宁重复摘要，不脏上下文。摘要本身是可丢弃重建的投影，
+ *  不是会话事实来源。 */
+export type CompactionRecord = {
+  summary: string;
+  /** canonical 历史中已折叠的前缀长度（消息条数）。 */
+  anchor: number;
+  /** 上次压缩时投影尾部的 token 估算（滞回带基准）。 */
+  tailTokensAtCompaction: number;
+  /** 播种合法性指纹：hash(JSON(canonical[0..anchor)))。 */
+  prefixHash: string;
+  updatedAt: string;
+};

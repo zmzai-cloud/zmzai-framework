@@ -54,3 +54,82 @@ describe("ContextBuilder.historySnapshot（同拍快照）", () => {
     }
   });
 });
+
+/** W7-S8 · CompactionStore 跨 Attempt（A30/A31 的 vitest 等价物）：
+ *  前缀指纹一致 → 播种复用（不再重摘）；前缀变化 → 放弃复用重新摘要
+ *  （宁重复摘要，不脏上下文）。 */
+describe("ContextBuilder · CompactionStore 跨 Attempt", () => {
+  async function setup() {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "ctx-compaction-"));
+    const store = createSqliteSessionStore({ dataDir });
+    const session = {
+      id: "s1", userId: "u", workspaceId: "w", agent: "default",
+      model: { providerId: "faux", modelId: "m" }, permission: [], queuedPrompts: [],
+      time: { created: "2026-09-01T00:00:00.000Z", updated: "2026-09-01T00:00:00.000Z" },
+    } as never;
+    await (store as SessionStore).createSession(session);
+    let summaryCalls = 0;
+    const builder = new ContextBuilder({
+      store: store as unknown as SessionStore,
+      modelFor: () => ({}) as never,
+      streamFnFor: (() => async () => {
+        summaryCalls += 1;
+        return { result: async () => ({ content: `模拟摘要第${summaryCalls}次` }) };
+      }) as never,
+      compaction: { enabled: true, contextWindow: 100, summaryModel: { providerId: "faux", modelId: "sum" } as never },
+    });
+    const parts: { id: string; text: string }[] = [];
+    for (let n = 0; n < 12; n += 1) {
+      const uid = `u${n}`;
+      const aid = `a${n}`;
+      await store.appendMessage({ id: uid, sessionId: "s1", role: "user", agent: "default", model: { providerId: "faux", modelId: "m" }, time: { created: "2026-09-01T00:00:00.000Z" } });
+      await store.appendPart({ id: `p-${uid}`, sessionId: "s1", messageId: uid, type: "text", text: `用户消息编号${n}的提问内容` });
+      await store.appendMessage({ id: aid, sessionId: "s1", role: "assistant", parentId: uid, agent: "default", model: { providerId: "faux", modelId: "m" }, time: { created: "2026-09-01T00:00:01.000Z" } });
+      const text = `助手回答编号${n}的处理内容`;
+      await store.appendPart({ id: `p-${aid}`, sessionId: "s1", messageId: aid, type: "text", text });
+      parts.push({ id: `p-${aid}`, text });
+    }
+    return { dataDir, store, builder, counter: () => summaryCalls, parts };
+  }
+
+  it("前缀一致时播种复用：第二个 Attempt 不再重摘（摘要调用数不增）", async () => {
+    const { dataDir, store, builder, counter } = await setup();
+    try {
+      const attempt1 = await builder.buildAttemptContext({ id: "s1" } as never, { text: "第一轮" }, () => {});
+      expect(attempt1.compactionTransform).toBeDefined();
+      const out1 = await attempt1.compactionTransform!(attempt1.history);
+      expect(counter()).toBe(1);
+      expect(store.compaction).toBeDefined();
+      const record = await store.compaction!.get("s1");
+      expect(record?.anchor).toBeGreaterThan(0);
+      expect(String((out1[0] as { content: unknown }).content)).toContain("【早期对话摘要】");
+
+      // 第二个 Attempt：同一 store、无记忆注入 → 前缀逐字节一致 → 播种
+      const attempt2 = await builder.buildAttemptContext({ id: "s1" } as never, { text: "第二轮" }, () => {});
+      const out2 = await attempt2.compactionTransform!(attempt2.history);
+      expect(counter()).toBe(1); // 复用生效：没有第二次摘要调用
+      expect(String((out2[0] as { content: unknown }).content)).toContain("【早期对话摘要】");
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("前缀变化（覆盖区消息被改）时放弃复用，重新摘要而非沿用脏投影", async () => {
+    const { dataDir, store, builder, counter, parts } = await setup();
+    try {
+      const attempt1 = await builder.buildAttemptContext({ id: "s1" } as never, { text: "第一轮" }, () => {});
+      await attempt1.compactionTransform!(attempt1.history);
+      expect(counter()).toBe(1);
+
+      // 覆盖区内的一条消息被外部修改（模拟 rewind 后重写/用户编辑）
+      await store.updatePart({ id: parts[1]!.id, sessionId: "s1", messageId: "a1", type: "text", text: "被外部改写的回答内容" });
+
+      const attempt3 = await builder.buildAttemptContext({ id: "s1" } as never, { text: "第三轮" }, () => {});
+      const out3 = await attempt3.compactionTransform!(attempt3.history);
+      expect(counter()).toBe(2); // 指纹失配 → 重新摘要
+      expect(String((out3[0] as { content: unknown }).content)).toContain("模拟摘要第2次");
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+});

@@ -54,7 +54,7 @@ describe("createCompactionTransform", () => {
     expect((result[0] as { content: string }).content).toContain("早期对话的摘要");
     // tail preserved
     expect(result[result.length - 1]).toEqual(messages[messages.length - 1]);
-    expect(onCompacted).toHaveBeenCalledWith("早期对话的摘要", expect.any(Number));
+    expect(onCompacted).toHaveBeenCalledWith("早期对话的摘要", expect.any(Number), expect.objectContaining({ anchor: expect.any(Number), summary: "早期对话的摘要" }));
   });
 
   it("degrades to full context when the summary fails", async () => {

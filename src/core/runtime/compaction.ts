@@ -8,9 +8,9 @@ import type { Api, Model } from "@earendil-works/pi-ai";
  *  request-only (never written back to state), so the previous stateless
  *  version re-summarized the whole history on every LLM request — the anchor
  *  turns compaction into an incremental, idempotent projection.
- *  Known limitation: closure state lives per-run (the runner builds a fresh
- *  transform for each runLoop), so a new run re-summarizes once when it next
- *  crosses the threshold; cross-run persistence belongs in the store later.
+ *  Known limitation→W7-S8: closure state can be seeded from a persisted
+ *  CompactionRecord (initialState) when the rebuilt prefix is byte-identical —
+ *  backends without the compaction store surface keep the per-run behavior.
  *
  *  Harness-course retrofits (tutorial-harness 05/07) preserved:
  *  - 膨胀拒绝：新摘要比它替代的内容（新折叠段 + 旧摘要）还长时作废本次压缩。
@@ -33,8 +33,13 @@ export type CompactionOptions = {
   keepRecentMessages?: number;
   /** Streams one completion from the summary model. */
   streamSummary: (messages: AgentMessage[]) => Promise<string>;
-  /** Called when a compaction happens so the runner can emit the part. */
-  onCompacted?: (summary: string, tokensBefore: number) => void;
+  /** Called when a compaction happens so the runner can emit the part.
+   *  第三个参数携带折叠后状态（anchor/tailTokens/canonical 数组）——
+   *  W7-S8 的 CompactionStore 持久化靠它计算前缀指纹。 */
+  onCompacted?: (summary: string, tokensBefore: number, state: { anchor: number; tailTokensAtCompaction: number; summary: string; messages: AgentMessage[] }) => void | Promise<void>;
+  /** 跨 Attempt 恢复的初始状态（W7-S8：CompactionStore 播种，前缀指纹
+   *  校验通过后才传入）。 */
+  initialState?: { summary: string; anchor: number; tailTokensAtCompaction: number };
   /** Called when a compaction attempt fails ("summary-empty" | "summary-inflated");
    *  after any failure the transform stops retrying for this run (失败记忆). */
   onCompactionFailed?: (reason: "summary-empty" | "summary-inflated") => void | Promise<void>;
@@ -86,9 +91,9 @@ function summaryMessage(text: string): AgentMessage {
 export function createCompactionTransform(options: CompactionOptions): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
   const reserve = options.reserveTokens ?? 4096;
   const keepRecent = options.keepRecentMessages ?? 8;
-  let summary: string | null = null; // 投影的唯一状态：当前摘要
-  let anchor = 0; // canonical 历史中已折叠的前缀长度
-  let tailTokensAtCompaction = 0; // 上次压缩时投影尾部的 token 量（滞回带基准）
+  let summary: string | null = options.initialState?.summary ?? null; // 投影的唯一状态：当前摘要
+  let anchor = options.initialState?.anchor ?? 0; // canonical 历史中已折叠的前缀长度
+  let tailTokensAtCompaction = options.initialState?.tailTokensAtCompaction ?? 0; // 上次压缩时投影尾部的 token 量（滞回带基准）
   let hasFailed = false; // 失败记忆：本轮不再重试摘要
 
   return async (messages, signal) => {
@@ -132,7 +137,7 @@ export function createCompactionTransform(options: CompactionOptions): (messages
     summary = next;
     anchor = messages.length - tailCount;
     tailTokensAtCompaction = estimateTokens(messages.slice(anchor));
-    options.onCompacted?.(summary, projectedTokens);
+    await options.onCompacted?.(summary, projectedTokens, { anchor, tailTokensAtCompaction, summary, messages });
     return [summaryMessage(summary), ...messages.slice(anchor)];
   };
 }
@@ -166,8 +171,9 @@ export function buildCompactionTransform(input: {
   contextWindow: number;
   summaryModel: Model<Api> | null;
   streamOne: (model: Model<Api>, messages: AgentMessage[]) => Promise<string>;
-  onCompacted?: (summary: string, tokensBefore: number) => void;
+  onCompacted?: (summary: string, tokensBefore: number, state: { anchor: number; tailTokensAtCompaction: number; summary: string; messages: AgentMessage[] }) => void | Promise<void>;
   force?: boolean;
+  initialState?: { summary: string; anchor: number; tailTokensAtCompaction: number };
 }): ((messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>) | undefined {
   if (!input.enabled || !input.summaryModel) return undefined;
   return createCompactionTransform({
@@ -176,5 +182,6 @@ export function buildCompactionTransform(input: {
     streamSummary: (messages) => input.streamOne(input.summaryModel!, messages),
     ...(input.onCompacted ? { onCompacted: input.onCompacted } : {}),
     ...(input.force ? { force: true } : {}),
+    ...(input.initialState ? { initialState: input.initialState } : {}),
   });
 }

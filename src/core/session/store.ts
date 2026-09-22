@@ -1,4 +1,4 @@
-import type { MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo } from "../session/types.js";
+import type { CompactionRecord, MessageInfo, MessageWithParts, Part, QueuedPrompt, SessionInfo } from "../session/types.js";
 
 /** Persistence abstraction (spec §3.1). The Mongo implementation is the cloud
  *  default; a JSONL backend (wrapping PI harness/session) provides the
@@ -11,6 +11,9 @@ export interface SessionStore {
   /** 持久任务契约（规格 3 §13.4）。缺失时 runner 退化为无任务语义的一次性
    *  运行——工具、权限、事件全部照常，「自动续跑」与「可信完成判定」不可用。 */
   task?: import("../task/store.js").TaskStore;
+  /** 压缩投影的跨 Attempt 状态（W7-S8）。可选：未提供的后端（JSONL demo）
+   *  保持每 Attempt 重新摘要的旧行为。 */
+  compaction?: { get(sessionId: string): Promise<CompactionRecord | null>; put(sessionId: string, record: CompactionRecord): Promise<void> };
   persistEvent?(event: import("../events/manifest.js").FrameworkEvent & { sessionId: string }): Promise<import("../events/manifest.js").PersistedFrameworkEvent>;
   createSession(info: SessionInfo): Promise<void>;
   getSession(id: string): Promise<SessionInfo | null>;

@@ -120,7 +120,7 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
   transaction(() => {
     const columns = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
     if (!columns.some(column => column.name === "message_seq")) db.exec("ALTER TABLE messages ADD COLUMN message_seq INTEGER");
-    db.exec(`
+    db.exec(`CREATE TABLE IF NOT EXISTS compaction_records (session_id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS session_history (session_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       INSERT INTO session_history(session_id,last_seq) SELECT session_id,COALESCE(MAX(message_seq),0) FROM messages GROUP BY session_id ON CONFLICT(session_id) DO UPDATE SET last_seq=MAX(last_seq,excluded.last_seq);
@@ -386,6 +386,17 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
     // CAS 用 UPDATE ... WHERE revision=? 而不是读改写：读改写在同一连接内
     // 也挡不住「另一个进程在我读完之后更新过」——而 lease 过期后的双 runner
     // 竞争正是这条路径最需要防的场景。
+    compaction: {
+      async get(sessionId) {
+        const row = db.prepare("SELECT json FROM compaction_records WHERE session_id=?").get(sessionId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as import("./types.js").CompactionRecord) : null;
+      },
+      async put(sessionId, record) {
+        transaction(() => {
+          db.prepare("INSERT INTO compaction_records(session_id,json,updated_at) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at").run(sessionId, JSON.stringify(record), record.updatedAt);
+        });
+      },
+    },
     task: {
       async createTask(input) {
         return transaction(() => {

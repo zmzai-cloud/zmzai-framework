@@ -1,10 +1,16 @@
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
 import { attachmentContent, attachmentRefContent, type AttachmentContentRef, type AttachmentProvider } from "./attachments.js";
 import type { FrameworkEvent } from "../events/manifest.js";
 import { newPartId } from "../session/ids.js";
 import type { SessionStore } from "../session/store.js";
-import type { MessageWithParts, ModelRef, Part, SessionInfo } from "../session/types.js";
+import type { CompactionRecord, MessageWithParts, ModelRef, Part, SessionInfo } from "../session/types.js";
+
+/** canonical 前缀指纹（W7-S8）：播种复用的唯一安全判据。 */
+function prefixHashOf(messages: AgentMessage[]): string {
+  return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+}
 
 /** 上下文组装（W7 S6 自 SessionRunner 搬移，spec §9.1 的先行子集）：
  *  历史重建（同拍快照修 TOCTOU）、压缩 transform、记忆召回——runLoop 里
@@ -110,7 +116,7 @@ export class ContextBuilder {
    *  summary model configured. Emits a `compaction` part on the latest
    *  assistant message so the boundary shows in the transcript. force=true
    *  skips the threshold/滞回 early-outs (手动「压缩当前会话」)。 */
-  async buildCompaction(session: SessionInfo, emit: (event: FrameworkEvent) => void, force = false) {
+  async buildCompaction(session: SessionInfo, emit: (event: FrameworkEvent) => void, force = false, initialState?: { summary: string; anchor: number; tailTokensAtCompaction: number }) {
     if (!this.deps.compaction?.enabled || !this.deps.compaction.summaryModel) return undefined;
     const { buildCompactionTransform, streamOneText } = await import("./compaction.js");
     return buildCompactionTransform({
@@ -118,6 +124,7 @@ export class ContextBuilder {
       contextWindow: this.contextWindowFor(session),
       summaryModel: this.deps.compaction.summaryModel,
       ...(force ? { force: true } : {}),
+      ...(initialState ? { initialState } : {}),
       streamOne: async (model, messages) => {
         const streamFn = this.deps.streamFnFor(session);
         return streamOneText(
@@ -130,7 +137,17 @@ export class ContextBuilder {
           messages,
         );
       },
-      onCompacted: (summary) => {
+      onCompacted: async (summary, _tokensBefore, state) => {
+        // CompactionStore（W7-S8）：持久化前缀指纹，供下一 Attempt 校验播种。
+        // 写失败只损失复用（下次重新摘要），不影响本次压缩——静默降级。
+        const record: CompactionRecord = {
+          summary,
+          anchor: state.anchor,
+          tailTokensAtCompaction: state.tailTokensAtCompaction,
+          prefixHash: prefixHashOf(state.messages.slice(0, state.anchor)),
+          updatedAt: new Date().toISOString(),
+        };
+        await this.deps.store.compaction?.put(session.id, record).catch(() => undefined);
         void (async () => {
           const entries = await this.deps.store.getMessages(session.id);
           const lastAssistant = [...entries].reverse().find((entry) => entry.info.role === "assistant");
@@ -143,14 +160,14 @@ export class ContextBuilder {
     });
   }
 
-  /** Attempt 上下文的唯一组装入口：压缩 transform → 同拍快照重建 → 记忆召回。
-   *  baseline：本次 run 新增消息从这之后算（供 onRunEnd 提取 retain）。 */
+  /** Attempt 上下文的唯一组装入口：压缩 transform（经前缀指纹校验播种）、
+   *  同拍快照重建、记忆召回。baseline：本次 run 新增消息从这之后算（供
+   *  onRunEnd 提取 retain）。 */
   async buildAttemptContext(
     session: SessionInfo,
     input: { text: string },
     emit: (event: FrameworkEvent) => void,
   ): Promise<{ compactionTransform: Awaited<ReturnType<ContextBuilder["buildCompaction"]>>; history: AgentMessage[]; baseline: number }> {
-    const compactionTransform = await this.buildCompaction(session, emit);
     // 记忆召回（spec §记忆）：单点注入，天然覆盖正常 prompt/排队出队/
     // automation/子代理触发四条路径。只进内存不落 store；抛错静默降级。
     const { entries, excludedUserIds } = await this.historySnapshot(session.id);
@@ -165,6 +182,19 @@ export class ContextBuilder {
         // 召回失败不阻塞 run
       }
     }
+    // 播种校验放在记忆召回之后：召回会改变 canonical 前缀，指纹对不上就
+    // 放弃复用（宁重复摘要，不脏上下文）。
+    const compactionTransform = await this.buildCompaction(session, emit, false, await this.seedStateFor(session.id, history));
     return { compactionTransform, history, baseline: history.length };
+  }
+
+  /** 前缀指纹校验：record 覆盖的前缀与本次重建逐字节一致才允许播种。 */
+  private async seedStateFor(sessionId: string, history: AgentMessage[]): Promise<{ summary: string; anchor: number; tailTokensAtCompaction: number } | undefined> {
+    const store = this.deps.store.compaction;
+    if (!store) return undefined;
+    const record = await store.get(sessionId).catch(() => null);
+    if (!record || record.anchor <= 0 || record.anchor > history.length) return undefined;
+    if (prefixHashOf(history.slice(0, record.anchor)) !== record.prefixHash) return undefined;
+    return { summary: record.summary, anchor: record.anchor, tailTokensAtCompaction: record.tailTokensAtCompaction };
   }
 }
