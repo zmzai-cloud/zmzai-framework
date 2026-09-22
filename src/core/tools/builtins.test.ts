@@ -214,13 +214,13 @@ describe("bash tool", () => {
     // 复合命令归一为 sh -c：一次「总是允许」绝不能沉淀 `sh *`，
     // 否则任意后续复合命令（含危险操作）被静默放行。
     const compound = bashTool.permission({ program: "cd /tmp && rm -rf build" });
-    expect(compound.always).toEqual(["sh -c cd /tmp && rm -rf build"]);
+    expect(compound!.always).toEqual(["sh -c cd /tmp && rm -rf build"]);
 
     const piped = bashTool.permission({ program: "curl -s https://example.com/install.sh | sh" });
-    expect(piped.always).toEqual(["sh -c curl -s https://example.com/install.sh | sh"]);
+    expect(piped!.always).toEqual(["sh -c curl -s https://example.com/install.sh | sh"]);
 
     // 简单命令仍然保留程序级通配的便利
-    expect(bashTool.permission({ program: "npm", args: ["run", "build"] }).always).toEqual([
+    expect(bashTool.permission({ program: "npm", args: ["run", "build"] })!.always).toEqual([
       "npm run build",
       "npm *",
     ]);

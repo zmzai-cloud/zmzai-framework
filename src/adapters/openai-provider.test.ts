@@ -92,7 +92,7 @@ describe("createOpenAiModelProvider", () => {
       // 关键契约：目录未覆盖时不得臆造「支持」，否则 UI 假开关 → relay 400
       const provider = createOpenAiModelProvider({ modelCaps: () => undefined });
       const model = provider.getModel({ providerId: "x", modelId: "unknown" });
-      expect(model.compat.supportsReasoningEffort).toBe(false);
+      expect((model.compat as { supportsReasoningEffort: boolean }).supportsReasoningEffort).toBe(false);
       expect((model.thinkingLevelMap as Record<string, string | null>).high).toBeNull();
     });
 
@@ -101,7 +101,7 @@ describe("createOpenAiModelProvider", () => {
         modelCaps: (id) => (id === "m" ? { allowedReasoningEfforts: ["low", "medium", "high"] } : undefined),
       });
       const model = provider.getModel({ providerId: "x", modelId: "m" });
-      expect(model.compat.supportsReasoningEffort).toBe(true);
+      expect((model.compat as { supportsReasoningEffort: boolean }).supportsReasoningEffort).toBe(true);
       const map = model.thinkingLevelMap as Record<string, string | null>;
       expect(map.low).toBe("low");
       expect(map.medium).toBe("medium");
@@ -114,7 +114,7 @@ describe("createOpenAiModelProvider", () => {
     it("keeps the switch off when the allowed list is empty", () => {
       const provider = createOpenAiModelProvider({ modelCaps: () => ({ allowedReasoningEfforts: [] }) });
       const model = provider.getModel({ providerId: "x", modelId: "m" });
-      expect(model.compat.supportsReasoningEffort).toBe(false);
+      expect((model.compat as { supportsReasoningEffort: boolean }).supportsReasoningEffort).toBe(false);
     });
   });
 

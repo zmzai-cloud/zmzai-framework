@@ -109,6 +109,7 @@ describe("模型上下文投影", () => {
     const parts = await attachmentRefContent(
       provider({ att_hist: { mediaType: "text/plain", body: "历史正文" } }),
       [{ id: "att_hist", name: "old.txt", kind: "text" }],
+      { sessionId: "ses_1" }
     );
     expect(parts).toHaveLength(1);
     expect((parts[0] as { text: string }).text).toContain("历史正文");
@@ -119,6 +120,7 @@ describe("模型上下文投影", () => {
     const parts = await attachmentRefContent(
       provider({ [png]: { mediaType: "image/png", body: "PNGDATA" } }),
       [ref({ id: png, kind: "image", name: "shot.png", mediaType: "image/png" })],
+      { sessionId: "ses_1" }
     );
     expect(parts).toEqual([{ type: "image", data: Buffer.from("PNGDATA").toString("base64"), mimeType: "image/png" }]);
   });
@@ -127,6 +129,7 @@ describe("模型上下文投影", () => {
     const parts = await attachmentRefContent(
       provider({ att_md: { mediaType: "text/markdown", body: "# 标题\n正文" } }),
       [ref({ id: "att_md", kind: "text", name: "notes.md", mediaType: "text/markdown" })],
+      { sessionId: "ses_1" }
     );
     expect(parts).toHaveLength(1);
     expect(parts[0]!.type).toBe("text");
@@ -139,6 +142,7 @@ describe("模型上下文投影", () => {
     const parts = await attachmentRefContent(
       provider({ att_pdf: { mediaType: "application/pdf", body: "PDFBODY" } }),
       [ref({ id: "att_pdf", kind: "document" })],
+      { sessionId: "ses_1" }
     );
     expect(parts).toHaveLength(1);
     const text = (parts[0] as { text: string }).text;
@@ -151,6 +155,7 @@ describe("模型上下文投影", () => {
     const parts = await attachmentRefContent(
       provider({ att_big: { mediaType: "text/plain", body: big } }),
       [ref({ id: "att_big", kind: "text", name: "big.txt", mediaType: "text/plain", size: big.length })],
+      { sessionId: "ses_1" }
     );
     const text = (parts[0] as { text: string }).text;
     expect(text).toContain("NOT available");
@@ -158,18 +163,18 @@ describe("模型上下文投影", () => {
   });
 
   it("未注入 provider 时全部降级为清单，不抛错（历史消息仍可重放）", async () => {
-    const parts = await attachmentRefContent(undefined, [ref({ kind: "image" }), ref({ id: "att_2", kind: "text" })]);
+    const parts = await attachmentRefContent(undefined, [ref({ kind: "image" }), ref({ id: "att_2", kind: "text" })], { sessionId: "ses_1" });
     expect(parts).toHaveLength(1);
     expect((parts[0] as { text: string }).text).toContain("NOT available");
   });
 
   it("附件已被清理（provider 返回 null）时不抛错", async () => {
-    const parts = await attachmentRefContent(provider({}), [ref({ id: "att_gone" })]);
+    const parts = await attachmentRefContent(provider({}), [ref({ id: "att_gone" })], { sessionId: "ses_1" });
     expect((parts[0] as { text: string }).text).toContain("att_gone");
   });
 
   it("空列表不产生内容片段", async () => {
-    expect(await attachmentRefContent(provider({}), [])).toEqual([]);
+    expect(await attachmentRefContent(provider({}), [], { sessionId: "ses_1" })).toEqual([]);
   });
 
   it("混合列表：图片与清单各自成立", async () => {
@@ -179,6 +184,7 @@ describe("模型上下文投影", () => {
         ref({ id: "att_png", kind: "image", name: "a.png", mediaType: "image/png" }),
         ref({ id: "att_pdf", kind: "document" }),
       ],
+      { sessionId: "ses_1" }
     );
     expect(parts.map((part) => part.type)).toEqual(["image", "text"]);
   });
