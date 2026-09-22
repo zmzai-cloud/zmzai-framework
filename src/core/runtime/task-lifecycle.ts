@@ -221,6 +221,7 @@ export class TaskLifecycle {
       unknownSideEffect: outcome.unknownSideEffect ? (outcome.sideEffectDetail ?? "存在结果不确定的操作") : null,
       pendingPermissions: isSessionAwaitingPermission(session.id) ? 1 : 0,
       unsafeReplay: null,
+      subagentPending: null, // M3-S22：无协调器时无子代理门禁
       budgetExhausted: null,
       externalAuthRequired: block?.kind === "external_auth" ? { message: block.message, requiredAction: block.requiredAction } : null,
       inputRequired: block?.kind === "input" ? { message: block.message, requiredAction: block.requiredAction } : null,

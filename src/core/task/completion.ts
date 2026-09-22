@@ -43,6 +43,9 @@ export type CompletionRuntimeState = {
   pendingPermissions: number;
   /** 已确认失败且需要外部核验才能安全重放的写操作（unsafe_replay）。 */
   unsafeReplay: string | null;
+  /** M3-S22：存在未终态或未通过父验证的必要子代理（spec §9.4——必要子结果
+   *  已被接受或需求已由有效证据解决才可交付；消费 ≠ 接受，A36）。 */
+  subagentPending: string[] | null;
   /** 预算耗尽原因（时间/token/费用/Attempt 数）。null 表示未超。 */
   budgetExhausted: string | null;
   /** 外部状态导致必须由用户完成的事（登录失效、验证码、付款）。
@@ -369,6 +372,10 @@ export function evaluateTaskCompletion(
   if (missingEvidence.length) reasons.push(`验收条件缺少验证证据：${missingEvidence.map((item) => item.description).join("、")}`);
   if (!state.finalTextPresent) reasons.push("尚未生成最终交付说明");
   if (!deliveryDeclared) reasons.push("尚未提交交付声明");
+  // M3-S22（spec §9.4 / §8.4）：必要子代理未收尾或结果未被父验证——消费 ≠ 接受
+  if (state.subagentPending && state.subagentPending.length > 0) {
+    reasons.push(`子代理未收尾或结果未通过验证：${state.subagentPending.join("、")}`.slice(0, 400));
+  }
 
   if (reasons.length === 0) {
     return { status: "delivered", reason: "全部验收条件已通过、留有条目证据，并由模型显式声明交付。" };
