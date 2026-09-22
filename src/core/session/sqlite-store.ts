@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { promptHash, type PromptReceipt, type WorkflowRun } from "./workflow.js";
+import { assertSubagentTransition, type SubagentRecord, type SubagentMessage } from "../subagents/types.js";
 import { frameworkEventSchemas, toPersistedEvent, type FrameworkEventType, type PersistedFrameworkEvent } from "../events/manifest.js";
 import { newEventId } from "./ids.js";
 import { searchablePart, searchSnippet, type MessageSearchHit } from "./message-search.js";
@@ -120,6 +121,17 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
   transaction(() => {
     const columns = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
     if (!columns.some(column => column.name === "message_seq")) db.exec("ALTER TABLE messages ADD COLUMN message_seq INTEGER");
+    db.exec(`CREATE TABLE IF NOT EXISTS subagents (
+      child_id TEXT PRIMARY KEY, parent_session_id TEXT NOT NULL, root_task_id TEXT NOT NULL,
+      spawn_request_id TEXT NOT NULL, json TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_subagents_spawn ON subagents(parent_session_id, spawn_request_id);
+    CREATE INDEX IF NOT EXISTS idx_subagents_root ON subagents(root_task_id);
+    CREATE TABLE IF NOT EXISTS subagent_messages (
+      message_id TEXT NOT NULL, child_id TEXT NOT NULL, created_at TEXT NOT NULL,
+      direction TEXT NOT NULL, json TEXT NOT NULL,
+      PRIMARY KEY (child_id, message_id)
+    );`);
     db.exec(`CREATE TABLE IF NOT EXISTS compaction_records (session_id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS session_history (session_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -394,6 +406,70 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       async put(sessionId, record) {
         transaction(() => {
           db.prepare("INSERT INTO compaction_records(session_id,json,updated_at) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at").run(sessionId, JSON.stringify(record), record.updatedAt);
+        });
+      },
+    },
+    subagents: {
+      async createSubagent(record) {
+        return transaction(() => {
+          const prior = db.prepare("SELECT json FROM subagents WHERE parent_session_id=? AND spawn_request_id=?").get(record.parentSessionId, record.spawnRequestId) as { json: string } | undefined;
+          if (prior) return JSON.parse(prior.json) as SubagentRecord;
+          db.prepare("INSERT INTO subagents(child_id,parent_session_id,root_task_id,spawn_request_id,json,updated_at) VALUES (?,?,?,?,?,?)").run(record.childId, record.parentSessionId, record.rootTaskId, record.spawnRequestId, JSON.stringify(record), record.times.spawnedAt);
+          return record;
+        });
+      },
+      async getSubagent(childId) {
+        const row = db.prepare("SELECT json FROM subagents WHERE child_id=?").get(childId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as SubagentRecord) : null;
+      },
+      async findSubagentBySpawnRequest(parentSessionId, spawnRequestId) {
+        const row = db.prepare("SELECT json FROM subagents WHERE parent_session_id=? AND spawn_request_id=?").get(parentSessionId, spawnRequestId) as { json: string } | undefined;
+        return row ? (JSON.parse(row.json) as SubagentRecord) : null;
+      },
+      async updateSubagent(childId, expectedRevision, patch) {
+        return transaction(() => {
+          const row = db.prepare("SELECT json FROM subagents WHERE child_id=?").get(childId) as { json: string } | undefined;
+          if (!row) throw new Error("SUBAGENT_NOT_FOUND");
+          const current = JSON.parse(row.json) as SubagentRecord;
+          if (current.revision !== expectedRevision) throw new Error("SUBAGENT_REVISION_CONFLICT");
+          if (patch.status) assertSubagentTransition(current.status, patch.status);
+          const next = { ...current, ...patch, revision: current.revision + 1 };
+          db.prepare("UPDATE subagents SET json=?, updated_at=? WHERE child_id=?").run(JSON.stringify(next), new Date().toISOString(), childId);
+          return next;
+        });
+      },
+      async listSubagents(filter) {
+        let sql = "SELECT json FROM subagents WHERE 1=1";
+        const args: (string | number | null)[] = [];
+        if (filter.parentSessionId) { sql += " AND parent_session_id=?"; args.push(filter.parentSessionId); }
+        if (filter.rootTaskId) { sql += " AND root_task_id=?"; args.push(filter.rootTaskId); }
+        const rows = db.prepare(sql).all(...args) as { json: string }[];
+        let list = rows.map((r) => JSON.parse(r.json) as SubagentRecord);
+        if (filter.statuses) list = list.filter((r) => filter.statuses!.includes(r.status));
+        return list.sort((a, b) => a.times.spawnedAt.localeCompare(b.times.spawnedAt));
+      },
+      async appendMessage(message) {
+        transaction(() => {
+          db.prepare("INSERT OR IGNORE INTO subagent_messages(message_id,child_id,created_at,direction,json) VALUES (?,?,?,?,?)").run(message.messageId, message.childId, message.createdAt, message.direction, JSON.stringify(message));
+        });
+      },
+      async listMessages(childId, options) {
+        let sql = "SELECT json FROM subagent_messages WHERE child_id=?";
+        const args: (string | number | null)[] = [childId];
+        if (options?.sinceCreatedAt) { sql += " AND created_at>?"; args.push(options.sinceCreatedAt); }
+        const rows = db.prepare(sql + " ORDER BY created_at").all(...args) as { json: string }[];
+        return rows.map((r) => JSON.parse(r.json) as SubagentMessage);
+      },
+      async markMessagesConsumedByParent(childId, upToCreatedAt) {
+        transaction(() => {
+          const rows = db.prepare("SELECT json FROM subagent_messages WHERE child_id=? AND created_at<=?").all(childId, upToCreatedAt) as { json: string }[];
+          for (const row of rows) {
+            const msg = JSON.parse(row.json) as SubagentMessage;
+            if (!msg.consumedByParent) {
+              msg.consumedByParent = true;
+              db.prepare("UPDATE subagent_messages SET json=? WHERE child_id=? AND message_id=?").run(JSON.stringify(msg), childId, msg.messageId);
+            }
+          }
         });
       },
     },

@@ -11,6 +11,8 @@ export interface SessionStore {
   /** 持久任务契约（规格 3 §13.4）。缺失时 runner 退化为无任务语义的一次性
    *  运行——工具、权限、事件全部照常，「自动续跑」与「可信完成判定」不可用。 */
   task?: import("../task/store.js").TaskStore;
+  /** 子代理协调记录与邮箱（M3-S17）。可选：未提供时子代理能力降级不可用。 */
+  subagents?: import("../subagents/types.js").SubagentStore;
   /** 压缩投影的跨 Attempt 状态（W7-S8）。可选：未提供的后端（JSONL demo）
    *  保持每 Attempt 重新摘要的旧行为。 */
   compaction?: { get(sessionId: string): Promise<CompactionRecord | null>; put(sessionId: string, record: CompactionRecord): Promise<void> };
