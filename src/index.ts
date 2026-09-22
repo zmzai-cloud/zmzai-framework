@@ -50,6 +50,8 @@ export { taskTool } from "./core/tools/task.js";
 export { createGitTools } from "./core/tools/git.js";
 export type { GitToolsOptions } from "./core/tools/git.js";
 export * from "./core/subagents/types.js";
+export { subagentTools, makeLegacyTaskTool } from "./core/subagents/tools.js";
+export { SubagentCoordinator } from "./core/subagents/coordinator.js";
 export { TerminalManager, createTerminalTools } from "./core/tools/terminal.js";
 export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSessionStatus } from "./core/tools/terminal.js";
 export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
