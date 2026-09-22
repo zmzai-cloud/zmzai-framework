@@ -1,5 +1,15 @@
 # @zmzai/agent-framework
 
+## 0.10.0
+
+### Minor Changes
+
+- **Runner 拆分（M1-W6/W7，行为保持）**：2068 行的 `SessionRunner` 拆为六个具名单元——`CommandService`（prompt 提交链/任务归属/拒绝回滚）、`RunScheduler`（drain 驱动链/放行登记/停止协调/租约，`leaseOwner` 可注入）、`TaskLifecycle`（Attempt 循环/预算闸/投影/终态）、`ContextBuilder`（上下文组装唯一入口）、`AttemptExecutor`（单次 Attempt 执行）、`ActiveRunRegistry`（全局活跃 run 表）。对外 API 与导出路径全部不变；runner.ts 降至 545 行（spec §7 审查线 400）。实测踩坑两条已写入代码注释：委托层必须非 async 直通（`async return promise` 多一拍 microtask，翻转提交与 drain 交错）；executor 持原 `RunnerDeps` 引用而非构造时快照（测试会在构造后改 deps 字段）。
+- **修复 runLoop 读偏斜竞态（TOCTOU）**：此前先读 `workflowRuns` 算排除集、下一拍才读消息，两拍之间 acceptPrompt 落库的排队消息会泄入运行中 run 的模型上下文。`WorkflowStore` 新增可选 `rebuildSnapshot`（sqlite 单事务同拍读两表），ContextBuilder 消费不可变快照——机制上消除窗口；未提供的后端回落两拍。
+- **CompactionStore 跨 Attempt 复用（W7-S8）**：`store.compaction` 可选面持久化 `CompactionRecord{summary,anchor,tailTokensAtCompaction,prefixHash}`；前缀指纹逐字节一致才播种 transform，任何不一致（rewind/召回变化）放弃复用重新摘要——宁重复摘要不脏上下文。已知边界：`rebuildMessages` 尚不重建 toolResult 消息，工具密集会话回落每 Attempt 重摘（与旧版等价）。
+- **ToolContract 声明 + toolCallId 执行台账（W8）**：`ToolDef/ExternalToolDef` 新增 `contract?: { effect, retrySafety, concurrency }`（spec §9.3 声明子集，缺失按保守语义）；全部内建工具已标注。adapter 双适配器按 toolCallId 去重——同一 callId 重复派发返回原执行记录、in-flight 共享 promise，修复重复 callId 重执行并留悬挂 running part 的缺陷。
+- **破坏性变更：`modelCaps` 回调签名改为 `(ref: ModelRef)`**（W9）。只按 modelId 缓存会让同一 modelId 挂不同 provider 的能力串用（A32）；宿主接线需改为按 providerId+modelId 查目录。
+
 ## 0.9.0
 
 ### Minor Changes
