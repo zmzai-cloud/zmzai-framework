@@ -123,6 +123,11 @@ export type TaskRecord = {
   activeMs?: number;
   /** 用户中途追加的约束（steering 消息累积），进 continuation 上下文。 */
   constraints: string[];
+  /** 调度停泊原因（spec §8.2，M3-S19）：父轮次结束但必要子代理未终态时
+   *  park（Task 保持 running、释放父模型并发槽）。这是**调度状态**不是
+   *  第二套生命周期——子结果齐后清 undefined 并由 RunScheduler 续跑。
+   *  旧数据无此字段按未停泊处理。 */
+  parkedReason?: "children";
   createdAt: string;
   updatedAt: string;
   deliveredAt?: string;
