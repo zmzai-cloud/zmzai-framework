@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import { adaptTool, permissionForCall, repairToolArguments } from "../tools/adapter.js";
+import { adaptExternalTool, adaptTool, permissionForCall, repairToolArguments } from "../tools/adapter.js";
 import type { ToolContext } from "../tools/context.js";
 import type { ToolDef } from "../tools/def.js";
 
@@ -162,5 +162,94 @@ describe("permissionForCall", () => {
     const defs = new Map<string, ToolDef>([["echo", echoTool]]);
     expect(permissionForCall(defs, "missing", {})).toBeNull();
     expect(permissionForCall(defs, "echo", { text: "" })).toBeNull();
+  });
+});
+
+/** W8：toolCallId 执行台账（spec §9.3「同一 toolCallId 重复派发返回原执行
+ *  记录」）+ 契约字段类型落地。 */
+const dedupCtx = {
+  sessionId: "s1", userId: "u", workspaceId: "w", agent: "default",
+  abort: new AbortController().signal,
+  ask: async () => {},
+  workspace: {},
+  buildSnapshot: async () => ({}),
+  runSandbox: async () => ({}),
+  setTodos: async () => {},
+  emitFileEdited: async () => {},
+  emitArtifact: async () => {},
+} as unknown as ToolContext;
+
+describe("adaptTool · toolCallId 台账（W8）", () => {
+  function probeDef(onExecute: () => void): ToolDef {
+    return {
+      id: "probe",
+      label: "Probe",
+      description: "计数探针",
+      parameters: z.object({ n: z.number() }),
+      permission: () => null,
+      contract: { effect: ["workspace"], retrySafety: "never" },
+      execute: async (args) => {
+        onExecute();
+        return { title: "probe", output: `执行一次，n=${args.n}` };
+      },
+    };
+  }
+
+  it("同一 toolCallId 重复派发返回原执行记录，不重复执行", async () => {
+    let executions = 0;
+    const tool = adaptTool(probeDef(() => { executions += 1; }), dedupCtx);
+    const first = await tool.execute("call-dup", { n: 1 });
+    const second = await tool.execute("call-dup", { n: 999 });
+    expect(executions).toBe(1);
+    expect(second).toEqual(first);
+  });
+
+  it("并发中的重复派发共享同一次 in-flight 执行", async () => {
+    let executions = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const def: ToolDef = {
+      ...probeDef(() => undefined),
+      execute: async (args) => {
+        executions += 1;
+        await gate;
+        return { title: "probe", output: `并发执行，n=${args.n}` };
+      },
+    };
+    const tool = adaptTool(def, dedupCtx);
+    const p1 = tool.execute("call-conc", { n: 1 });
+    const p2 = tool.execute("call-conc", { n: 2 });
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(executions).toBe(1);
+    expect(r2).toEqual(r1);
+  });
+
+  it("不同 toolCallId 互不去重", async () => {
+    let executions = 0;
+    const tool = adaptTool(probeDef(() => { executions += 1; }), dedupCtx);
+    await tool.execute("call-a", { n: 1 });
+    await tool.execute("call-b", { n: 2 });
+    expect(executions).toBe(2);
+  });
+
+  it("外部工具同样按 toolCallId 去重", async () => {
+    let executions = 0;
+    const tool = adaptExternalTool({
+      id: "ext-probe",
+      label: "Ext Probe",
+      description: "外部探针",
+      parametersJsonSchema: { type: "object", properties: { n: { type: "number" } } },
+      permission: () => null,
+      contract: { effect: ["network"], retrySafety: "never" },
+      execute: async (args) => {
+        executions += 1;
+        return { title: "ext", output: `外部执行，n=${String(args.n)}` };
+      },
+    }, dedupCtx);
+    const first = await tool.execute("call-ext", { n: 1 });
+    const second = await tool.execute("call-ext", { n: 2 });
+    expect(executions).toBe(1);
+    expect(second).toEqual(first);
   });
 });

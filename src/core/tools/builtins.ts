@@ -10,6 +10,7 @@ import { wildcardMatch } from "../permission/ruleset.js";
 
 export const readTool: ToolDef = {
   id: "read",
+  contract: { effect: [], retrySafety: "read_only", concurrency: { mode: "parallel_read" } },
   label: "读取文件",
   description: "读取当前 Workspace 中一个文本文件的内容。路径必须来自 glob 结果或已知 Workspace 路径。",
   parameters: z.object({ path: z.string().min(1).max(512) }),
@@ -23,6 +24,7 @@ export const readTool: ToolDef = {
 
 export const globTool: ToolDef = {
   id: "glob",
+  contract: { effect: [], retrySafety: "read_only", concurrency: { mode: "parallel_read" } },
   label: "按模式列文件",
   description: "按 glob 模式列出 Workspace 文件路径（* 匹配任意字符序列，? 匹配单字符）。不传 pattern 则列出全部。",
   parameters: z.object({ pattern: z.string().max(256).optional() }),
@@ -41,6 +43,7 @@ export const globTool: ToolDef = {
 
 export const grepTool: ToolDef = {
   id: "grep",
+  contract: { effect: [], retrySafety: "read_only", concurrency: { mode: "parallel_read" } },
   label: "搜索文件内容",
   description: "在 Workspace 文本文件内容中搜索关键词，最多返回 50 条匹配（path:line: 内容）。",
   parameters: z.object({
@@ -73,6 +76,7 @@ export const grepTool: ToolDef = {
 
 export const writeTool: ToolDef = {
   id: "write",
+  contract: { effect: ["workspace"], retrySafety: "never" },
   label: "写入文件",
   description: "创建或完整覆盖 Workspace 中的一个文本文件。写入立即生效并生成不可变版本（可通过 file.edited 事件审查差异）。",
   parameters: z.object({
@@ -92,6 +96,7 @@ export const writeTool: ToolDef = {
 
 export const editTool: ToolDef = {
   id: "edit",
+  contract: { effect: ["workspace"], retrySafety: "never" },
   label: "编辑文件",
   description: "对 Workspace 文件做精确文本替换：oldText 必须在文件中唯一出现。编辑立即生效并生成不可变版本。",
   parameters: z.object({
@@ -112,6 +117,7 @@ export const editTool: ToolDef = {
 
 export const todoTool: ToolDef = {
   id: "todo",
+  contract: { effect: [], retrySafety: "read_only" },
   label: "更新任务清单",
   description: "维护当前任务的工作清单：开始前拆解步骤（in_progress 标记进行中），每完成一步立即更新状态。让用户随时看到进度。",
   parameters: z.object({
@@ -160,6 +166,7 @@ function splitProgram(program: string): { program: string; args: string[] } {
 
 export const bashTool: ToolDef = {
   id: "bash",
+  contract: { effect: ["workspace", "network", "system"], retrySafety: "never" },
   label: "在沙箱中执行命令",
   description:
     "在当前 Workspace 的快照中执行一条命令（隔离沙箱）。程序必须在允许列表内；stdout/stderr 会返回。新生成的产物文件会自动出现在用户的产物面板（可预览/下载）——回复中不要自己编造下载链接（如 sandbox: 伪协议或沙箱路径），引用产物时使用工具结果里给出的真实 URL。",

@@ -138,6 +138,10 @@ async function persistTruncatedOutput(
  *  single choke point before execute() runs. */
 export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx: ToolContext): AgentTool {
   const jsonSchema = z.toJSONSchema(def.parameters) as Record<string, unknown>;
+  /** toolCallId 执行台账（W8，spec §9.3）：同一 toolCallId 重复派发返回原
+   *  执行记录（共享同一个 in-flight promise），不重跑 def.execute。此前重复
+   *  callId 会再次执行并在 pi-bridge 留下悬挂 running part。 */
+  const executions = new Map<string, Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }>>();
   return {
     name: def.id,
     label: def.label,
@@ -146,6 +150,11 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
     ...(def.executionMode ? { executionMode: def.executionMode } : {}),
     prepareArguments: (rawParams) => repairToolArguments(rawParams) as never,
     async execute(toolCallId, rawParams) {
+      if (toolCallId) {
+        const prior = executions.get(toolCallId);
+        if (prior) return prior;
+      }
+      const run = (async () => {
       const parsed = def.parameters.safeParse(repairToolArguments(rawParams));
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
@@ -180,6 +189,9 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
           ...(outputPath ? { outputPath } : {}),
         },
       };
+      })();
+      if (toolCallId) executions.set(toolCallId, run);
+      return run;
     },
   };
 }
@@ -187,6 +199,8 @@ export function adaptTool<TSchema extends z.ZodType>(def: ToolDef<TSchema>, ctx:
 /** External (JSON Schema) tools reuse the same prune/wrap pipeline; args pass
  *  through unvalidated — the remote tool owns its schema contract. */
 export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): AgentTool {
+  /** toolCallId 执行台账（W8）：与 adaptTool 同语义，覆盖外部工具。 */
+  const executions = new Map<string, Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }>>();
   return {
     name: def.id,
     label: def.label,
@@ -195,6 +209,11 @@ export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): Agent
     ...(def.executionMode ? { executionMode: def.executionMode } : {}),
     prepareArguments: (rawParams) => repairToolArguments(rawParams) as never,
     async execute(toolCallId, rawParams) {
+      if (toolCallId) {
+        const prior = executions.get(toolCallId);
+        if (prior) return prior;
+      }
+      const run = (async () => {
       const args = repairToolArguments(rawParams);
       if (!isRecord(args)) throw new Error("参数无效：必须是 JSON 对象，请修正后重新调用");
       let result;
@@ -221,6 +240,9 @@ export function adaptExternalTool(def: ExternalToolDef, ctx: ToolContext): Agent
           ...(outputPath ? { outputPath } : {}),
         },
       };
+      })();
+      if (toolCallId) executions.set(toolCallId, run);
+      return run;
     },
   };
 }
