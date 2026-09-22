@@ -6,8 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createJsonlSessionStore } from "./jsonl-store.js";
 import { createSqliteSessionStore } from "./sqlite-store.js";
-import type { MessageInfo, SessionStore } from "./store.js";
-import type { Part, SessionInfo } from "./types.js";
+import type { SessionStore } from "./store.js";
+import type { MessageInfo, Part, SessionInfo } from "./types.js";
 
 function sessionInfo(id = "ses_1"): SessionInfo {
   return {

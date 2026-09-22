@@ -31,7 +31,7 @@ describe("sqlite workflow contract", () => {
     await store.createSession(session());
     for (let n = 1; n <= 5; n++) {
       const item = accepted(session().id, `read_${n}`, String(n));
-      if (n > 1) item.message = { ...item.message, role: "assistant", parentId: "read_1" };
+      if (n > 1) item.message = { ...item.message, role: "assistant", parentId: "read_1" } as typeof item.message;
       await store.appendMessage(item.message);
       if (n !== 3) await store.appendPart(item.parts[0]!);
     }
