@@ -56,7 +56,7 @@ describe("createOpenAiModelProvider", () => {
 
     it("uses the real context window when the model catalog covers the model", () => {
       const provider = createOpenAiModelProvider({
-        modelCaps: (id) => (id === "long-ctx" ? { contextWindow: 1_000_000, maxTokens: 65_536 } : undefined),
+        modelCaps: (ref) => (ref.modelId === "long-ctx" ? { contextWindow: 1_000_000, maxTokens: 65_536 } : undefined),
       });
       const model = provider.getModel({ providerId: "x", modelId: "long-ctx" });
       expect(model.contextWindow).toBe(1_000_000);
@@ -88,6 +88,17 @@ describe("createOpenAiModelProvider", () => {
       expect(model.maxTokens).toBe(16_384);
     });
 
+    it("W9：同一 modelId 挂不同 providerId 时能力不串用（按完整 ref 查询）", () => {
+      // A32 的单元级等价物：能力目录按 providerId+modelId 区分
+      const provider = createOpenAiModelProvider({
+        modelCaps: (ref) => (ref.providerId === "p-long" ? { contextWindow: 1_000_000 } : { contextWindow: 32_000 }),
+      });
+      const long = provider.getModel({ providerId: "p-long", modelId: "same" });
+      const short = provider.getModel({ providerId: "p-short", modelId: "same" });
+      expect((long as { contextWindow?: number }).contextWindow).toBe(1_000_000);
+      expect((short as { contextWindow?: number }).contextWindow).toBe(32_000);
+    });
+
     it("disables reasoning effort when the catalog does not cover the model", () => {
       // 关键契约：目录未覆盖时不得臆造「支持」，否则 UI 假开关 → relay 400
       const provider = createOpenAiModelProvider({ modelCaps: () => undefined });
@@ -98,7 +109,7 @@ describe("createOpenAiModelProvider", () => {
 
     it("maps allowed efforts into thinkingLevelMap and enables the switch", () => {
       const provider = createOpenAiModelProvider({
-        modelCaps: (id) => (id === "m" ? { allowedReasoningEfforts: ["low", "medium", "high"] } : undefined),
+        modelCaps: (ref) => (ref.modelId === "m" ? { allowedReasoningEfforts: ["low", "medium", "high"] } : undefined),
       });
       const model = provider.getModel({ providerId: "x", modelId: "m" });
       expect((model.compat as { supportsReasoningEffort: boolean }).supportsReasoningEffort).toBe(true);

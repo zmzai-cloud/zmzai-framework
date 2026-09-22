@@ -60,10 +60,12 @@ export function createOpenAiModelProvider(input?: {
   apiKey?: string;
   defaultModel?: string;
   headers?: ProviderHeaders;
-  /** 按 modelId 查询真实模型能力（上下文窗口/最大输出）。同步形式——getModel
-   *  是同步契约，产品侧需自己缓存模型目录（如请求级灌入进程内缓存）。
+  /** 按完整 ModelRef 查询真实模型能力（W9：键必须含 provider 标识——同一
+   *  modelId 挂在不同 provider/端点配置上时能力不得串用，spec §9.2 / A32；
+   *  只按 modelId 缓存正是要钉的缺陷）。同步形式——getModel 是同步契约，
+   *  产品侧缓存键应按 providerId+modelId（+端点配置）。
    *  未命中返回 undefined 时回落 DEFAULT_*，与不配置时行为完全一致。 */
-  modelCaps?: (modelId: string) => ModelCaps | undefined;
+  modelCaps?: (ref: ModelRef) => ModelCaps | undefined;
   failoverEndpoints?: FailoverEndpoint[] | (() => FailoverEndpoint[]);
   /** 降级发生时回调（宿主用于日志/UI 提示）。 */
   onFailover?: (event: FailoverEvent) => void;
@@ -98,7 +100,7 @@ export function createOpenAiModelProvider(input?: {
       // 解析器抛错同样回落——目录只是增强信息，绝不能阻断建会话/压缩摘要。
       let caps: ModelCaps | undefined;
       try {
-        caps = input?.modelCaps?.(id);
+        caps = input?.modelCaps?.(ref);
       } catch {
         caps = undefined;
       }
