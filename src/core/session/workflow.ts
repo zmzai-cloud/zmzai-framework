@@ -1,7 +1,42 @@
 import { createHash } from "node:crypto";
-import type { MessageInfo, Part } from "./types.js";
-import type { PromptInput } from "../runtime/runner.js";
+import type { MessageInfo, ModelRef, Part, SelectedSkill, ThinkingEffort } from "./types.js";
 import type { PersistedFrameworkEvent } from "../events/manifest.js";
+
+/** 一条 prompt 提交的输入（W6 S2 自 runner.ts 原样搬移——它本来就是提交协议，
+ *  放在 workflow.ts 也让命令层不必再 import runner）。 */
+export type PromptInput = {
+  requestId?: string;
+  /** 旧契约（v1，data URL）。 */
+  attachments?: readonly import("../runtime/attachments.js").InputAttachment[];
+  /** 新契约（v2）：附件描述符（规格 2 §11）。与 `attachments` 可并存，便于迁移期混用。 */
+  attachmentRefs?: readonly import("../runtime/attachments.js").InputAttachmentRef[];
+  text: string;
+  agent?: string;
+  model?: ModelRef;
+  images?: readonly { url: string; mediaType: string }[];
+  effort?: ThinkingEffort;
+  skill?: SelectedSkill;
+  references?: readonly string[];
+  /** 归属的持久任务（规格 3 §6）。服务端在创建/复用任务后写入。 */
+  taskId?: string;
+  /** 内部续跑标记（规格 3 §8.2）。
+   *
+   *  【为什么这个字段决定「有没有多出一条用户消息」】它存在时，本次运行是
+   *  任务自动推进触发的，不是一个用户回合：runner 必须跳过用户消息的投影、
+   *  跳过新建 message，只在 systemPrompt 里注入任务契约。规格 §19 禁止的
+   *  「用新增一条伪用户消息作为内部 continuation」，防的就是这里做错。 */
+  continuation?: { attempt: number; advisory?: string };
+  /** 人工放行后的续跑标记（规格 3 §13.2 的 `resume`）。
+   *
+   *  【与 `continuation` 的区别，以及为什么必须是两个字段】`continuation` 是
+   *  任务自己决定「我还没做完」，由 `runTask` 的循环内部产生；`resume` 是**用户
+   *  按了一个按钮**。两者都不创建用户消息，但入口不同：`continuation` 永远在
+   *  `runTask` 的 while 里自己接着跑，而 `resume` 时的 workflow run 早已
+   *  `completed`（任务是因为预算/无进展/等待而停下的，不是排队等认领），
+   *  `claimPrompt` 取不到任何东西——所以它必须由 `resumeTask` 直接驱动。
+   *  混成一个字段会让「谁有权推进这个任务」变得不可判定。 */
+  resume?: true;
+};
 
 /** 一条消息被提交后服务端的处置（规格 3 §12 / §13.1，取值与规格逐字一致）。
  *

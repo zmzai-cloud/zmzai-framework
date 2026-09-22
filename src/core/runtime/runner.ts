@@ -1,7 +1,5 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import {
-  validateAttachments,
-  validateAttachmentRefs,
   attachmentContent,
   attachmentRefContent,
   type AttachmentContentRef,
@@ -10,12 +8,14 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 
 import { AgentRegistry, type AgentInfo } from "../agent/registry.js";
 import type { AgentResolver, ResolvedAgent } from "../agent/resolver.js";
-import { leaseDurationMs } from "../../adapters/index.js";
 import { notifyEventLogListeners, type EventLog } from "../events/bus.js";
 import type { FrameworkEvent, TodoItem } from "../events/manifest.js";
 import { PermissionEngine, RejectedError, type Reply } from "../permission/engine.js";
 import type { Ruleset } from "../permission/ruleset.js";
 import { confineWorkspaceFiles, writePathGuardRules } from "../permission/write-path.js";
+import { defaultActiveRunRegistry } from "./active-run-registry.js";
+import { CommandService, RESET_GUARDS_ON_RESUME } from "./command-service.js";
+import { RunScheduler } from "./run-scheduler.js";
 import { PartProjector, serializeEmit } from "./pi-bridge.js";
 import { LoopGuard, REPEAT_EDIT_FAILURE_THRESHOLD } from "./loop-guard.js";
 import type { SessionStore } from "../session/store.js";
@@ -32,8 +32,7 @@ import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type Lifec
 import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
-import { randomUUID } from "node:crypto";
-import type { PromptDisposition, PromptReceipt, WorkflowState } from "../session/workflow.js";
+import type { PromptInput, PromptReceipt, WorkflowState } from "../session/workflow.js";
 import {
   DEFAULT_MAX_ATTEMPTS,
   durationBudgetBlocker,
@@ -67,39 +66,8 @@ import { isTerminalStatus, isWaitingStatus, type TaskBlocker, type TaskEvidenceK
 
 export type { ThinkingEffort } from "../session/types.js";
 
-export type PromptInput = {
-  requestId?: string;
-  /** 旧契约（v1，data URL）。 */
-  attachments?: readonly import("./attachments.js").InputAttachment[];
-  /** 新契约（v2）：附件描述符（规格 2 §11）。与 `attachments` 可并存，便于迁移期混用。 */
-  attachmentRefs?: readonly import("./attachments.js").InputAttachmentRef[];
-  text: string;
-  agent?: string;
-  model?: ModelRef;
-  images?: readonly { url: string; mediaType: string }[];
-  effort?: ThinkingEffort;
-  skill?: SelectedSkill;
-  references?: readonly string[];
-  /** 归属的持久任务（规格 3 §6）。服务端在创建/复用任务后写入。 */
-  taskId?: string;
-  /** 内部续跑标记（规格 3 §8.2）。
-   *
-   *  【为什么这个字段决定「有没有多出一条用户消息」】它存在时，本次运行是
-   *  任务自动推进触发的，不是一个用户回合：runner 必须跳过用户消息的投影、
-   *  跳过新建 message，只在 systemPrompt 里注入任务契约。规格 §19 禁止的
-   *  「用新增一条伪用户消息作为内部 continuation」，防的就是这里做错。 */
-  continuation?: { attempt: number; advisory?: string };
-  /** 人工放行后的续跑标记（规格 3 §13.2 的 `resume`）。
-   *
-   *  【与 `continuation` 的区别，以及为什么必须是两个字段】`continuation` 是
-   *  任务自己决定「我还没做完」，由 `runTask` 的循环内部产生；`resume` 是**用户
-   *  按了一个按钮**。两者都不创建用户消息，但入口不同：`continuation` 永远在
-   *  `runTask` 的 while 里自己接着跑，而 `resume` 时的 workflow run 早已
-   *  `completed`（任务是因为预算/无进展/等待而停下的，不是排队等认领），
-   *  `claimPrompt` 取不到任何东西——所以它必须由 `resumeTask` 直接驱动。
-   *  混成一个字段会让「谁有权推进这个任务」变得不可判定。 */
-  resume?: true;
-};
+/** 提交协议类型已移至 session/workflow.ts（W6 S2）；此处再导出保持外部导入路径不变。 */
+export type { PromptInput } from "../session/workflow.js";
 
 /** Product-owned resolver. It must be session-root aware and return trusted, bounded text. */
 export type MandatorySkillResolver = (session: SessionInfo, skill: SelectedSkill) => Promise<{ context: string }>;
@@ -160,16 +128,6 @@ export type RunnerDeps = {
   };
 };
 
-type ActiveRun = {
-  agent: Agent;
-  engine: PermissionEngine;
-  settled: () => Promise<void>;
-  abort: () => void;
-  /** Resolves only after the run has emitted its terminal state and released
-   * its lease. Control-plane code uses this before starting a continuation. */
-  done: Promise<void>;
-};
-
 /** 事件的 sessionId 提取：能自带的自带（message/part/session），其余
  *  （message.part.delta 等）用发起 run 的会话 id 兜底。 */
 function sessionIdOf(event: FrameworkEvent, fallbackSessionId: string): string {
@@ -179,9 +137,9 @@ function sessionIdOf(event: FrameworkEvent, fallbackSessionId: string): string {
   return fallbackSessionId;
 }
 
-const globalRunners = globalThis as typeof globalThis & { __zmzaiFrameworkRuns?: Map<string, ActiveRun> };
-const activeRuns = globalRunners.__zmzaiFrameworkRuns ?? new Map<string, ActiveRun>();
-globalRunners.__zmzaiFrameworkRuns = activeRuns;
+/** 活跃 run 表已抽离到 active-run-registry.ts（W6 S1）；这里保留同名引用，
+ *  使搬移范围内的调用点 diff 最小。 */
+const activeRuns = defaultActiveRunRegistry;
 
 /** 上游中断类错误（F6）：模型流偶发终止/连接断开时自动重试，避免偶发中断
  *  直接结束任务（实测 relay 透传 "terminated"、上游断流
@@ -294,30 +252,6 @@ type RunOutcome = {
  *  用类型把它挡在外面，`settleTask` 里就不需要再防一次不可能的状态。 */
 type SettledVerdict = Exclude<CompletionVerdict, { status: "continue" }>;
 
-/** 一条新消息与任务的关系（`resolveTaskForPrompt` 的结论）。
- *
- *  `previous` 是改动前的快照：提交可能在这一步之后被 workflow 层拒掉
- *  （RECOVERY_REQUIRED 等），那时必须把任务改回去——没被接受的提交不该留下
- *  任何痕迹。新建任务时 `previous` 为 null，见 `rollbackTaskResolution`。 */
-type TaskResolution = {
-  task: TaskRecord;
-  disposition: PromptDisposition;
-  startedTask: boolean;
-  previous: TaskRecord | null;
-};
-
-/** 用户明确放行时重置的三个保护计数（新消息恢复、以及 `resumeTask`）。
- *
- *  【为什么必须重置】不重置的话「继续」是个死按钮：因为 no_progress 停下来的任务
- *  计数仍是 3，下一次判定立刻再停；因为轮数预算停下来的任务第 N+1 轮开头就超过
- *  上限，一步都不会跑；时间预算同理——已经烧满一小时的 `activeMs` 会让放行后的
- *  第一轮连起点都过不去。用户点「继续」就是明确授权再做一些，那一刻起保护阈值
- *  应当重新计时——由人来决定要不要继续，正是这类保护的设计前提（规格 §10.1 的
- *  三档策略本来就以「用户可以再来一轮」为前提）。
- *
- *  这不会让任务无限跑：每一次重置都需要一次显式的人工动作，不存在自触发路径。 */
-const RESET_GUARDS_ON_RESUME = { noProgressCount: 0, attemptCount: 0, activeMs: 0 } as const;
-
 /** 人工放行时喂给模型的驱动文本（与 `continuation` 那条同源但不同话术）。
  *
  *  它同样**不落库**：`resumeTask` 不经过 `prompt()`，没有 message、没有 workflow
@@ -332,74 +266,28 @@ const RESUME_DRIVE_TEXT =
 const MAX_ATTEMPT_CEILING = 64;
 
 export class SessionRunner {
-  constructor(private readonly deps: RunnerDeps) {}
-  private draining = new Map<string, Promise<void>>();
-  private stopRequested = new Set<string>();
-  /** 已被用户放行、等待驱动链接手推进的会话（见 `drain` 的第三条分支）。 */
-  private resumeRequests = new Set<string>();
+  private readonly scheduler: RunScheduler;
+  private readonly commandService: CommandService;
 
-  private drain(sessionId: string): void {
-    if (this.draining.has(sessionId)) return;
-    const work = (async () => {
-      while (true) {
-        const job = await this.deps.store.workflow!.claimPrompt(sessionId, `node:${process.pid}`);
-        if (job) {
-          let outcome: WorkflowState = "recovery_required";
-          try {
-            if (this.stopRequested.has(sessionId)) {
-              outcome = "cancelled";
-            } else {
-            const session = await this.deps.store.getSession(sessionId);
-            if (!session) {
-              outcome = "failed";
-            } else {
-              // 走任务层：一次 claim 之后可能跑多轮 Attempt（规格 §8.2）
-              outcome = await this.runTask(session, job.input, job.receipt.userMessageId);
-            }
-            }
-          } catch {
-            // Setup or settlement may have failed after a tool ran. Do not replay.
-          }
-          try {
-            await this.deps.store.workflow!.finishPrompt(sessionId,job.receipt.runId,job.revision,outcome);
-          } catch (error) {
-            // revision 是这次 run 的所有权凭据。冲突说明这次 run 的归属已经在
-            // 别处被改写过——最典型的就是进程崩溃后恢复扫描把它标成
-            // `recovery_required`，而这一轮结算才姗姗来迟。那时这条结论不该由
-            // 我们写（恢复扫描已经给出了它的判断），静默退出即可。把冲突往上抛
-            // 只会炸掉 `abort()`——它正 await 着这条驱动链。
-            if (!/RUN_REVISION_CONFLICT/.test(String((error as Error)?.message ?? ""))) throw error;
-            return;
-          }
-          if (outcome !== "completed") return;
-          continue;
-        }
-        // 队列里没有 run 了。还有第三种可能要推进：**用户刚按了「继续」**。
-        // 这类任务停下的原因是预算/无进展/等待，而不是「排队等认领」——它那次
-        // 的 workflow run 早已 `completed`，`claimPrompt` 永远取不到它。没有这条
-        // 分支，`resumeTask` 把任务放回 queued 之后就再没有东西会碰它，
-        // 每个 blocker 里写的那句「确认后可以继续」就是一句系统接不住的承诺。
-        if (!this.resumeRequests.delete(sessionId)) return;
-        if (this.stopRequested.has(sessionId)) return;
-        const resumed = await this.deps.store.getSession(sessionId);
-        if (!resumed) return;
-        await this.driveResumedTask(resumed);
-      }
-    })();
-    this.draining.set(sessionId, work);
-    void work.catch(() => undefined).finally(async () => {
-      this.draining.delete(sessionId);
-      if (this.stopRequested.has(sessionId)) return;
-      // 有放行请求就在原地接着驱动。必须在这里再查一次：`resumeTask` 是在
-      // `draining.delete` 之前判断「有没有人在跑」的，上面那个 while 也可能
-      // 刚刚判定退出——两件事都发生在微任务队列里，中间只差一次 await。
-      // 少了这一查，一次恰好落在收尾窗口里的「继续」会被静默丢掉。
-      if (this.resumeRequests.has(sessionId)) {
-        this.drain(sessionId);
-        return;
-      }
-      const queued = await this.deps.store.workflow!.workflowRuns(sessionId).catch(() => []);
-      if (queued.some(run => run.status === "queued") && !queued.some(run => run.status === "running" || run.status === "recovery_required")) this.drain(sessionId);
+  constructor(private readonly deps: RunnerDeps) {
+    // 调度（drain 驱动链 / 放行登记 / 停止协调 / 租约）在 RunScheduler（W6 S3），
+    // 提交链（投影 → 任务归属 → acceptPrompt → task.started）在 CommandService
+    // （W6 S4）。runner 经回调提供执行语义；W7 换 AttemptExecutor 时改这里。
+    this.scheduler = new RunScheduler({
+      store: deps.store,
+      executor: {
+        runJob: (session, input, acceptedUserId) => this.runTask(session, input, acceptedUserId),
+        driveResumed: (session) => this.driveResumedTask(session),
+        cancelResidual: (sessionId) => this.cancelResidualTask(sessionId),
+      },
+      ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),
+    });
+    this.commandService = new CommandService({
+      store: deps.store,
+      scheduler: this.scheduler,
+      casTask: (task, patch) => this.casTask(task, patch),
+      publish: (event, sessionId) => this.publish(event, sessionId),
+      launch: (session, input) => void this.runLoop(session, input),
     });
   }
 
@@ -463,151 +351,11 @@ export class SessionRunner {
     notifyEventLogListeners(persisted);
   }
 
-  private async stampLease(sessionId: string): Promise<void> {
-    if (!this.deps.leaseStore) return; // demo/JSONL mode: no lease
-    await this.deps.leaseStore.stamp(sessionId, `node:${process.pid}`, new Date(Date.now() + leaseDurationMs)).catch(() => undefined);
-  }
-
-  private async clearLease(sessionId: string): Promise<void> {
-    if (!this.deps.leaseStore) return;
-    await this.deps.leaseStore.clear(sessionId).catch(() => undefined);
-  }
-
-  /** 为一条新消息决定它归属哪个任务，以及这次提交的处置（规格 §12 / §13.1）。
-   *
-   *  四种处置的判定依据是**任务当前状态**，不是模型对文本的猜测：
-   *  - 无活跃任务 → 开新任务；
-   *  - 任务在 waiting_permission / waiting_input / waiting_external / blocked
-   *    → 这条消息就是那个「用户动作」，任务恢复；
-   *  - 任务在 running → 这条消息是补充/纠正，并入约束。
-   *
-   *  【为什么不做「这是不是无关新目标」的语义分类】那需要模型判断，代价是一次
-   *  额外的往返，而且判错的后果不对称：把无关目标误并进当前任务，用户会看到
-   *  自己的话被当成补充说明；反过来把补充说明误判成新任务，则会产生两个抢同一
-   *  个工作区的任务（规格 §18.9 禁止的情况）。所以默认并入，并由约束文本明确
-   *  标注「这是用户在你执行期间补充的」，让模型自己决定是否改变方向。 */
-  private async resolveTaskForPrompt(
-    session: SessionInfo,
-    input: PromptInput,
-    userMessageId: string,
-  ): Promise<TaskResolution | null> {
-    const store = this.deps.store.task;
-    if (!store) return null;
-    const requestId = input.requestId!;
-
-    // 幂等：同一 requestId 重复提交返回同一任务，不创建第二个（§13.1 / §17.1.11）
-    // 重放时 disposition 描述的是「这条消息与任务的关系」，那是稳定的：
-    // 一条消息一旦开启过某个任务，它永远是那个任务的开启者。
-    const prior = await store.findTaskByRequestId(session.id, requestId);
-    if (prior) return { task: prior, disposition: "task_started", startedTask: false, previous: null };
-
-    const active = await store.getActiveTask(session.id);
-    if (active) {
-      const resuming = isWaitingStatus(active.status);
-      const text = input.text.trim();
-      const constraints = text ? [...active.constraints, text].slice(-8) : active.constraints;
-      const task = await this.casTask(active, {
-        constraints,
-        // 恢复：把任务放回可被认领的状态，drain 会接着推进它
-        ...(resuming ? { status: "queued" as const } : {}),
-        ...(resuming ? { blocker: undefined } : {}),
-        ...(resuming ? RESET_GUARDS_ON_RESUME : {}),
-      });
-      return { task, disposition: resuming ? "task_resumed" : "task_steered", startedTask: false, previous: active };
-    }
-
-    const goal = input.text.trim().slice(0, 500) || "（未命名任务）";
-    const task = await store.createTask({
-      sessionId: session.id,
-      rootRequestId: requestId,
-      rootUserMessageId: userMessageId,
-      goal,
-    });
-    return { task, disposition: "task_started", startedTask: true, previous: null };
-  }
-
-  /** 提交被拒时把任务改回这一步之前的样子（见 `prompt` 里的调用点）。
-   *
-   *  新建的任务**不回滚**：它是这个 requestId 的幂等锚点，删掉会让「同一 requestId
-   *  重试」失去依据。留着它没有代价——下一次同 requestId 的提交会命中
-   *  `findTaskByRequestId` 拿回同一个任务，别的消息则会被 `getActiveTask` 收编成
-   *  steering。 */
-  private async rollbackTaskResolution(resolution: TaskResolution | null): Promise<void> {
-    if (!resolution?.previous) return;
-    const { previous, task } = resolution;
-    await this.casTask(task, {
-      status: previous.status,
-      constraints: previous.constraints,
-      // 计数也要一起还原：恢复路径把它们清零了，而这次提交并没有发生。
-      noProgressCount: previous.noProgressCount,
-      attemptCount: previous.attemptCount,
-      activeMs: previous.activeMs ?? 0,
-      // 显式区分「清空 blocker」与「保持原样」：undefined 是清除指令
-      ...(previous.blocker ? { blocker: previous.blocker } : { blocker: undefined }),
-    }).catch(() => undefined);
-  }
-
-  async prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
-    input = { ...input, attachments: validateAttachments(input.attachments), attachmentRefs: validateAttachmentRefs(input.attachmentRefs) };
-    const session = await this.deps.store.getSession(sessionId);
-    if (!session) throw new Error("SESSION_NOT_FOUND");
-
-    if (this.deps.store.workflow) {
-      input = { ...input, requestId: input.requestId ?? randomUUID(), model: input.model ?? session.model };
-      const projector = new PartProjector({ sessionId, agent: input.agent ?? session.agent, model: input.model! });
-      const parts: Part[] = [];
-      const message = projector.onUserPrompt(event => {
-        if (event.type === "message.part.updated") parts.push(event.data.part);
-      }, input.text,input.images,input.skill,input.references,input.attachments,input.attachmentRefs);
-      // 先建消息再建任务：TaskRecord.rootUserMessageId 需要真实的消息 id，
-      // 事后回填会多一次 CAS，也让「任务与首条消息同生」这条不变量出现空窗。
-      const resolution = await this.resolveTaskForPrompt(session, input, message.id);
-      if (resolution) input = { ...input, taskId: resolution.task.id };
-      let accepted: Awaited<ReturnType<typeof this.deps.store.workflow.acceptPrompt>>;
-      try {
-        accepted = await this.deps.store.workflow.acceptPrompt(sessionId,input,{ message,parts });
-      } catch (error) {
-        // 提交被拒（最常见的是 RECOVERY_REQUIRED）。必须把任务改回原样：
-        // resolveTaskForPrompt 可能已经清掉 blocker、把状态放回 queued，而这次
-        // prompt 根本没被接受——没被接受就没有任何 run 会去推进它，任务会停在
-        // queued 上永远等不到，而用户看到的只是一个 409。
-        await this.rollbackTaskResolution(resolution);
-        throw error;
-      }
-      for (const event of accepted.events) notifyEventLogListeners(event);
-      if (resolution?.startedTask) {
-        const task = resolution.task;
-        await this.publish(
-          { type: "task.started", data: { taskId: task.id, revision: task.revision, goal: task.goal, steps: [], acceptanceCriteria: task.acceptanceCriteria.map((criterion) => ({ id: criterion.id, description: criterion.description, required: criterion.required, status: criterion.status })) } },
-          sessionId,
-        );
-      }
-      if (accepted.events.length) this.drain(sessionId);
-      return {
-        ...accepted.receipt,
-        ...(resolution ? { disposition: resolution.disposition, taskId: resolution.task.id } : {}),
-      };
-    }
-
-    if (activeRuns.has(sessionId)) {
-      await this.deps.store.enqueuePrompt(sessionId, {
-        text: input.text,
-        attachments: input.attachments,
-        // 排队消息必须记住附件引用：真正执行时要按 id 重新确认附件仍存在且可读（规格 2 §11）
-        ...(input.attachmentRefs?.length ? { attachmentRefs: [...input.attachmentRefs] } : {}),
-        images: input.images,
-        model: input.model,
-        ...(input.agent ? { agent: input.agent } : {}),
-        ...(input.effort ? { effort: input.effort } : {}),
-        ...(input.skill ? { skill: input.skill } : {}),
-        ...(input.references?.length ? { references: [...input.references] } : {}),
-        enqueuedAt: new Date().toISOString(),
-      });
-      return { queued: true };
-    }
-
-    void this.runLoop(session, input);
-    return { queued: false };
+  /** 非 async 直通：async 方法 `return promise` 会多一拍 microtask 才让调用方
+   *  的 await 恢复，实测足以翻转 prompt 提交与 drain 链之间的交错时序（FIFO
+   *  用例的读偏斜）。委托层一律直通，不包 async。 */
+  prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
+    return this.commandService.submit(sessionId, input);
   }
 
   async replyPermission(sessionId: string, requestId: string, reply: Reply, feedback?: string): Promise<boolean> {
@@ -643,8 +391,7 @@ export class SessionRunner {
     // 任务会被放回 queued 却没有任何东西去推进它。
     await this.deps.store.workflow?.clearRecoveryRequired(sessionId).catch(() => 0);
     await this.casTask(task, { status: "queued", blocker: undefined, ...RESET_GUARDS_ON_RESUME });
-    this.resumeRequests.add(sessionId);
-    this.drain(sessionId);
+    this.scheduler.requestResume(sessionId);
     return true;
   }
 
@@ -661,24 +408,8 @@ export class SessionRunner {
     return removedFromEngine || removedFromStore;
   }
 
-  async abort(sessionId: string): Promise<void> {
-    this.stopRequested.add(sessionId);
-    await this.deps.store.clearQueuedPrompts(sessionId);
-    const active = activeRuns.get(sessionId);
-    // PI's abort signal does not cancel a PermissionEngine.ask() promise.
-    // Rejecting pending approvals first releases beforeToolCall so the run can
-    // publish its terminal state and a continuation cannot overlap it.
-    if (active) {
-      active.engine.dispose("任务已停止，未处理的授权请求已取消");
-      active.abort();
-      await active.done;
-    }
-    await this.draining.get(sessionId);
-    await this.cancelResidualTask(sessionId);
-    // 停止会作废还没被认领的放行请求：留着它，驱动链下一次启动就会去推进一个
-    // 用户已经改主意（点了停止）的任务。
-    this.resumeRequests.delete(sessionId);
-    this.stopRequested.delete(sessionId);
+  abort(sessionId: string): Promise<void> {
+    return this.scheduler.abort(sessionId);
   }
 
   /** 停止时把任务层也收干净（规格 3 §11「用户停止任务」）。
@@ -974,9 +705,9 @@ export class SessionRunner {
     };
     let resolveDone!: () => void;
     const done = new Promise<void>((resolve) => { resolveDone = resolve; });
-    activeRuns.set(session.id, { agent, engine, settled, abort, done });
-    if (this.stopRequested.has(session.id)) abort();
-    await this.stampLease(session.id);
+    activeRuns.register(session.id, { agent, engine, settled, abort, done });
+    if (this.scheduler.isStopRequested(session.id)) abort();
+    await this.scheduler.stampLease(session.id);
 
     // 循环防护在任务层跨 Attempt 复用（规格 3 §16 阶段 D）：一条任务会自己续跑
     // 多轮，而「同一个工具一直以同样的方式失败」是不会因为换了一轮就消失的事实。
@@ -1273,7 +1004,7 @@ export class SessionRunner {
       activeRuns.delete(session.id);
       engine.dispose();
       // Workflow settlement clears its lease atomically with the terminal run state.
-      if (!acceptedUserId) await this.clearLease(session.id);
+      if (!acceptedUserId) await this.scheduler.clearLease(session.id);
       const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
       attemptFinalText = [...newMessages].reverse().find((message) => message.role === "assistant")?.text ?? "";
       // 任务终态小结（N5）：终态 status 已发布后补一条 session.summary，
@@ -2060,7 +1791,7 @@ export function isSessionAwaitingPermission(sessionId: string): boolean {
 /** 当前所有 running 会话 id（Electron 优雅退出等收尾场景枚举用，P2）。
  *  activeRuns 是模块级 globalThis 单例，跨项目/跨 runtime 共享。 */
 export function listActiveSessions(): string[] {
-  return [...activeRuns.keys()];
+  return activeRuns.sessionIds();
 }
 
 // The package runner is storage-agnostic: stores (Mongo/JSONL), event logs,
