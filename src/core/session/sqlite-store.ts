@@ -369,6 +369,14 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
       async workflowRuns(sessionId) {
         return (db.prepare("SELECT payload,receipt,status,revision FROM workflow_runs WHERE session_id=? ORDER BY ordinal").all(sessionId) as { payload: string; receipt: string; status: WorkflowRun["status"]; revision: number }[]).map(row => ({ input: JSON.parse(row.payload), receipt: JSON.parse(row.receipt), status: row.status, revision: row.revision }));
       },
+      async rebuildSnapshot(sessionId) {
+        return transaction(() => {
+          const entries = readMessages(sessionId);
+          const rows = db.prepare("SELECT receipt,status FROM workflow_runs WHERE session_id=?").all(sessionId) as { receipt: string; status: WorkflowRun["status"] }[];
+          const excludedUserIds = new Set(rows.filter((row) => row.status !== "completed" && row.status !== "failed").map((row) => (JSON.parse(row.receipt) as PromptReceipt).userMessageId));
+          return { entries, excludedUserIds };
+        });
+      },
       async findPrompt(sessionId,requestId) {
         const row = db.prepare("SELECT payload,receipt,status,revision FROM workflow_runs WHERE session_id=? AND request_id=?").get(sessionId,requestId) as { payload: string; receipt: string; status: WorkflowRun["status"]; revision: number } | undefined;
         return row ? { input: JSON.parse(row.payload),receipt: JSON.parse(row.receipt),status: row.status,revision: row.revision } : null;

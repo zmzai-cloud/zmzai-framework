@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MessageInfo, ModelRef, Part, SelectedSkill, ThinkingEffort } from "./types.js";
 import type { PersistedFrameworkEvent } from "../events/manifest.js";
+import type { MessageWithParts } from "./types.js";
 
 /** 一条 prompt 提交的输入（W6 S2 自 runner.ts 原样搬移——它本来就是提交协议，
  *  放在 workflow.ts 也让命令层不必再 import runner）。 */
@@ -100,6 +101,9 @@ export interface WorkflowStore {
   clearRecoveryRequired(sessionId: string): Promise<number>;
   workflowRuns(sessionId: string): Promise<WorkflowRun[]>;
   findPrompt(sessionId: string, requestId: string): Promise<WorkflowRun | null>;
+  /** 重建输入的一致性快照（W7-S6 修 TOCTOU）：排除集与消息条目同拍读取。
+   *  sqlite 实现走单 transaction；不提供的实现由 ContextBuilder 回落两拍。 */
+  rebuildSnapshot?(sessionId: string): Promise<{ entries: MessageWithParts[]; excludedUserIds: Set<string> }>;
 }
 
 export function promptHash(payload: unknown): string {

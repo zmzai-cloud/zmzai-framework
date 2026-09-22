@@ -16,6 +16,7 @@ import { confineWorkspaceFiles, writePathGuardRules } from "../permission/write-
 import { defaultActiveRunRegistry } from "./active-run-registry.js";
 import { CommandService } from "./command-service.js";
 import { TaskLifecycle, RESET_GUARDS_ON_RESUME, isRetryableError, type RunOutcome } from "./task-lifecycle.js";
+import { ContextBuilder } from "./context-builder.js";
 export { isRetryableError } from "./task-lifecycle.js";
 import { RunScheduler } from "./run-scheduler.js";
 import { PartProjector, serializeEmit } from "./pi-bridge.js";
@@ -192,12 +193,21 @@ const RESUME_DRIVE_TEXT =
 export class SessionRunner {
   private readonly scheduler: RunScheduler;
   private readonly lifecycle: TaskLifecycle;
+  private readonly contextBuilder: ContextBuilder;
   private readonly commandService: CommandService;
 
   constructor(private readonly deps: RunnerDeps) {
     // 调度（drain 驱动链 / 放行登记 / 停止协调 / 租约）在 RunScheduler（W6 S3），
     // 提交链（投影 → 任务归属 → acceptPrompt → task.started）在 CommandService
     // （W6 S4）。runner 经回调提供执行语义；W7 换 AttemptExecutor 时改这里。
+    this.contextBuilder = new ContextBuilder({
+      store: deps.store,
+      ...(deps.attachments ? { attachments: deps.attachments } : {}),
+      ...(deps.compaction ? { compaction: deps.compaction } : {}),
+      modelFor: (ref) => deps.modelFor(ref),
+      streamFnFor: (session) => deps.streamFnFor(session),
+      ...(deps.memoryContextFor ? { memoryContextFor: (session, text) => deps.memoryContextFor!(session, text) } : {}),
+    });
     this.lifecycle = new TaskLifecycle({
       store: deps.store,
       publish: (event, sessionId) => this.publish(event, sessionId),
@@ -370,68 +380,13 @@ export class SessionRunner {
     }
     const session = await this.deps.store.getSession(sessionId);
     if (!session) return { ok: false, reason: "session-not-found" };
-    const transform = await this.buildCompaction(session, (event) => this.publish(event, session.id), true);
+    const transform = await this.contextBuilder.buildCompaction(session, (event) => this.publish(event, session.id), true);
     if (!transform) return { ok: false, reason: "compaction-disabled" };
-    const workflowRuns = this.deps.store.workflow ? await this.deps.store.workflow.workflowRuns(sessionId) : [];
-    const excludedUserIds = this.deps.store.workflow
-      ? new Set(workflowRuns.filter((run) => run.status !== "completed" && run.status !== "failed").map((run) => run.receipt.userMessageId))
-      : undefined;
-    const messages = await this.rebuildMessages(sessionId, excludedUserIds);
+    const { entries, excludedUserIds } = await this.contextBuilder.historySnapshot(sessionId);
+    const messages = await this.contextBuilder.rebuildMessages(sessionId, entries, excludedUserIds);
     if (messages.length <= 1) return { ok: false, reason: "nothing-to-compact" };
     await transform(messages);
     return { ok: true };
-  }
-
-  /** 当前会话的压缩阈值：优先取模型目录给的真实上下文窗口，回落 runtime 级
-   *  全局配置。旧行为恒取 deps.compaction.contextWindow；模型目录未覆盖该
-   *  modelId 时 model.contextWindow 即等于该全局值，行为不变。
-   *  modelFor 抛错（宿主 provider 不认识该 ref）时同样回落，绝不阻断压缩。 */
-  private contextWindowFor(session: SessionInfo): number {
-    const fallback = this.deps.compaction?.contextWindow ?? 0;
-    try {
-      const model = this.deps.modelFor(session.model) as { contextWindow?: unknown } | null | undefined;
-      const win = model?.contextWindow;
-      return typeof win === "number" && win > 0 ? win : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
-  /** Builds the compaction transformContext (spec §8.3) when the runner has a
-   *  summary model configured. Emits a `compaction` part on the latest
-   *  assistant message so the boundary shows in the transcript. force=true
-   *  skips the threshold/滞回 early-outs (手动「压缩当前会话」). */
-  private async buildCompaction(session: SessionInfo, emit: (event: FrameworkEvent) => void, force = false) {
-    if (!this.deps.compaction?.enabled || !this.deps.compaction.summaryModel) return undefined;
-    const { buildCompactionTransform, streamOneText } = await import("./compaction.js");
-    return buildCompactionTransform({
-      enabled: true,
-      contextWindow: this.contextWindowFor(session),
-      summaryModel: this.deps.compaction.summaryModel,
-      ...(force ? { force: true } : {}),
-      streamOne: async (model, messages) => {
-        const streamFn = this.deps.streamFnFor(session);
-        return streamOneText(
-          async (m, ctx) => {
-            const stream = await streamFn(m, ctx as never);
-            return stream;
-          },
-          model,
-          "你是上下文压缩助手。只输出结构化摘要，不续写对话。",
-          messages,
-        );
-      },
-      onCompacted: (summary) => {
-        void (async () => {
-          const entries = await this.deps.store.getMessages(session.id);
-          const lastAssistant = [...entries].reverse().find((entry) => entry.info.role === "assistant");
-          if (!lastAssistant) return;
-          const part: Part = { id: newPartId(), sessionId: session.id, messageId: lastAssistant.info.id, type: "compaction", summary };
-          await this.deps.store.appendPart(part).catch(() => undefined);
-          emit({ type: "message.part.updated", data: { part } });
-        })();
-      },
-    });
   }
 
   /** Layers the session's workspace custom agents (`.zmzai/agents/*.md`) on top
@@ -586,26 +541,8 @@ export class SessionRunner {
     /** 本轮模型用 `task_deliver` 提交的交付声明（规格 3 §9 条件 6）。见 `RunOutcome.delivery`。 */
     let delivery: TaskDeliverInput | null = null;
 
-    const compactionTransform = await this.buildCompaction(session, emit);
-    // 记忆召回（spec §记忆）：单点注入 runLoop，天然覆盖正常 prompt/排队出
-    // 队/automation/子代理触发四条路径。只进内存不落 store；抛错静默降级。
-    const workflowRuns = this.deps.store.workflow ? await this.deps.store.workflow.workflowRuns(session.id) : [];
-    const excludedUserIds = this.deps.store.workflow
-      ? new Set(workflowRuns.filter((run) => run.status !== "completed" && run.status !== "failed").map((run) => run.receipt.userMessageId))
-      : undefined;
-    const history = await this.rebuildMessages(session.id, excludedUserIds);
-    if (this.deps.memoryContextFor) {
-      try {
-        const section = await this.deps.memoryContextFor(session, input.text);
-        if (section) {
-          history.unshift({ role: "user", content: [{ type: "text", text: section }], timestamp: Date.now() } as AgentMessage);
-        }
-      } catch {
-        // 召回失败不阻塞 run
-      }
-    }
-    // baseline：本次 run 新增消息从这之后算（供 onRunEnd 提取 retain）
-    const baseline = history.length;
+    // 上下文组装唯一入口（W7-S6）：压缩 transform、同拍快照重建、记忆召回。
+    const { compactionTransform, history, baseline } = await this.contextBuilder.buildAttemptContext(session, input, emit);
     const agent = new Agent({
       initialState: {
         systemPrompt: [
@@ -1208,59 +1145,6 @@ export class SessionRunner {
       current = next;
     }
     return depth;
-  }
-  private async rebuildMessages(sessionId: string, excludedUserIds?: Set<string>): Promise<AgentMessage[]> {
-    const entries = await this.deps.store.getMessages(sessionId);
-    const messages: AgentMessage[] = [];
-    for (const { info, parts } of entries) {
-      if (info.role === "user") {
-        if (excludedUserIds?.has(info.id)) continue;
-        const text = parts
-          .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-        const fileParts = parts.filter((p): p is Extract<Part, { type: "file" }> => p.type === "file");
-        // 旧链路历史：data URL 内联部分保持原样重建，否则升级后老会话会「丢附件」。
-        const legacy = fileParts.flatMap((p) => {
-          const url = p.url;
-          if (typeof url !== "string" || !url.startsWith("data:")) return [];
-          return [{ name: p.filename, mediaType: p.mime, data: url, size: Buffer.from(url.slice(url.indexOf(",") + 1), "base64").length }];
-        });
-        // 新链路：按描述符重建，正文经 provider 读取（图片→视觉输入、小文本→内联、其余→清单）。
-        // 因此重放历史**不会**把所有附件正文反复塞进后续每个 turn（规格 2 §11）。
-        // 用 AttachmentContentRef 而不是 InputAttachmentRef：part 里没有 sha256，
-        // 硬编一个假摘要会违反该类型的不变量。
-        const refs: AttachmentContentRef[] = fileParts.flatMap((p) => p.attachmentId
-          ? [{
-            id: p.attachmentId,
-            name: p.filename,
-            mediaType: p.mime,
-            ...(typeof p.size === "number" ? { size: p.size } : {}),
-            kind: p.kind ?? "text",
-          }]
-          : []);
-        const refParts = await attachmentRefContent(this.deps.attachments, refs, { sessionId });
-        messages.push({ role: "user", content: [{ type: "text", text }, ...attachmentContent(legacy), ...refParts], timestamp: Date.parse(info.time.created) || Date.now() });
-      } else {
-        const text = parts
-          .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-        if (!text) continue;
-        messages.push({
-          role: "assistant",
-          content: [{ type: "text", text }],
-          api: "openai-completions",
-          provider: info.model.providerId,
-          model: info.model.modelId,
-          usage: { input: info.tokens?.input ?? 0, output: info.tokens?.output ?? 0, cacheRead: info.tokens?.cacheRead ?? 0, cacheWrite: info.tokens?.cacheWrite ?? 0, totalTokens: (info.tokens?.input ?? 0) + (info.tokens?.output ?? 0) + (info.tokens?.cacheRead ?? 0) + (info.tokens?.cacheWrite ?? 0) },
-          stopReason: info.error ? "error" : "stop",
-          ...(info.error ? { errorMessage: info.error.message } : {}),
-          timestamp: Date.parse(info.time.created) || Date.now(),
-        } as AgentMessage);
-      }
-    }
-    return messages;
   }
 }
 

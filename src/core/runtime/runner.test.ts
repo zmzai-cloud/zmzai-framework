@@ -7,6 +7,7 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-wo
 
 import { AgentRegistry } from "../agent/registry.js";
 import { SessionRunner, createFrameworkSession, isRetryableError, isSessionActive, isSessionAwaitingPermission, type RunnerDeps } from "../runtime/runner.js";
+import { ContextBuilder } from "./context-builder.js";
 import type { SessionStore } from "../session/store.js";
 import type { MessageInfo, MessageWithParts, Part, SessionInfo } from "../session/types.js";
 import type { ToolContext, WorkspaceFiles } from "../tools/context.js";
@@ -833,47 +834,39 @@ describe("SessionRunner", () => {
   describe("contextWindowFor（压缩阈值来源）", () => {
     const session = { id: "ses_1", model: { providerId: "faux", modelId: "long-ctx" } } as never;
 
-    function makeRunner(modelFor: RunnerDeps["modelFor"], compactionWindow = 128_000): SessionRunner {
-      const deps: RunnerDeps = {
+    // W7-S6：contextWindowFor 已随压缩构建迁入 ContextBuilder，测试直测新家。
+    function makeBuilder(modelFor: RunnerDeps["modelFor"], compactionWindow = 128_000): ContextBuilder {
+      return new ContextBuilder({
         store: memoryStore(),
-        registry: new AgentRegistry(),
+        modelFor,
         streamFnFor: () => {
           throw new Error("no stream");
         },
-        modelFor,
-        eventLog: createMemoryEventLog(),
-        workspaceFor: () => fakeWorkspace(),
-        subagentDepth: 1,
         compaction: { enabled: true, contextWindow: compactionWindow, summaryModel: null },
-      };
-      return new SessionRunner(deps);
+      });
     }
 
-    const windowFor = (runner: SessionRunner) =>
-      (runner as unknown as { contextWindowFor: (s: never) => number }).contextWindowFor(session);
+    const windowFor = (builder: ContextBuilder) =>
+      (builder as unknown as { contextWindowFor: (s: never) => number }).contextWindowFor(session);
 
     it("优先取模型目录给的真实窗口，而非 runtime 级全局配置", () => {
       // 断层修复点：长窗口模型不再被 128k 提前压缩
-      const runner = makeRunner(() => ({ contextWindow: 1_000_000 }) as never);
-      expect(windowFor(runner)).toBe(1_000_000);
+      expect(windowFor(makeBuilder(() => ({ contextWindow: 1_000_000 }) as never))).toBe(1_000_000);
     });
 
     it("模型未暴露窗口时回落全局配置（旧行为）", () => {
-      const runner = makeRunner(() => ({}) as never);
-      expect(windowFor(runner)).toBe(128_000);
+      expect(windowFor(makeBuilder(() => ({}) as never))).toBe(128_000);
     });
 
     it("modelFor 抛错时不阻断压缩，回落全局配置", () => {
-      const runner = makeRunner(() => {
+      expect(windowFor(makeBuilder(() => {
         throw new Error("unknown provider");
-      });
-      expect(windowFor(runner)).toBe(128_000);
+      }))).toBe(128_000);
     });
 
     it("窗口非正数视为无效，回落全局配置", () => {
       // 0 会让压缩每轮都触发，比用保守默认值严重
-      const runner = makeRunner(() => ({ contextWindow: 0 }) as never);
-      expect(windowFor(runner)).toBe(128_000);
+      expect(windowFor(makeBuilder(() => ({ contextWindow: 0 }) as never))).toBe(128_000);
     });
   });
 });
