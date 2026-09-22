@@ -9,6 +9,7 @@ import type { ToolDef } from "../tools/def.js";
  *  to the parent model; a subtask part is recorded in the parent transcript. */
 export const taskTool: ToolDef = {
   id: "task",
+  contract: { effect: ["workspace"], retrySafety: "never" },
   label: "派生子代理",
   description:
     "把一个独立的子任务交给子代理在新会话中完成。用于并行探索（explore）或隔离的通用子任务（general）。子代理有自己的上下文；你只收到它的最终结论。available subagents 见系统提示或 registry。",

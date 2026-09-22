@@ -206,6 +206,7 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
 
   const startTool: ToolDef = {
     id: "terminal_start",
+    contract: { effect: ["workspace", "network", "system"], retrySafety: "never" },
     label: "启动交互式终端",
     description:
       "在本机启动一个长驻/交互式命令（dev server、watch、交互安装器等），立即返回 sessionId 不阻塞对话。输出用 terminal_read 增量读取；交互应答用 terminal_write；结束用 terminal_kill。",
@@ -244,6 +245,7 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
 
   const readTool: ToolDef = {
     id: "terminal_read",
+    contract: { effect: [], retrySafety: "read_only" },
     label: "读取终端输出",
     description:
       "增量读取指定终端自 since 字节游标以来的输出；返回新的游标（下次传回即可续读）。输出的末尾包含会话状态；进程已退出时会注明退出码，无需继续轮询。",
@@ -270,6 +272,7 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
 
   const writeTool: ToolDef = {
     id: "terminal_write",
+    contract: { effect: ["workspace", "network", "system"], retrySafety: "never" },
     label: "向终端写入",
     description: "向运行中的终端发送输入（如回答 y/n 提示）。默认自动补换行；newline=false 可发送裸按键序列（Ctrl+C 用 \"\\u0003\"）。",
     parameters: z.object({
@@ -294,6 +297,7 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
 
   const killTool: ToolDef = {
     id: "terminal_kill",
+    contract: { effect: ["system"], retrySafety: "never" },
     label: "终止终端会话",
     description: "结束一个运行中的终端会话（先 SIGTERM，必要时 SIGKILL 兜底）。已退出的会话会被清理回收。",
     parameters: z.object({ sessionId: z.string().min(1).max(32) }),
@@ -320,6 +324,7 @@ export function createTerminalTools(manager: TerminalManager, opts: { workspaceR
 
   const listTool: ToolDef = {
     id: "terminal_list",
+    contract: { effect: [], retrySafety: "read_only" },
     label: "列出终端会话",
     description: "列出全部终端会话及其状态（含 id/name/backend/pid），用于找回上下文丢失的会话。",
     parameters: z.object({}),

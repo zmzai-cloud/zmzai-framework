@@ -71,6 +71,7 @@ export type TaskDeliverInput = z.infer<typeof taskDeliverInputSchema>;
 
 export const taskDeliverTool: ToolDef<typeof taskDeliverInputSchema> = {
   id: TASK_DELIVER_TOOL_ID,
+  contract: { effect: [], retrySafety: "read_only" },
   label: "提交交付",
   description:
     "声明这个任务已经完成，并按四个问题提交交付信息：做成了什么、改了哪些主要内容、怎么验证的、还有哪些没做完。**任务只有在你调用它之后才会结束**——结束本轮、给出一段收尾文字、把 todo 标记完成都不能交付。调用时机：验收条件真的都满足了，而且你能说清是怎么验证的。如果你的答复还没达到目标，不要调用它，继续做事或用 task_block 说明卡在哪里。",

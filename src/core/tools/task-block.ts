@@ -57,6 +57,7 @@ const KIND_HINT: Record<TaskBlockInput["kind"], string> = {
 
 export const taskBlockTool: ToolDef<typeof taskBlockInputSchema> = {
   id: TASK_BLOCK_TOOL_ID,
+  contract: { effect: [], retrySafety: "read_only" },
   label: "声明任务受阻",
   description:
     "声明这个任务被卡住了，必须由用户介入才能继续。仅在以下情况调用：① 缺少的信息确实无法从工作区、工具或已有上下文中获得；② 有两个会产生明显不同且不可逆结果的方案，必须由用户选；③ 需要用户完成外部登录、验证码或付款。不要为了让用户确认计划而调用——计划默认直接执行。调用后本轮就结束，请用一句话说明卡在哪里以及需要用户做什么。",

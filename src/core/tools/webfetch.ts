@@ -67,6 +67,7 @@ const FETCH_TIMEOUT_MS = 15_000;
  *  大小/超时上限。 */
 export const webfetchTool: ToolDef = {
   id: "webfetch",
+  contract: { effect: ["network"], retrySafety: "read_only" },
   label: "抓取网页",
   description:
     "（experimental）抓取一个公网网页并返回文本内容，供分析文档、查阅资料使用。只允许 http(s) 公网地址，私网/本机地址会被拒绝。响应超过 256KB 会被截断。",

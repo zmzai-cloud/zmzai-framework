@@ -109,6 +109,7 @@ export function createWebSearchTool(opts: WebSearchOptions = {}): ToolDef {
 
   return {
     id: "websearch",
+    contract: { effect: ["network"], retrySafety: "read_only" },
     label: "联网搜索",
     description:
       "搜索互联网并返回标题+链接+摘要列表（多数结果无需再抓取即可判断相关性；需要全文时对结果 URL 用 webfetch）。查询用与目标资料相同的语言效果最好。",

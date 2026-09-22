@@ -33,6 +33,7 @@ function hasFixedOverflowRisk(styles: string): boolean {
 
 export const qaCheckTool: ToolDef = {
   id: "qa-check",
+  contract: { effect: [], retrySafety: "read_only" },
   label: "质量检查",
   description: "检查当前 Workspace 中的 web_app：HTML 是否可加载、核心内容是否存在、桌面和移动视口是否有明显布局风险。返回稳定的 v1 JSON；失败时请先修复再继续交付。",
   parameters: qaCheckInputSchema,

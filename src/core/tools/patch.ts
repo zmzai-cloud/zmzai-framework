@@ -245,6 +245,7 @@ function affectedPaths(patchText: string): string[] {
 
 export const applyPatchTool: ToolDef = {
   id: "apply_patch",
+  contract: { effect: ["workspace"], retrySafety: "never" },
   label: "应用补丁",
   description:
     "把 unified diff 补丁应用到 Workspace：一个补丁可改多个文件/多处 hunk，支持新建文件（--- /dev/null）；逐块上下文匹配允许 ±300 行漂移。任一文件校验失败则整体不变更。大范围结构化修改首选本工具。",

@@ -9,6 +9,7 @@ import type { ToolDef } from "./def.js";
 export function createRepoMapTool(opts: { workspaceRoot: () => string }): ToolDef {
   return {
     id: "repo_map",
+    contract: { effect: [], retrySafety: "read_only", concurrency: { mode: "parallel_read" } },
     label: "仓库地图",
     description:
       "获取当前 Workspace 的代码结构导航图：按重要性排序的文件 + 每文件的定义符号（函数/类/接口，带行号）。在开始大范围探索前先调用它，可以少走 glob/grep 弯路；用 focus 传入任务描述或关键符号名，地图会优先显示与任务最相关的文件。返回文本很紧凑（默认 ~1k tokens）。",

@@ -75,6 +75,7 @@ export function createGitTools(options: GitToolsOptions): ToolDef[] {
 
   const gitStatusTool: ToolDef = {
     id: "git_status",
+    contract: { effect: ["git"], retrySafety: "read_only" },
     label: "查看 Git 状态",
     description: "查看当前仓库的分支、已暂存/未暂存/未跟踪文件清单（结构化解析 porcelain 输出）。只读操作。",
     parameters: z.object({}),
@@ -118,6 +119,7 @@ export function createGitTools(options: GitToolsOptions): ToolDef[] {
 
   const gitDiffTool: ToolDef = {
     id: "git_diff",
+    contract: { effect: ["git"], retrySafety: "read_only" },
     label: "查看 Git 差异",
     description: "查看工作区相对 HEAD 的 diff（--no-color 统一格式），可选只看单个文件或仅看已暂存变更。开头附每行增删统计。只读操作。",
     parameters: z.object({
@@ -150,6 +152,7 @@ export function createGitTools(options: GitToolsOptions): ToolDef[] {
 
   const gitLogTool: ToolDef = {
     id: "git_log",
+    contract: { effect: ["git"], retrySafety: "read_only" },
     label: "查看提交历史",
     description: "列出最近 N 条提交（hash、作者、时间、标题）。只读操作。",
     parameters: z.object({ limit: z.number().int().min(1).max(100).optional() }),
@@ -175,6 +178,7 @@ export function createGitTools(options: GitToolsOptions): ToolDef[] {
 
   const gitCommitTool: ToolDef = {
     id: "git_commit",
+    contract: { effect: ["git", "workspace"], retrySafety: "never" },
     label: "创建 Git 提交",
     description:
       "把指定文件（paths）或全部变更（addAll: true）暂存并创建提交；都不传则直接提交当前已暂存的内容。message 必填。提交真实发生在仓库中。",
