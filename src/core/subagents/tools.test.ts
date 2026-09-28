@@ -6,6 +6,7 @@ import { createSqliteSessionStore } from "../session/sqlite-store.js";
 import { AgentRegistry } from "../agent/registry.js";
 import { SubagentCoordinator, type SubagentCoordinatorDeps } from "./coordinator.js";
 import { agentListTool, agentSendTool, agentSpawnTool, agentWaitTool, agentCancelTool, makeLegacyTaskTool, type SubagentToolContext } from "./tools.js";
+import type { ToolContext } from "../tools/context.js";
 import { isSubagentTerminal } from "./types.js";
 
 /** M3-S20：五工具面——A16（read_only spawn 生效）、A14（spawn_request_id
@@ -25,7 +26,7 @@ async function boot(runMs = 80) {
     abortChild: async () => {},
   };
   const coordinator = new SubagentCoordinator(deps);
-  const ctx = { sessionId: "ses_parent", subagents: { coordinator, rootTaskId: "task_root", parentTaskId: "task_root" } } as unknown as SubagentToolContext & { sessionId: string };
+  const ctx = { sessionId: "ses_parent", subagents: { coordinator, rootTaskId: "task_root", parentTaskId: "task_root" } } as unknown as ToolContext & SubagentToolContext;
   return { store, coordinator, ctx, launches, dataDir };
 }
 

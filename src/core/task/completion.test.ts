@@ -72,6 +72,7 @@ function stateOf(overrides: Partial<CompletionRuntimeState> = {}): CompletionRun
     choiceRequired: null,
     unresolvedToolErrors: [],
     finalTextPresent: true,
+    subagentPending: null,
     cancelled: false,
     ...overrides,
   };
