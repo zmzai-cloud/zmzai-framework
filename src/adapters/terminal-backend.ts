@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 
 import type { TerminalBackend } from "../core/tools/terminal.js";
@@ -35,8 +35,16 @@ function tryLoadNodePty(): NodePtyModule | null {
   try {
     // 变量名解析：框架不硬依赖 node-pty（可选原生依赖），缺失/ABI 不匹配时静默降级
     const specifier = ["node", "pty"].join("-");
-    ensureMacPtyHelperExecutable(specifier);
-    const mod = requireFromModuleContext(specifier) as NodePtyModule & { default?: NodePtyModule };
+    // 显式模块路径覆盖（Electron 打包宿主用）：bundle 进 asar 后本模块位置在
+    // 虚拟路径里，NODE_PATH 回退在 utilityProcess+asar 组合下不可依赖——宿主把
+    // node-pty 放在真实目录并注入本 env，直接锚定解析，零查找算法参与。
+    const explicitDir = process.env.ZMZAI_PTY_MODULE_PATH;
+    const loader = explicitDir
+      ? createRequire(join(explicitDir, "package.json"))
+      : requireFromModuleContext;
+    const mod = loader(specifier) as NodePtyModule & { default?: NodePtyModule };
+    if (explicitDir) ensureMacPtyHelperExecutableAt(explicitDir, specifier);
+    else ensureMacPtyHelperExecutable(specifier);
     return mod.default ?? mod;
   } catch {
     return null;
@@ -46,6 +54,19 @@ function tryLoadNodePty(): NodePtyModule | null {
 // 必须从 framework 自己解析：被 Next/Electron 宿主导入时，process.cwd() 指向
 // Lectern 项目，无法找到 framework 的 optionalDependencies（如 node-pty）。
 const requireFromModuleContext = createRequire(import.meta.url);
+
+/** 显式路径模式的 helper 执行位补齐（与 ensureMacPtyHelperExecutable 同逻辑，
+ *  锚点从 require.resolve 换成显式 node_modules 目录）。 */
+function ensureMacPtyHelperExecutableAt(nodeModulesDir: string, specifier: string): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const entry = createRequire(join(nodeModulesDir, "package.json")).resolve(specifier);
+    const helper = resolve(dirname(entry), "..", "prebuilds", `darwin-${process.arch}`, "spawn-helper");
+    if (existsSync(helper)) chmodSync(helper, 0o755);
+  } catch {
+    // 路径不匹配时由常规 spawn 探测安全降级。
+  }
+}
 
 /**
  * node-pty 1.1.0 的 darwin-arm64 预构建包偶尔丢失 spawn-helper 的执行位。
