@@ -34,7 +34,8 @@ function makeDeps(opts: { runMs?: number; states?: Map<string, "completed" | "fa
       running.delete(childId);
       const l = launches.find((x) => x.childId === childId)!;
       l.endedAt = Date.now();
-      return opts.states?.get(childId) ?? "completed";
+      const state = opts.states?.get(childId) ?? "completed";
+      return { state, summary: state === "completed" ? "子代理结论" : undefined };
     },
     abortChild: async () => {},
     limits: { perRoot: 3, global: 6 },

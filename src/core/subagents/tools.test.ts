@@ -25,7 +25,7 @@ async function boot(runMs = 80) {
     store,
     registry,
     createChildSession: async ({ parent: p, agentType, description }) => ({ id: `ses_c_${Math.random().toString(36).slice(2, 8)}`, parentId: p.id, userId: p.userId, workspaceId: p.workspaceId, agent: agentType, title: description } as never),
-    runChild: async (childId) => { launches.push(childId); await new Promise((r) => setTimeout(r, runMs)); return "completed"; },
+    runChild: async (childId) => { launches.push(childId); await new Promise((r) => setTimeout(r, runMs)); return { state: "completed", summary: "子代理结论" }; },
     abortChild: async () => {},
   };
   const coordinator = new SubagentCoordinator(deps);

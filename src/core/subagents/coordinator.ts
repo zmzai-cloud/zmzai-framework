@@ -4,7 +4,6 @@ import type { SessionInfo } from "../session/types.js";
 import type { SessionStore } from "../session/store.js";
 import { createFrameworkSession } from "../runtime/runner.js";
 import { writePathGuardRules } from "../permission/write-path.js";
-import type { WorkflowState } from "../session/workflow.js";
 import { isSubagentTerminal, newSubagentRecord, type SubagentRecord, type SubagentStore, type SubagentStatus } from "./types.js";
 
 /** SubagentCoordinator（spec §8.1/§8.2，M3-S18；T02 统一子创建入口）。
@@ -96,6 +95,86 @@ export function createDefaultChildSessionFactory(deps: {
   };
 }
 
+/** 子 run 的结构化结果（spec §4.1/T03：不能根据 Promise 正常返回推断成功）。
+ *  runChild 必须读取执行器的真实终态并携带证据；failed/cancelled/blocked 与
+ *  completed 一样是显式声明，缺省字段按「未知」处理而非「成功」。 */
+export type ChildRunOutcome = {
+  state: "completed" | "failed" | "cancelled" | "blocked" | "waiting_input" | "waiting_permission" | "waiting_external";
+  /** 子代理最终结论文本（completed 时给父展示/验收用）。 */
+  summary?: string;
+  /** 证据引用（工具产物/文件版本等，父验收核对用）。 */
+  evidenceRefs?: string[];
+  /** 副作用不确定（unsafe_replay 类）：只能进入 blocked，不得报 completed。 */
+  unknownSideEffect?: boolean;
+  /** failed/blocked 的原因说明。 */
+  errorMessage?: string;
+};
+
+/** 子代理运行许可（T03，spec §4.1 统一 AdmissionController）：Host 进程内
+ *  跨项目 Runtime 共享的计数面。每项目各建一个协调器会让「Host 总计 6」
+ *  变成「每项目 6」，全局上限必须由所有协调器共享的同一实例计数。 */
+export type SubagentAdmission = {
+  /** 原子申请一个运行槽（rootKey 维度施加 perRoot 上限）；超限返回 false。 */
+  tryAcquire(rootKey: string): boolean;
+  release(rootKey: string): void;
+  /** 释放时通知（跨协调器重试排队者：A 项目释放要能唤醒 B 项目的泵）。 */
+  onRelease(listener: () => void): void;
+  /** 诊断快照。 */
+  counts(): { global: number; perRoot: Record<string, number> };
+};
+
+/** 进程内 AdmissionController 参考实现（Host 直接复用或替换为持久实现）。 */
+export function createSubagentAdmission(limits: CoordinatorLimits): SubagentAdmission {
+  let global = 0;
+  const perRoot = new Map<string, number>();
+  const listeners = new Set<() => void>();
+  return {
+    tryAcquire(rootKey) {
+      if (global >= limits.global) return false;
+      if ((perRoot.get(rootKey) ?? 0) >= limits.perRoot) return false;
+      global += 1;
+      perRoot.set(rootKey, (perRoot.get(rootKey) ?? 0) + 1);
+      return true;
+    },
+    release(rootKey) {
+      if ((perRoot.get(rootKey) ?? 0) <= 0) return;
+      perRoot.set(rootKey, perRoot.get(rootKey)! - 1);
+      global = Math.max(0, global - 1);
+      for (const listener of listeners) listener();
+    },
+    onRelease(listener) {
+      listeners.add(listener);
+    },
+    counts() {
+      return { global, perRoot: Object.fromEntries(perRoot) };
+    },
+  };
+}
+
+/** runChild 结构化 outcome → 协调记录状态投影（T03，PC02）。
+ *  failed/cancelled/blocked/waiting_* 与 completed 一样进入记录——子失败不得
+ *  伪装完成；waiting_* 是非终态（出口互不替代，spec §8.2），终态才写 result。 */
+function projectChildRunOutcome(outcome: ChildRunOutcome): { status: SubagentStatus; result?: SubagentRecord["result"]; blockerReason?: string } {
+  const evidence = outcome.evidenceRefs?.length ? { evidenceRefs: outcome.evidenceRefs } : {};
+  switch (outcome.state) {
+    case "completed":
+      return { status: "completed", result: { outcome: "completed", summary: outcome.summary ?? "（无文本结果）", ...evidence } };
+    case "failed":
+      return {
+        status: "failed",
+        blockerReason: outcome.errorMessage ?? "子运行失败",
+        result: { outcome: "failed", summary: outcome.summary ?? (outcome.errorMessage ? `失败：${outcome.errorMessage}` : "子运行失败"), ...evidence },
+      };
+    case "cancelled":
+      return { status: "cancelled", result: { outcome: "cancelled", summary: outcome.summary ?? "（已取消）", ...evidence } };
+    case "blocked":
+      return { status: "blocked", blockerReason: outcome.errorMessage ?? (outcome.unknownSideEffect ? "副作用结果未知，需恢复核对" : "子运行阻塞") };
+    default:
+      // waiting_input / waiting_permission / waiting_external：非终态
+      return { status: outcome.state };
+  }
+}
+
 export type SubagentCoordinatorDeps = {
   store: SessionStore;
   /** 直连构造时的静态 registry 基线。经 createServer 装配时由 bindRuntimeServices
@@ -106,13 +185,17 @@ export type SubagentCoordinatorDeps = {
   registryFor?: (session: SessionInfo) => Promise<AgentRegistry>;
   /** 子会话创建工厂；缺省用框架默认实现（见 createDefaultChildSessionFactory）。 */
   createChildSession?: ChildSessionFactory;
-  /** 子 run 执行（SessionRunner.prompt 或 runAttempt）；返回终态。 */
-  runChild(childSessionId: string, prompt: string): Promise<WorkflowState>;
+  /** 子 run 执行（SessionRunner.runAttempt 等）；必须返回结构化 outcome——
+   *  Promise 正常返回不构成成功（spec §4.1，T03）。 */
+  runChild(childSessionId: string, prompt: string): Promise<ChildRunOutcome>;
   /** 取消子 run（runner.abort）。 */
   abortChild(childSessionId: string): Promise<void>;
   limits?: CoordinatorLimits;
   /** 嵌套深度上限（默认 1）；createServer 装配时与 runner 同源绑定。 */
   subagentDepth?: number;
+  /** 跨协调器共享的运行许可（T03，PC03：多项目共用 Host 全局/根上限）。
+   *  缺省时仅按本协调器 store 内的运行计数限额。 */
+  admission?: SubagentAdmission;
 };
 
 export class SubagentCoordinator {
@@ -130,6 +213,9 @@ export class SubagentCoordinator {
     this.limits = deps.limits ?? DEFAULT_LIMITS;
     this.createChildSession = deps.createChildSession
       ?? createDefaultChildSessionFactory({ store: deps.store, registryFor: (session) => this.resolveRegistry(session) });
+    // 共享许可的释放要能唤醒本协调器的队列泵（另一项目的协调器释放槽位后，
+    // 本项目排队者才能启动，PC03）。
+    deps.admission?.onRelease(() => this.pump());
   }
 
   private get store(): SubagentStore {
@@ -252,18 +338,30 @@ export class SubagentCoordinator {
     return all.map((r) => ({ ...r }));
   }
 
-  /** agent_send：幂等投递；waiting_input 唤醒；终态拒绝（CHILD_TERMINAL）。 */
-  async send(childId: string, payload: string, kind: "constraint" | "user_input" = "constraint", messageId = randomUUID()): Promise<{ delivered: boolean; reason?: string }> {
+  /** agent_send：幂等投递；waiting_input 唤醒；终态拒绝（CHILD_TERMINAL）。
+   *  scope（T03，PC03）：调用方任务树——树外 childId 拒绝（CHILD_OUT_OF_SCOPE），
+   *  模型不能向其它根 Task 的子代理投递。 */
+  async send(childId: string, payload: string, kind: "constraint" | "user_input" = "constraint", messageId = randomUUID(), scope?: { rootTaskId: string }): Promise<{ delivered: boolean; reason?: string }> {
     const rec = await this.store.getSubagent(childId);
     if (!rec) return { delivered: false, reason: "CHILD_NOT_FOUND" };
+    if (scope && rec.rootTaskId !== scope.rootTaskId) return { delivered: false, reason: "CHILD_OUT_OF_SCOPE" };
     if (isSubagentTerminal(rec.status)) return { delivered: false, reason: "CHILD_TERMINAL" }; // 不复活旧子代理（spec §8.2）
     await this.store.appendMessage({ messageId, childId, direction: "to_child", kind, payload, createdAt: new Date().toISOString() });
     return { delivered: true };
   }
 
   /** agent_wait：最多 timeoutMs；等首个终态或需处理状态；无变化返回仍在运行。
-   *  非 async 挂死——用活跃 run 的 done promise + 轮询兜底。 */
-  async wait(childIds: string[], timeoutMs = 30_000): Promise<{ changed: SubagentRecord[]; anyTerminal: boolean }> {
+   *  非 async 挂死——用活跃 run 的 done promise + 轮询兜底。
+   *  scope（T03）：树外 childId 直接拒绝，不把其它树的状态泄露给调用方。 */
+  async wait(childIds: string[], timeoutMs = 30_000, scope?: { rootTaskId: string }): Promise<{ changed: SubagentRecord[]; anyTerminal: boolean }> {
+    if (scope) {
+      const out: string[] = [];
+      for (const id of childIds) {
+        const rec = await this.store.getSubagent(id);
+        if (rec && rec.rootTaskId !== scope.rootTaskId) out.push(id);
+      }
+      if (out.length > 0) throw new Error(`SCOPE_VIOLATION：childId 不在当前任务树内：${out.join(", ")}`);
+    }
     const deadline = Date.now() + timeoutMs;
     const read = async () => {
       const out: SubagentRecord[] = [];
@@ -289,11 +387,13 @@ export class SubagentCoordinator {
   }
 
   /** agent_cancel：幂等标记 cancelling → 停止 admission → 取消 run 与后代 →
-   *  终态确认由状态回调落 cancelled。返回已登记。 */
-  async cancel(childId: string): Promise<{ cancelling: boolean; reason?: string }> {
+   *  终态确认由状态回调落 cancelled。返回已登记。
+   *  scope（T03）：树外 childId 拒绝——一个会话不能取消另一个根的后代。 */
+  async cancel(childId: string, scope?: { rootTaskId: string }): Promise<{ cancelling: boolean; reason?: string }> {
     for (;;) {
       const rec = await this.store.getSubagent(childId);
       if (!rec) return { cancelling: false, reason: "CHILD_NOT_FOUND" };
+      if (scope && rec.rootTaskId !== scope.rootTaskId) return { cancelling: false, reason: "CHILD_OUT_OF_SCOPE" };
       if (isSubagentTerminal(rec.status)) return { cancelling: false, reason: `CHILD_TERMINAL:${rec.status}` };
       if (rec.status === "cancelling") return { cancelling: true };
       try {
@@ -341,7 +441,10 @@ export class SubagentCoordinator {
 
   // ---- 调度 ----
 
-  /** 队列泵：按根轮转取额度可用的 child 启动。 */
+  /** 队列泵：按根轮转取额度可用的 child 启动。
+   *  T03：admission（跨协调器共享）原子授予运行槽——本 store 的运行计数只是
+   *  本协调器内的廉价预过滤，全局/根上限以 admission 为准；授予失败即退出
+   *  本次泵程，等释放通知（onRelease → pump）重试。 */
   private pump(): void {
     void (async () => {
       for (;;) {
@@ -349,8 +452,10 @@ export class SubagentCoordinator {
         if (running.length >= this.limits.global) return;
         const next = this.pickNext(running);
         if (!next) return;
+        const admission = this.deps.admission;
+        if (admission && !admission.tryAcquire(next.rootTaskId)) return;
         this.queue.splice(this.queue.indexOf(next), 1);
-        void this.launch(next);
+        void this.launch(next); // launch 持有许可，finally 按执行状态释放
       }
     })().catch(() => undefined);
   }
@@ -368,35 +473,45 @@ export class SubagentCoordinator {
     return ordered[0];
   }
 
-  private async launch(item: { childId: string; prompt: string }): Promise<void> {
-    let rec = await this.store.getSubagent(item.childId);
-    if (!rec || isSubagentTerminal(rec.status) || rec.status === "cancelling") return;
-    rec = await this.store.updateSubagent(item.childId, rec.revision, { status: "running", times: { ...rec.times, startedAt: new Date().toISOString() } });
-    let settle!: () => void;
-    const done = new Promise<void>((resolve) => { settle = resolve; });
-    this.active.set(item.childId, { abort: () => undefined, done });
+  private async launch(item: { childId: string; rootTaskId: string; prompt: string }): Promise<void> {
+    const admission = this.deps.admission;
+    let settle: (() => void) | null = null;
+    let done: Promise<void> | null = null;
     try {
-      const state = await this.deps.runChild(item.childId, item.prompt);
+      let rec = await this.store.getSubagent(item.childId);
+      if (!rec || isSubagentTerminal(rec.status) || rec.status === "cancelling") return;
+      rec = await this.store.updateSubagent(item.childId, rec.revision, { status: "running", times: { ...rec.times, startedAt: new Date().toISOString() } });
+      let resolveDone!: () => void;
+      done = new Promise<void>((resolve) => { resolveDone = resolve; });
+      settle = resolveDone;
+      this.active.set(item.childId, { abort: () => undefined, done });
+      // T03（PC02）：runChild 返回结构化 outcome——失败/取消/阻塞与完成一样是
+      // 显式声明，禁止按 Promise 正常返回推断成功（F02 修复的框架侧契约）。
+      const outcome = await this.deps.runChild(item.childId, item.prompt);
       const latest = await this.store.getSubagent(item.childId);
       if (!latest) return;
       if (latest.status === "cancelling") {
         await this.store.updateSubagent(item.childId, latest.revision, { status: "cancelled", times: { ...latest.times, endedAt: new Date().toISOString() } });
       } else {
-        const outcome = state === "completed" ? "completed" : state === "cancelled" ? "cancelled" : "failed";
+        const settled = projectChildRunOutcome(outcome);
         await this.store.updateSubagent(item.childId, latest.revision, {
-          status: outcome,
+          status: settled.status,
           times: { ...latest.times, endedAt: new Date().toISOString() },
-          ...(outcome === "completed" ? {} : { blockerReason: state === "failed" ? `子运行失败（${state}）` : undefined }),
+          ...(settled.result ? { result: settled.result } : {}),
+          ...(settled.blockerReason ? { blockerReason: settled.blockerReason } : {}),
         });
       }
     } catch (error) {
       const latest = await this.store.getSubagent(item.childId);
       if (latest && !isSubagentTerminal(latest.status)) {
-        await this.store.updateSubagent(item.childId, latest.revision, { status: "failed", blockerReason: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+        await this.store.updateSubagent(item.childId, latest.revision, { status: "failed", blockerReason: error instanceof Error ? error.message : String(error), result: { outcome: "failed", summary: `失败：${error instanceof Error ? error.message : String(error)}` } }).catch(() => undefined);
       }
     } finally {
+      // 许可按执行状态释放：runChild 真正结束（成功/失败/取消/异常）后，而非
+      // Promise 语义猜测；waiting_* 不占模型并发槽的细化在 T04 调度层处理。
+      admission?.release(item.rootTaskId);
       this.active.delete(item.childId);
-      settle();
+      settle?.();
       this.notifyWaiters();
       this.pump(); // 腾出的额度给下一个排队者
     }

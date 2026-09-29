@@ -65,7 +65,7 @@ describe("T02/PC01：subagentCoordinator 经 createAgentRuntime→createServer �
         store,
         createChildSession: async ({ parent, agentType, description }) =>
           createFrameworkSession({ store, userId: parent.userId, workspaceId: parent.workspaceId, agent: agentType, model: { providerId: "faux", modelId: "test-model" }, prompt: description, parentId: parent.id, title: description }),
-        runChild: async (childId) => { launches.push(childId); return "completed"; },
+        runChild: async (childId) => { launches.push(childId); return { state: "completed", summary: "子代理结论" }; },
         abortChild: async () => {},
       });
       const faux = createFauxCore({ models: [{ id: "test-model" }] });
@@ -129,7 +129,7 @@ describe("T02/PC01：subagentCoordinator 经 createAgentRuntime→createServer �
         // 工厂拿到的是完整父会话——不再需要常量身份兜底。
         createChildSession: async ({ parent, agentType, description }) =>
           createFrameworkSession({ store, userId: parent.userId, workspaceId: parent.workspaceId, agent: agentType, model: { providerId: "faux", modelId: "test-model" }, prompt: description, parentId: parent.id, title: description }),
-        runChild: async (childId) => { launches.push(childId); return "completed"; },
+        runChild: async (childId) => { launches.push(childId); return { state: "completed", summary: "子代理结论" }; },
         abortChild: async () => {},
       });
       const faux = createFauxCore({ models: [{ id: "test-model" }] });

@@ -51,8 +51,8 @@ export { createGitTools } from "./core/tools/git.js";
 export type { GitToolsOptions } from "./core/tools/git.js";
 export * from "./core/subagents/types.js";
 export { subagentTools, makeLegacyTaskTool } from "./core/subagents/tools.js";
-export { SubagentCoordinator, createDefaultChildSessionFactory, childSessionIdFor } from "./core/subagents/coordinator.js";
-export type { SubagentCoordinatorDeps, ChildSessionFactory, CoordinatorLimits, SpawnInput } from "./core/subagents/coordinator.js";
+export { SubagentCoordinator, createDefaultChildSessionFactory, childSessionIdFor, createSubagentAdmission } from "./core/subagents/coordinator.js";
+export type { SubagentCoordinatorDeps, ChildSessionFactory, ChildRunOutcome, SubagentAdmission, CoordinatorLimits, SpawnInput } from "./core/subagents/coordinator.js";
 export { TerminalManager, createTerminalTools } from "./core/tools/terminal.js";
 export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSessionStatus } from "./core/tools/terminal.js";
 export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
@@ -61,6 +61,7 @@ export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOpt
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, isSessionAwaitingPermission, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";
+export type { RunOutcome } from "./core/runtime/task-lifecycle.js";
 export {
   validateAttachments,
   validateAttachmentRefs,

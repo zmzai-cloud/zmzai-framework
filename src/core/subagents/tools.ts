@@ -91,8 +91,9 @@ export const agentSendTool: ToolDef = {
   }),
   permission: () => null,
   async execute(args, ctx) {
-    const { coordinator } = requireCoordinator(ctx);
-    const result = await coordinator.send(args.child_id, args.message, args.kind, args.message_id);
+    const { coordinator, rootTaskId } = requireCoordinator(ctx);
+    // T03（PC03）：范围校验——只允许操作当前任务树内的子代理。
+    const result = await coordinator.send(args.child_id, args.message, args.kind, args.message_id, { rootTaskId });
     if (!result.delivered) {
       return { title: "投递失败", output: `未投递：${result.reason}`, metadata: { delivered: false, reason: result.reason } };
     }
@@ -111,8 +112,8 @@ export const agentWaitTool: ToolDef = {
   }),
   permission: () => null,
   async execute(args, ctx) {
-    const { coordinator } = requireCoordinator(ctx);
-    const { changed, anyTerminal } = await coordinator.wait(args.child_ids, args.timeout_seconds * 1_000);
+    const { coordinator, rootTaskId } = requireCoordinator(ctx);
+    const { changed, anyTerminal } = await coordinator.wait(args.child_ids, args.timeout_seconds * 1_000, { rootTaskId });
     const lines = changed.map((r) => `- ${r.childId}: ${r.status}${r.result ? `（${r.result.outcome}: ${r.result.summary.slice(0, 120)}）` : ""}`);
     return {
       title: anyTerminal ? "有终态" : "仍在运行",
@@ -130,8 +131,8 @@ export const agentCancelTool: ToolDef = {
   parameters: z.object({ child_id: z.string().min(1) }),
   permission: () => null,
   async execute(args, ctx) {
-    const { coordinator } = requireCoordinator(ctx);
-    const result = await coordinator.cancel(args.child_id);
+    const { coordinator, rootTaskId } = requireCoordinator(ctx);
+    const result = await coordinator.cancel(args.child_id, { rootTaskId });
     const terminal = result.reason?.startsWith("CHILD_TERMINAL");
     return {
       title: terminal ? "已是终态" : "取消已登记",
