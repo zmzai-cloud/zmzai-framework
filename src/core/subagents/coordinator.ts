@@ -196,6 +196,14 @@ export type SubagentCoordinatorDeps = {
   /** 跨协调器共享的运行许可（T03，PC03：多项目共用 Host 全局/根上限）。
    *  缺省时仅按本协调器 store 内的运行计数限额。 */
   admission?: SubagentAdmission;
+  /** 子终态回调（T04，spec §4.2 唤醒意图）：settleSubagent（终态+结果邮件
+   *  同事务）成功后调用；宿主接父唤醒（runner.requestInternalResume 等），
+   *  不得在此另写结果邮件（已在事务内）。 */
+  onChildTerminal?: (child: SubagentRecord, parentSessionId: string) => void;
+  /** 运行中子代理的消息投递通道（T04，PC07「运行中安全边界接收」）：宿主接
+   *  runner.prompt（活动会话的 FIFO queued prompt 即安全边界；requestId 用
+   *  messageId 幂等）。缺省时 running 子代理的 agent_send 只落邮箱。 */
+  deliverToChild?: (childSessionId: string, text: string, requestId: string) => Promise<void>;
 };
 
 export class SubagentCoordinator {
@@ -216,6 +224,9 @@ export class SubagentCoordinator {
     // 共享许可的释放要能唤醒本协调器的队列泵（另一项目的协调器释放槽位后，
     // 本项目排队者才能启动，PC03）。
     deps.admission?.onRelease(() => this.pump());
+    // T04（spec §4.2）启动对账：内存队列只是缓存，凭 store 恢复
+    // （见 recover——宿主须保证同一 store 每进程只建一个协调器）。
+    this.recover();
   }
 
   private get store(): SubagentStore {
@@ -313,6 +324,9 @@ export class SubagentCoordinator {
         traceId: randomUUID(),
       }),
       spawnPayloadHash,
+      // T04（spec §4.2 持久队列）：执行输入落记录——宿主重启后凭此恢复
+      // queued 子代理，不依赖进程内存。
+      prompt: input.prompt,
     };
     const created = await this.createSubagentIdempotent(record);
     this.queue.push({ childId: created.childId, rootTaskId, prompt: input.prompt });
@@ -332,21 +346,59 @@ export class SubagentCoordinator {
     }
   }
 
+  /** 启动对账（T04，spec §4.2）：内存队列/活跃表只是缓存，进程重启后凭 store
+   *  重建——queued（从未开始）凭记录里的 prompt 重新入队执行；running/cancelling
+   *  是上个进程的在途执行、结果未知 → 落 blocked 进恢复审查（cancelling 补收
+   *  cancelled），不自动重放副作用；waiting_* 无活跃 run、重启安全，保持原状
+   *  （waiting_permission 的重启审计随 T06 恢复场景收口）。 */
+  private recover(): void {
+    void (async () => {
+      const stale = await this.store.listSubagents({}).catch(() => [] as SubagentRecord[]);
+      let requeued = 0;
+      for (const rec of stale) {
+        if (rec.status === "queued") {
+          this.queue.push({ childId: rec.childId, rootTaskId: rec.rootTaskId, prompt: rec.prompt ?? rec.goal });
+          requeued += 1;
+        } else if (rec.status === "running" || rec.status === "cancelling") {
+          await this.store.updateSubagent(rec.childId, rec.revision, rec.status === "cancelling"
+            ? { status: "cancelled", times: { ...rec.times, endedAt: new Date().toISOString() } }
+            : { status: "blocked", blockerReason: "宿主重启：子运行中断，结果未知，需恢复核对（不自动重放副作用）", times: { ...rec.times, endedAt: new Date().toISOString() } })
+            .catch(() => undefined);
+        }
+      }
+      if (requeued > 0) this.pump();
+    })().catch(() => undefined);
+  }
+
   /** agent_list：当前树内子代理 + 最近进度。 */
   async list(rootTaskId: string): Promise<SubagentRecord[]> {
     const all = await this.store.listSubagents({ rootTaskId });
     return all.map((r) => ({ ...r }));
   }
 
-  /** agent_send：幂等投递；waiting_input 唤醒；终态拒绝（CHILD_TERMINAL）。
-   *  scope（T03，PC03）：调用方任务树——树外 childId 拒绝（CHILD_OUT_OF_SCOPE），
-   *  模型不能向其它根 Task 的子代理投递。 */
+  /** agent_send：幂等投递；按子代理状态真正进入子上下文（T04，PC07）——
+   *  queued：launch 时随原始 prompt 注入（见 launch 的消息组装）；
+   *  活跃 run：经 deliverToChild 投递（宿主接 runner.prompt——活动会话的
+   *    FIFO queued prompt 即安全边界，requestId=messageId 幂等）；
+   *  waiting_input（无活跃 run）：重新入队，runChild 携带新消息续跑；
+   *  waiting_permission/waiting_external/blocked：只落邮箱——普通消息不得
+   *    替代审批或解除安全阻塞（spec §8.2 出口互不替代）。
+   *  终态拒绝（CHILD_TERMINAL）；scope（T03）：树外 childId 拒绝。 */
   async send(childId: string, payload: string, kind: "constraint" | "user_input" = "constraint", messageId = randomUUID(), scope?: { rootTaskId: string }): Promise<{ delivered: boolean; reason?: string }> {
     const rec = await this.store.getSubagent(childId);
     if (!rec) return { delivered: false, reason: "CHILD_NOT_FOUND" };
     if (scope && rec.rootTaskId !== scope.rootTaskId) return { delivered: false, reason: "CHILD_OUT_OF_SCOPE" };
     if (isSubagentTerminal(rec.status)) return { delivered: false, reason: "CHILD_TERMINAL" }; // 不复活旧子代理（spec §8.2）
     await this.store.appendMessage({ messageId, childId, direction: "to_child", kind, payload, createdAt: new Date().toISOString() });
+    if (rec.status === "queued") return { delivered: true };
+    if (this.active.has(childId)) {
+      await this.deps.deliverToChild?.(rec.childSessionId, payload, messageId);
+      return { delivered: true };
+    }
+    if (rec.status === "waiting_input" && !this.queue.some((q) => q.childId === childId)) {
+      this.queue.push({ childId, rootTaskId: rec.rootTaskId, prompt: rec.prompt ?? rec.goal });
+      this.pump();
+    }
     return { delivered: true };
   }
 
@@ -485,26 +537,44 @@ export class SubagentCoordinator {
       done = new Promise<void>((resolve) => { resolveDone = resolve; });
       settle = resolveDone;
       this.active.set(item.childId, { abort: () => undefined, done });
+      // T04（PC07）：子上下文组装——原始 prompt + 全部 to_child 消息（agent_send
+      //  落邮箱的补充约束/用户输入）。重跑（waiting_input 续跑/恢复）时重复注入
+      //  旧约束幂等无害；新消息按时间序追加。
+      const supplements = (await this.store.listMessages(item.childId).catch(() => [] as never[]))
+        .filter((m) => m.direction === "to_child");
+      const prompt = supplements.length > 0
+        ? `${item.prompt}\n\n[父代理追加输入（按时间序，最新在后）]\n${supplements.map((m) => `- (${m.kind}) ${m.payload}`).join("\n")}`
+        : item.prompt;
       // T03（PC02）：runChild 返回结构化 outcome——失败/取消/阻塞与完成一样是
       // 显式声明，禁止按 Promise 正常返回推断成功（F02 修复的框架侧契约）。
-      const outcome = await this.deps.runChild(item.childId, item.prompt);
+      const outcome = await this.deps.runChild(item.childId, prompt);
       const latest = await this.store.getSubagent(item.childId);
       if (!latest) return;
       if (latest.status === "cancelling") {
-        await this.store.updateSubagent(item.childId, latest.revision, { status: "cancelled", times: { ...latest.times, endedAt: new Date().toISOString() } });
+        await this.settleTerminal(latest, { status: "cancelled" });
       } else {
         const settled = projectChildRunOutcome(outcome);
-        await this.store.updateSubagent(item.childId, latest.revision, {
-          status: settled.status,
-          times: { ...latest.times, endedAt: new Date().toISOString() },
-          ...(settled.result ? { result: settled.result } : {}),
-          ...(settled.blockerReason ? { blockerReason: settled.blockerReason } : {}),
-        });
+        if (isSubagentTerminal(settled.status)) {
+          // T04（spec §4.2）：子终态 + to_parent 结果邮件同事务，成功后触发
+          // 父唤醒意图钩子（宿主接 requestInternalResume——PC05 的接线点）。
+          await this.settleTerminal(latest, {
+            status: settled.status,
+            ...(settled.result ? { result: settled.result } : {}),
+            ...(settled.blockerReason ? { blockerReason: settled.blockerReason } : {}),
+          });
+        } else {
+          // waiting_*：非终态，无结果邮件（出口互不替代，spec §8.2）
+          await this.store.updateSubagent(item.childId, latest.revision, {
+            status: settled.status,
+            ...(settled.blockerReason ? { blockerReason: settled.blockerReason } : {}),
+          });
+        }
       }
     } catch (error) {
       const latest = await this.store.getSubagent(item.childId);
       if (latest && !isSubagentTerminal(latest.status)) {
-        await this.store.updateSubagent(item.childId, latest.revision, { status: "failed", blockerReason: error instanceof Error ? error.message : String(error), result: { outcome: "failed", summary: `失败：${error instanceof Error ? error.message : String(error)}` } }).catch(() => undefined);
+        const message = error instanceof Error ? error.message : String(error);
+        await this.settleTerminal(latest, { status: "failed", blockerReason: message, result: { outcome: "failed", summary: `失败：${message}` } }).catch(() => undefined);
       }
     } finally {
       // 许可按执行状态释放：runChild 真正结束（成功/失败/取消/异常）后，而非
@@ -520,5 +590,28 @@ export class SubagentCoordinator {
   private notifyWaiters(): void {
     for (const w of this.waiters) w();
     this.waiters.clear();
+  }
+
+  /** 终态结算（T04，spec §4.2）：状态 + to_parent 结果邮件**同事务**落库
+   *  （settleSubagent），成功后触发唤醒钩子。messageId 由 childId + 结算后
+   *  revision 派生——同 child 重放结算天然幂等（INSERT OR IGNORE）。 */
+  private async settleTerminal(latest: SubagentRecord, patch: { status: SubagentStatus; result?: SubagentRecord["result"]; blockerReason?: string }): Promise<void> {
+    const settled = await this.store.settleSubagent(latest.childId, latest.revision, {
+      ...patch,
+      times: { ...latest.times, endedAt: new Date().toISOString() },
+    }, {
+      messageId: `result_${latest.childId}_${latest.revision + 1}`,
+      childId: latest.childId,
+      direction: "to_parent",
+      kind: "result",
+      payload: JSON.stringify({ outcome: patch.result?.outcome ?? patch.status, summary: patch.result?.summary ?? "", childId: latest.childId }),
+      createdAt: new Date().toISOString(),
+    });
+    try {
+      this.deps.onChildTerminal?.(settled, settled.parentSessionId);
+    } catch {
+      // 唤醒钩子失败不影响终态结算（邮箱里已有结果，父侧可经其它路径续跑）
+    }
+    this.notifyWaiters();
   }
 }

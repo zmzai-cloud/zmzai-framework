@@ -66,10 +66,19 @@ export async function onChildTerminal(deps: ParkControllerDeps, child: SubagentR
   deps.requestInternalResume(parentSessionId);
 }
 
-/** 父唤醒时的未消费结果读取 + 水位推进（A28：仅纳入一次）。 */
-export async function drainParentMailbox(deps: ParkControllerDeps, rootTaskId: string): Promise<{ results: { childId: string; outcome: string; summary: string }[]; clearedPark: boolean }> {
+/** 父唤醒时的未消费结果读取（T04 两段式，PC06）：**投递水位在实际 Attempt
+ *  上下文持久登记后才能推进**（spec §4.2）——读取阶段不动水位；消费方把
+ *  results 注入父上下文并持久化后调用 commit() 推进水位。读取与 commit 之间
+ *  崩溃只会导致重读（幂等），不会丢结果；重复 commit 也是幂等 no-op。 */
+export async function drainParentMailbox(deps: ParkControllerDeps, rootTaskId: string): Promise<{
+  results: { childId: string; outcome: string; summary: string }[];
+  /** 水位推进：results 已持久进父上下文后调用。 */
+  commit: () => Promise<void>;
+  clearedPark: boolean;
+}> {
   const children = await deps.subagents.listSubagents({ rootTaskId });
   const results: { childId: string; outcome: string; summary: string }[] = [];
+  const unconsumed: { childId: string; upToCreatedAt: string }[] = [];
   for (const child of children) {
     const messages = await deps.subagents.listMessages(child.childId);
     for (const msg of messages) {
@@ -80,13 +89,18 @@ export async function drainParentMailbox(deps: ParkControllerDeps, rootTaskId: s
         } catch {
           results.push({ childId: child.childId, outcome: "unknown", summary: msg.payload.slice(0, 200) });
         }
-        await deps.subagents.markMessagesConsumedByParent(child.childId, msg.createdAt);
+        unconsumed.push({ childId: child.childId, upToCreatedAt: msg.createdAt });
       }
     }
   }
+  const commit = async () => {
+    for (const item of unconsumed) {
+      await deps.subagents.markMessagesConsumedByParent(item.childId, item.upToCreatedAt);
+    }
+  };
   // 全部终态且结果已消费 → 清 parked 标记
   const allTerminal = children.every((c) => isSubagentTerminal(c.status));
-  return { results, clearedPark: allTerminal };
+  return { results, commit, clearedPark: allTerminal };
 }
 
 /** 终态根 Task 拒绝自动唤醒（A29：取消/失败/已交付的父不复活）。 */

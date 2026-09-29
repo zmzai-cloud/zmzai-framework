@@ -438,6 +438,23 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
           return next;
         });
       },
+      /** T04（spec §4.2）：子终态 + to_parent 结果邮件同事务——拆开落库的中间
+       *  崩溃会丢结果邮件（记录终态了但父邮箱永远等不到）。 */
+      async settleSubagent(childId, expectedRevision, patch, resultMessage) {
+        return transaction(() => {
+          const row = db.prepare("SELECT json FROM subagents WHERE child_id=?").get(childId) as { json: string } | undefined;
+          if (!row) throw new Error("SUBAGENT_NOT_FOUND");
+          const current = JSON.parse(row.json) as SubagentRecord;
+          if (current.revision !== expectedRevision) throw new Error("SUBAGENT_REVISION_CONFLICT");
+          if (patch.status) assertSubagentTransition(current.status, patch.status);
+          const next = { ...current, ...patch, revision: current.revision + 1 };
+          db.prepare("UPDATE subagents SET json=?, updated_at=? WHERE child_id=?").run(JSON.stringify(next), new Date().toISOString(), childId);
+          if (resultMessage) {
+            db.prepare("INSERT OR IGNORE INTO subagent_messages(message_id,child_id,created_at,direction,json) VALUES (?,?,?,?,?)").run(resultMessage.messageId, resultMessage.childId, resultMessage.createdAt, resultMessage.direction, JSON.stringify(resultMessage));
+          }
+          return next;
+        });
+      },
       async listSubagents(filter) {
         let sql = "SELECT json FROM subagents WHERE 1=1";
         const args: (string | number | null)[] = [];

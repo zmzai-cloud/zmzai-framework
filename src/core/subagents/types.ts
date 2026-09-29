@@ -26,6 +26,9 @@ export type SubagentRecord = {
   /** 派生 payload 指纹（T02，spec §4.1）：同键异 payload 重试拒绝
    *  （SPAWN_PAYLOAD_MISMATCH）。旧记录缺省时不阻断同键重试。 */
   spawnPayloadHash?: string;
+  /** 派生时的原始 prompt（T04，spec §4.2 持久队列）：内存队列只是缓存，
+   *  宿主重启后凭本字段恢复 queued 子代理的执行输入，不依赖进程内存。 */
+  prompt?: string;
   agentType: string;
   goal: string;
   mode: "read_only" | "workspace_write";
@@ -78,6 +81,10 @@ export interface SubagentStore {
   findSubagentBySpawnRequest(parentSessionId: string, spawnRequestId: string): Promise<SubagentRecord | null>;
   /** CAS 更新；非法状态迁移（如 completed → running）抛 SUBAGENT_INVALID_TRANSITION。 */
   updateSubagent(childId: string, expectedRevision: number, patch: Partial<SubagentRecord>): Promise<SubagentRecord>;
+  /** 终态结算 + to_parent 结果邮件**同事务**（T04，spec §4.2/§8.2：
+   *  子终态、mailbox 与唤醒依据不能拆开落库——中间崩溃会造成「终态已写、
+   *  结果邮件丢失」。resultMessage 的 messageId 幂等（INSERT OR IGNORE）。 */
+  settleSubagent(childId: string, expectedRevision: number, patch: Partial<SubagentRecord>, resultMessage?: SubagentMessage): Promise<SubagentRecord>;
   listSubagents(filter: { rootTaskId?: string; parentSessionId?: string; statuses?: SubagentStatus[] }): Promise<SubagentRecord[]>;
   appendMessage(message: SubagentMessage): Promise<void>;
   /** messageId 去重：同 messageId 重复投递是 no-op（至少一次投递 + 幂等消费）。 */

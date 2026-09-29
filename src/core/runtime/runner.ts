@@ -237,6 +237,13 @@ export class SessionRunner {
     return this.attemptExecutor.registryFor(session);
   }
 
+  /** 内部续跑登记（T04，spec §4.2 子终态唤醒父）：不创建用户消息、不新建
+   *  workflow run——与用户「继续」按钮共用调度侧放行通道（resumeRequests
+   *  Set 天然幂等合并多个子代理同时完成的唤醒）。 */
+  requestInternalResume(sessionId: string): void {
+    this.scheduler.requestResume(sessionId);
+  }
+
   /** fallbackSessionId 由 runLoop 闭包传入（而非实例字段）：runner 是进程级
    *  单例，两个会话并发时实例字段会互相覆盖，导致 message.part.delta 等
    *  无自带 sessionId 的事件落到错误的会话事件流里（串台）。 */

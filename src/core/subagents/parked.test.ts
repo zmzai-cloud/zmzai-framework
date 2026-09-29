@@ -49,13 +49,18 @@ describe("parked/mailbox/父唤醒（M3-S19）", () => {
       await onChildTerminal(deps, done, session.id); // 重放（崩溃后）——同 messageId 不重复
       expect(resumeCalls.length).toBeGreaterThanOrEqual(1);
 
-      // 父唤醒 drain：结果恰一份
+      // 父唤醒 drain：结果恰一份（两段式：读取不动水位，commit 才推进）
       const first = await drainParentMailbox(deps, task.id);
       expect(first.results).toHaveLength(1);
       expect(first.results[0]!.summary).toBe("探索A完成");
       expect(first.clearedPark).toBe(false); // c2 仍 running
+      // commit 前重读（模拟注入上下文前崩溃）：结果仍在——不丢
+      const reread = await drainParentMailbox(deps, task.id);
+      expect(reread.results).toHaveLength(1);
+      await first.commit();
+      await reread.commit(); // 重复 commit 幂等
 
-      // 再次 drain：已消费不再追加
+      // 水位推进后再 drain：已消费不再追加
       const again = await drainParentMailbox(deps, task.id);
       expect(again.results).toHaveLength(0);
 
