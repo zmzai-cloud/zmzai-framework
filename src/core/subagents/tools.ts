@@ -40,13 +40,19 @@ export const agentSpawnTool: ToolDef = {
   permission: (args) => ({ permission: "task", patterns: [args.agent_type], metadata: { subagent: args.agent_type, description: args.description, mode: args.mode } }),
   async execute(args, ctx) {
     const { coordinator, rootTaskId, parentTaskId } = requireCoordinator(ctx);
-    const session = { id: (ctx as { sessionId: string }).sessionId } as never;
-    const record = await coordinator.spawn(session, parentTaskId, rootTaskId, {
+    // T02（spec §4.1）：spawnRequestId 从持久工具调用身份派生——模型未显式
+    // 提供时，同一次工具调用的重试也落在同一幂等键上；父身份只传 { id }
+    // 引用，完整父会话由协调器从 store 解析（禁止伪 Session 直达工厂）。
+    const record = await coordinator.spawn({ id: (ctx as { sessionId: string }).sessionId }, parentTaskId, rootTaskId, {
       description: args.description,
       prompt: args.prompt,
       subagentType: args.agent_type,
       mode: args.mode,
-      ...(args.spawn_request_id ? { spawnRequestId: args.spawn_request_id } : {}),
+      ...(args.spawn_request_id
+        ? { spawnRequestId: args.spawn_request_id }
+        : (ctx as { toolCallId?: string }).toolCallId
+          ? { spawnRequestId: `spawn:${(ctx as { toolCallId: string }).toolCallId}` }
+          : {}),
     });
     return {
       title: `子代理 ${args.agent_type}：${args.description}`,
@@ -154,8 +160,14 @@ export function makeLegacyTaskTool(coordinatorGetter: (ctx: unknown) => { coordi
     async execute(args, ctx) {
       const c = coordinatorGetter(ctx);
       if (!c) throw new Error("当前环境不支持子代理");
-      const session = { id: (ctx as { sessionId: string }).sessionId } as never;
-      const record = await c.coordinator.spawn(session, c.parentTaskId, c.rootTaskId, { description: args.description, prompt: args.prompt, subagentType: args.subagent_type });
+      const record = await c.coordinator.spawn({ id: (ctx as { sessionId: string }).sessionId }, c.parentTaskId, c.rootTaskId, {
+        description: args.description,
+        prompt: args.prompt,
+        subagentType: args.subagent_type,
+        ...((ctx as { toolCallId?: string }).toolCallId
+          ? { spawnRequestId: `spawn:${(ctx as { toolCallId: string }).toolCallId}` }
+          : {}),
+      });
       const { changed } = await c.coordinator.wait([record.childId], 120_000);
       const final = changed.find((r) => r.childId === record.childId) ?? record;
       const state = isSubagentTerminal(final.status) && final.status === "completed" ? "completed" : final.status === "cancelled" ? "error" : final.result?.outcome === "failed" || final.status === "failed" ? "error" : "completed";

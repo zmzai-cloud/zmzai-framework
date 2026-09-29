@@ -89,7 +89,7 @@ export type AttemptCollaborators = {
   publish: (event: FrameworkEvent, sessionId: string) => Promise<void>;
   persist: (event: FrameworkEvent, fallbackSessionId: string) => Promise<void>;
   subagentCoordinator?: import("../subagents/coordinator.js").SubagentCoordinator;
-  spawnSubagent: (session: SessionInfo, input: { description: string; prompt: string; subagentType: string }, registry: AgentRegistry, parentEngine: PermissionEngine) => Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }>;
+  spawnSubagent: (session: SessionInfo, input: { description: string; prompt: string; subagentType: string; spawnRequestId?: string }, registry: AgentRegistry, parentEngine: PermissionEngine) => Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }>;
 };
 
 export class AttemptExecutor {
@@ -102,7 +102,9 @@ export class AttemptExecutor {
 
   constructor(private readonly deps: import("./runner.js").RunnerDeps, private readonly collabs: AttemptCollaborators) {}
 
-  private async registryFor(session: SessionInfo): Promise<AgentRegistry> {    const base = this.deps.registry;
+  /** 会话级 registry 解析（public：createServer 给协调器绑定同源解析用，
+   *  保证子代理类型检查与默认工厂看到 workspace 自定义 Agent）。 */
+  async registryFor(session: SessionInfo): Promise<AgentRegistry> {    const base = this.deps.registry;
     if (!this.deps.loadWorkspaceAgents) return base;
     try {
       const custom = await this.deps.loadWorkspaceAgents(session);

@@ -4,16 +4,19 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createSqliteSessionStore } from "../session/sqlite-store.js";
 import { AgentRegistry } from "../agent/registry.js";
+import { createFrameworkSession } from "../runtime/runner.js";
 import { SubagentCoordinator, type SubagentCoordinatorDeps } from "./coordinator.js";
 import { agentListTool, agentSendTool, agentSpawnTool, agentWaitTool, agentCancelTool, makeLegacyTaskTool, type SubagentToolContext } from "./tools.js";
 import type { ToolContext } from "../tools/context.js";
 import { isSubagentTerminal } from "./types.js";
 
 /** M3-S20：五工具面——A16（read_only spawn 生效）、A14（spawn_request_id
- *  幂等）、agent_send/wait/cancel 行为、旧 task 兼容封装。 */
+ *  幂等）、agent_send/wait/cancel 行为、旧 task 兼容封装。
+ *  T02：工具层只传 { id }，父身份由协调器从 store 解析——父会话必须真实存在。 */
 async function boot(runMs = 80) {
   const dataDir = await mkdtemp(path.join(tmpdir(), "m3-s20-"));
   const store = createSqliteSessionStore({ dataDir });
+  const parent = await createFrameworkSession({ store, userId: "u", workspaceId: "ws", model: { providerId: "faux", modelId: "m" } });
   const registry = new AgentRegistry().derive([
     { name: "explorer", description: "探索", mode: "subagent", steps: 8, prompt: "你是探索代理。", permission: [], model: { providerId: "faux", modelId: "m" } } as never,
   ]);
@@ -21,16 +24,14 @@ async function boot(runMs = 80) {
   const deps: SubagentCoordinatorDeps = {
     store,
     registry,
-    createChildSession: async ({ parent, agentType, description }) => ({ id: `ses_c_${Math.random().toString(36).slice(2, 8)}`, parentId: parent.id, userId: parent.userId, workspaceId: parent.workspaceId, agent: agentType, title: description } as never),
+    createChildSession: async ({ parent: p, agentType, description }) => ({ id: `ses_c_${Math.random().toString(36).slice(2, 8)}`, parentId: p.id, userId: p.userId, workspaceId: p.workspaceId, agent: agentType, title: description } as never),
     runChild: async (childId) => { launches.push(childId); await new Promise((r) => setTimeout(r, runMs)); return "completed"; },
     abortChild: async () => {},
   };
   const coordinator = new SubagentCoordinator(deps);
-  const ctx = { sessionId: "ses_parent", subagents: { coordinator, rootTaskId: "task_root", parentTaskId: "task_root" } } as unknown as ToolContext & SubagentToolContext;
-  return { store, coordinator, ctx, launches, dataDir };
+  const ctx = { sessionId: parent.id, toolCallId: "call_s20", subagents: { coordinator, rootTaskId: "task_root", parentTaskId: "task_root" } } as unknown as ToolContext & SubagentToolContext;
+  return { store, parent, coordinator, ctx, launches, dataDir };
 }
-
-const parentSession = { id: "ses_parent", userId: "u", workspaceId: "ws", agent: "default" } as never;
 
 describe("agent_* 工具族（M3-S20）", () => {
   it("agent_spawn：立即返回 childId（不等执行）；spawn_request_id 幂等（A14）", async () => {
@@ -44,10 +45,11 @@ describe("agent_* 工具族（M3-S20）", () => {
       // 幂等重试
       const again = await agentSpawnTool.execute({ description: "并行探索A", prompt: "P", agent_type: "explorer", mode: "read_only", spawn_request_id: "s20-1" }, ctx);
       expect((again.metadata as { childId: string }).childId).toBe(childId);
+      // 同键异 payload 拒绝（T02，spec §4.1）
+      await expect(agentSpawnTool.execute({ description: "并行探索B", prompt: "P", agent_type: "explorer", mode: "read_only", spawn_request_id: "s20-1" }, ctx)).rejects.toThrow("SPAWN_PAYLOAD_MISMATCH");
       // spawn 面（coordinator 层）与父会话关联
       const rec = await coordinator.list("task_root");
       expect(rec).toHaveLength(1);
-      void parentSession;
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }

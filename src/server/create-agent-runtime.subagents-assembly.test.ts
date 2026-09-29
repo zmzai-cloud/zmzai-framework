@@ -12,9 +12,9 @@ import { createMemoryEventLog } from "../core/events/bus.js";
 import { createAgentRuntime } from "./create-agent-runtime.js";
 import type { Part } from "../core/session/types.js";
 
-/** T01 / F01 复现（production-chain-closure）。
+/** T01→T02 / F01 复现与修复验收（production-chain-closure）。
  *
- *  缺陷链（spec 2026-09-28 §F01，T00 源码核对深化）：
+ *  缺陷链（spec 2026-09-28 §F01，T00 源码核对深化；T01 时以红测试钉住）：
  *  1. 宿主把 subagentCoordinator 传给 createAgentRuntime；
  *  2. createAgentRuntime 用条件 spread 把它并入 createServer({...}) 的入参——
  *     spread 不触发 TS 的 excess property 检查；
@@ -25,15 +25,11 @@ import type { Part } from "../core/session/types.js";
  *  5. agent_spawn 已注册（createAgentRuntime 在协调器存在时自动拼 subagentTools），
  *     模型调用 → requireCoordinator(ctx) 抛 SUBAGENTS_UNSUPPORTED。
  *
- *  本文件两条用例构成对照：同一协调器、同一注册表、同一脚本模型——
- *  经 createAgentRuntime（生产装配路径）调用失败；直接构造 SessionRunner
- *  （协调器真正抵达 runner）成功。失败点即 createServer 边界。 */
-
-function subagentRegistry(): AgentRegistry {
-  return new AgentRegistry().derive([
-    { name: "explorer", description: "探索", mode: "subagent", steps: 8, prompt: "你是探索代理。", permission: [], model: { providerId: "faux", modelId: "test-model" } } as never,
-  ]);
-}
+ *  T02 修复：FrameworkDeps 增加显式 subagentCoordinator 字段并透传给
+ *  SessionRunner（消灭静默丢弃）；createAgentRuntime 改显式字段传递。本文件的
+ *  生产装配用例翻绿（PC01：真实 createAgentRuntime 触发 agent_spawn，正常建立
+ *  子会话，不注入替代协调器）；直连 SessionRunner 对照组保持不变（同一协调器
+ *  经两条装配路径行为一致）。 */
 
 function toolPartsOf(parts: Part[]): Part[] {
   return parts.filter((p) => p.type === "tool");
@@ -59,16 +55,14 @@ async function waitForSpawnPart(
   }
 }
 
-describe("T01/F01：createAgentRuntime 的 subagentCoordinator 在 createServer 边界被丢弃", () => {
-  it("生产装配路径：agent_spawn 已注册但执行抛 SUBAGENTS_UNSUPPORTED（协调器未抵达 runner）", async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), "t01-f01-"));
+describe("T02/PC01：subagentCoordinator 经 createAgentRuntime→createServer 抵达 runner", () => {
+  it("生产装配路径：agent_spawn 正常建立子会话（协调器不再被 createServer 边界丢弃）", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "t02-pc01-"));
     try {
       const store = createSqliteSessionStore({ dataDir });
-      const registry = subagentRegistry();
       const launches: string[] = [];
       const coordinator = new SubagentCoordinator({
         store,
-        registry,
         createChildSession: async ({ parent, agentType, description }) =>
           createFrameworkSession({ store, userId: parent.userId, workspaceId: parent.workspaceId, agent: agentType, model: { providerId: "faux", modelId: "test-model" }, prompt: description, parentId: parent.id, title: description }),
         runChild: async (childId) => { launches.push(childId); return "completed"; },
@@ -76,8 +70,8 @@ describe("T01/F01：createAgentRuntime 的 subagentCoordinator 在 createServer 
       });
       const faux = createFauxCore({ models: [{ id: "test-model" }] });
       faux.setResponses([
-        fauxAssistantMessage([fauxToolCall("agent_spawn", { description: "并行探索A", prompt: "P", agent_type: "explorer", mode: "read_only" })]),
-        fauxAssistantMessage("已尝试派出子代理"),
+        fauxAssistantMessage([fauxToolCall("agent_spawn", { description: "并行探索A", prompt: "P", agent_type: "explore", mode: "read_only" })]),
+        fauxAssistantMessage("已派出子代理"),
       ]);
       // 生产装配路径：与 Lectern lib/runtime.ts 相同的 createAgentRuntime 调用形态
       const runtime = createAgentRuntime({
@@ -90,45 +84,51 @@ describe("T01/F01：createAgentRuntime 的 subagentCoordinator 在 createServer 
         subagentCoordinator: coordinator,
         capabilities: { subagents: 1 },
       });
+      // 修复直接证据：协调器抵达 runner（deps 显式字段，不再静默丢弃）
+      expect((runtime.runner as unknown as { deps: { subagentCoordinator?: unknown } }).deps.subagentCoordinator).toBe(coordinator);
       const session = await createFrameworkSession({
         store,
         userId: "u",
         workspaceId: "ws",
         model: { providerId: "faux", modelId: "test-model" },
         prompt: "派一个子代理去探索",
-        // 预盖 task 权限：本用例考的是工具执行期的上下文注入，不是权限门
+        // 预盖 task 权限：本用例考的是装配链路，不是权限门
         permission: [{ permission: "task", pattern: "*", action: "allow" }],
       });
-      await runtime.runner.prompt(session.id, { requestId: "req_f01", text: "派一个子代理去探索" });
+      await runtime.runner.prompt(session.id, { requestId: "req_pc01", text: "派一个子代理去探索" });
 
       const spawnParts = await waitForSpawnPart(store, session.id);
-      // 工具确实被模型调用了（不是「未注册」——那会是另一种错误）
       expect(spawnParts).toHaveLength(1);
-      const state = spawnParts[0]!.state;
-      expect(state.status).toBe("error");
-      expect((state as { error?: string }).error).toContain("SUBAGENTS_UNSUPPORTED");
-      // 协调器全程未被触达：没有子代理记录
-      expect(await store.subagents!.listSubagents({ parentSessionId: session.id })).toHaveLength(0);
-      expect(launches).toHaveLength(0);
+      expect(spawnParts[0]!.state.status).toBe("completed");
+      // 子会话经协调器登记（真实 SubagentRecord，非替代协调器）并真正执行
+      const records = await store.subagents!.listSubagents({ parentSessionId: session.id });
+      expect(records).toHaveLength(1);
+      expect(records[0]!.agentType).toBe("explore");
+      expect(records[0]!.childSessionId).not.toBe(session.id);
+      expect(launches).toHaveLength(1);
+      const childSession = await store.getSession(records[0]!.childSessionId);
+      expect(childSession?.parentId).toBe(session.id);
+      expect(childSession?.userId).toBe("u");
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
 
-  it("对照：同一协调器直连 SessionRunner 时 agent_spawn 成功（缺陷定位在 createServer 边界）", async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), "t01-f01-ctrl-"));
+  it("对照：同一协调器直连 SessionRunner 时 agent_spawn 成功（两条装配路径行为一致）", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "t02-pc01-ctrl-"));
     try {
       const store = createSqliteSessionStore({ dataDir });
-      const registry = subagentRegistry();
+      const registry = new AgentRegistry().derive([
+        { name: "explorer", description: "探索", mode: "subagent", steps: 8, prompt: "你是探索代理。", permission: [], model: { providerId: "faux", modelId: "test-model" } } as never,
+      ]);
       const launches: string[] = [];
       const coordinator = new SubagentCoordinator({
         store,
         registry,
-        // 注意：agent_spawn 工具传给 createChildSession 的 parent 只有 { id: sessionId }
-        // （工具层不携带完整父会话）——真实工厂必须从 store 解析父身份（T02 议题）。
-        // 对照组只验证「协调器抵达 runner 时链路通」，身份用常量。
-        createChildSession: async ({ agentType, description }) =>
-          createFrameworkSession({ store, userId: "u", workspaceId: "ws", agent: agentType, model: { providerId: "faux", modelId: "test-model" }, prompt: description, title: description }),
+        // T02 后父身份由协调器从 store 解析（工具层只传 { id }），
+        // 工厂拿到的是完整父会话——不再需要常量身份兜底。
+        createChildSession: async ({ parent, agentType, description }) =>
+          createFrameworkSession({ store, userId: parent.userId, workspaceId: parent.workspaceId, agent: agentType, model: { providerId: "faux", modelId: "test-model" }, prompt: description, parentId: parent.id, title: description }),
         runChild: async (childId) => { launches.push(childId); return "completed"; },
         abortChild: async () => {},
       });

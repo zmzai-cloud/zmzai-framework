@@ -23,6 +23,9 @@ export type SubagentRecord = {
   parentTaskId: string;
   /** 同 spawnRequestId 重试返回同一 child（不重复派生，spec A14）。 */
   spawnRequestId: string;
+  /** 派生 payload 指纹（T02，spec §4.1）：同键异 payload 重试拒绝
+   *  （SPAWN_PAYLOAD_MISMATCH）。旧记录缺省时不阻断同键重试。 */
+  spawnPayloadHash?: string;
   agentType: string;
   goal: string;
   mode: "read_only" | "workspace_write";

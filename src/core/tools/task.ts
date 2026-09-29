@@ -26,6 +26,8 @@ export const taskTool: ToolDef = {
       description: args.description,
       prompt: args.prompt,
       subagentType: args.subagent_type,
+      // T02：从持久工具调用身份派生幂等键——同一次 task 调用的重试不重复派生。
+      ...(ctx.toolCallId ? { spawnRequestId: `spawn:${ctx.toolCallId}` } : {}),
     });
     return {
       title: `子代理 ${args.subagent_type}：${args.description}`,

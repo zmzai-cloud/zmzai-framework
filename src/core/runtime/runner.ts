@@ -230,6 +230,13 @@ export class SessionRunner {
     return this.#hooks;
   }
 
+  /** 会话级 registry 解析（T02：createServer 给 SubagentCoordinator 绑定同源
+   *  解析——子代理类型检查/默认子会话工厂与 runner 看到同一份 workspace
+   *  自定义 Agent，不会出现「runner 认识、协调器拒绝」的分叉）。 */
+  registryFor(session: SessionInfo): Promise<AgentRegistry> {
+    return this.attemptExecutor.registryFor(session);
+  }
+
   /** fallbackSessionId 由 runLoop 闭包传入（而非实例字段）：runner 是进程级
    *  单例，两个会话并发时实例字段会互相覆盖，导致 message.part.delta 等
    *  无自带 sessionId 的事件落到错误的会话事件流里（串台）。 */
@@ -379,39 +386,28 @@ export class SessionRunner {
     registry: AgentRegistry,
     parentEngine: PermissionEngine,
   ): Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }> {
-    // M3-S21：协调器路径——SubagentRecord 持久化 + 限额队列 + 事件桥保留
+    // M3-S21→T02：协调器路径——子会话创建收敛到协调器的唯一 ChildSessionFactory
+    // （默认实现=父权限 stamp + 父模型继承 + 确定性子 id 幂等），runner 不再
+    // 私建子会话；本方法保留权限审批（PermissionEngine 是 runner 的运行期域）、
+    // 事件桥与等待/摘要投影。
     const coordinator = this.deps.subagentCoordinator;
     if (coordinator) {
-      const depth = await this.sessionDepth(parent);
-      if (depth >= this.deps.subagentDepth) throw new Error(`子代理嵌套深度超过限制（${this.deps.subagentDepth}）`);
-      const subagent = registry.get(input.subagentType);
-      if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) throw new Error(`未知或非子代理类型：${input.subagentType}`);
       await parentEngine.ask({ sessionId: parent.id, permission: "task", patterns: [input.subagentType], always: ["*"], metadata: { subagent: input.subagentType, description: input.description } });
-      // 权限 stamp 的子会话创建 + 事件桥（与旧路径同构）
-      const childSession = await createFrameworkSession({
-        store: this.deps.store, userId: parent.userId, workspaceId: parent.workspaceId,
-        agent: input.subagentType, model: subagent.model ?? parent.model, prompt: input.prompt,
-        parentId: parent.id, title: input.description,
-        // read_only 模式：父权限为上限，写工具全 deny（writePathGuardRules([]) 空集 +
-        // preset 无 writePaths → 圈禁为空 → executor 的 confine 会拒绝全部写路径）
-        permission: input.mode === "read_only" ? [...parent.permission] : [...parent.permission, ...writePathGuardRules(subagent.writePaths ?? [])],
-        ...(input.mode !== "read_only" && subagent.writePaths?.length ? { writePaths: subagent.writePaths } : {}),
-      });
-      await this.publish({ type: "subagent.started", data: { id: childSession.id, agent: input.subagentType, task: input.description, parentSessionId: parent.id } }, parent.id);
       const activeTask = await this.deps.store.task?.getActiveTask(parent.id);
       const record = await coordinator.spawn(parent, activeTask?.id ?? "task_adhoc", activeTask?.rootRequestId ?? activeTask?.id ?? "task_adhoc", {
         description: input.description, prompt: input.prompt, subagentType: input.subagentType,
-        childSessionId: childSession.id,
         ...(input.mode ? { mode: input.mode } : {}),
         ...(input.spawnRequestId ? { spawnRequestId: input.spawnRequestId } : {}),
       });
+      // 权限 stamp 的子会话创建 + 事件桥（与旧路径同构）
+      await this.publish({ type: "subagent.started", data: { id: record.childSessionId, agent: input.subagentType, task: input.description, parentSessionId: parent.id } }, parent.id);
       const { changed } = await coordinator.wait([record.childId], 300_000);
       const final = changed.find((r) => r.childId === record.childId);
-      const summary = final?.result?.summary ?? ((await this.lastAssistantText(childSession.id)) || `(状态 ${final?.status ?? "unknown"})`);
-      await this.recordSubtask(parent, { prompt: input.prompt, description: input.description, agent: input.subagentType, childSessionId: childSession.id });
+      const summary = final?.result?.summary ?? ((await this.lastAssistantText(record.childSessionId)) || `(状态 ${final?.status ?? "unknown"})`);
+      await this.recordSubtask(parent, { prompt: input.prompt, description: input.description, agent: input.subagentType, childSessionId: record.childSessionId });
       const terminalState = final && (final.status === "completed") ? "completed" : "error";
-      await this.publish({ type: "subagent.finished", data: { id: childSession.id, state: terminalState, durationMs: Date.now() - Date.parse(record.times.spawnedAt), toolCalls: 0 } }, parent.id);
-      return { childSessionId: childSession.id, summary, state: terminalState };
+      await this.publish({ type: "subagent.finished", data: { id: record.childSessionId, state: terminalState, durationMs: Date.now() - Date.parse(record.times.spawnedAt), toolCalls: 0 } }, parent.id);
+      return { childSessionId: record.childSessionId, summary, state: terminalState };
     }
     const depth = await this.sessionDepth(parent);
     if (depth >= this.deps.subagentDepth) {

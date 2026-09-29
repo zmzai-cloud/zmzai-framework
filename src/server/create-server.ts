@@ -28,6 +28,12 @@ export type FrameworkDeps = {
   /** 生命周期钩子（P0）：observe/block，见 core/runtime/lifecycle.ts。 */
   hooks?: import("../core/runtime/lifecycle.js").LifecycleHook[];
   subagentDepth?: number;
+  /** 子代理协调器（T02，spec 2026-09-28 §4.1）：宿主注入执行服务
+   *  （runChild/abortChild/限额，可选自定义子会话工厂）；本函数把它透传给
+   *  SessionRunner 并绑定 runner 同源的运行期服务（会话级 registry 解析 +
+   *  深度上限）。此前该字段不存在——宿主经条件 spread 传入会被本边界静默
+   *  丢弃，agent_* 工具已注册但执行期 ctx.subagents 永不注入（F01）。 */
+  subagentCoordinator?: import("../core/subagents/coordinator.js").SubagentCoordinator;
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api> | null };
   leaseStore?: { stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>; clear(sessionId: string): Promise<void> };
   resolveMandatorySkill?: import("../core/runtime/runner.js").MandatorySkillResolver;
@@ -65,7 +71,16 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     ...(deps.compaction ? { compaction: deps.compaction } : {}),
     ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),
     ...(deps.resolveMandatorySkill ? { resolveMandatorySkill: deps.resolveMandatorySkill } : {}),
+    ...(deps.subagentCoordinator ? { subagentCoordinator: deps.subagentCoordinator } : {}),
   });
+  // T02：绑定 runner 同源的运行期服务——协调器的类型检查/默认子会话工厂解析
+  // 到与 runner 相同的 registry（含 workspace 自定义 Agent），深度上限同源。
+  if (deps.subagentCoordinator) {
+    deps.subagentCoordinator.bindRuntimeServices({
+      registryFor: (session) => runner.registryFor(session),
+      subagentDepth: deps.subagentDepth ?? 1,
+    });
+  }
 
   return {
     runner,

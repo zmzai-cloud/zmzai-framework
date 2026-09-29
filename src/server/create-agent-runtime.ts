@@ -125,19 +125,21 @@ export function createAgentRuntime(preset: AgentRuntimePreset): AgentFramework {
     streamFor: (session) => streamFnFor!(session),
   };
 
+  // M3-S21→T02：协调器注入时自动拼 agent_* 工具族（宿主无须手工带 subagentTools）。
+  // subagentCoordinator 作为 createServer 契约内的显式字段传递——此前用条件
+  // spread 并入，spread 豁免 excess property 检查，字段不在 FrameworkDeps 时
+  // 会被静默丢弃（F01：工具已注册、执行期 ctx.subagents 永不注入）。
+  const localTools = [...capabilityTools, ...(preset.subagentCoordinator ? subagentTools : []), ...(preset.localTools ?? [])];
+
   return createServer({
     store: preset.store,
     eventLog: preset.eventLog ?? createMemoryEventLog(),
     modelProvider,
     workspaceFor,
     sandbox,
-    localTools: [...capabilityTools, ...(preset.localTools ?? [])],
-    // M3-S21：协调器注入时自动拼 agent_* 工具族（宿主无须手工带 subagentTools）
-    ...(preset.subagentCoordinator
-      ? { localTools: [...capabilityTools, ...subagentTools, ...(preset.localTools ?? [])] }
-      : {}),
+    localTools,
     subagentDepth,
     ...preset.runnerOptions,
-    ...(preset.subagentCoordinator ? { subagentCoordinator: preset.subagentCoordinator } : {}),
+    subagentCoordinator: preset.subagentCoordinator,
   });
 }

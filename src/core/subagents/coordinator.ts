@@ -1,16 +1,22 @@
-import { randomUUID } from "node:crypto";
-import type { AgentRegistry } from "../agent/registry.js";
+import { createHash, randomUUID } from "node:crypto";
+import { AgentRegistry } from "../agent/registry.js";
 import type { SessionInfo } from "../session/types.js";
-import type { SessionRunner } from "../runtime/runner.js";
+import type { SessionStore } from "../session/store.js";
+import { createFrameworkSession } from "../runtime/runner.js";
+import { writePathGuardRules } from "../permission/write-path.js";
 import type { WorkflowState } from "../session/workflow.js";
-import { isSubagentTerminal, type SubagentRecord, type SubagentStore, type SubagentStatus } from "./types.js";
+import { isSubagentTerminal, newSubagentRecord, type SubagentRecord, type SubagentStore, type SubagentStatus } from "./types.js";
 
-/** SubagentCoordinator（spec §8.1/§8.2，M3-S18）。
+/** SubagentCoordinator（spec §8.1/§8.2，M3-S18；T02 统一子创建入口）。
  *
  *  职责：限额队列调度子 run、五工具的可执行面（spawn/list/send/wait/cancel）、
  *  子 run 生命周期与 SubagentRecord 状态同步。不负责：父 parked/唤醒合并
- *  （S19 TaskLifecycle 接线）、权限交集展开（S20，spawn 时由 caller 传入
- *  已 stamp 好的 childSession）。
+ *  （S19 TaskLifecycle 接线）、权限审批（runner 的 PermissionEngine 域）。
+ *
+ *  T02（spec 2026-09-28 §4.1）：子会话创建收敛到唯一 ChildSessionFactory——
+ *  agent_spawn 与旧 task 两条路径共用；父身份从 store 解析（禁止只有 id 的
+ *  伪 Session 直达工厂）；spawnRequestId 未显式提供时由工具层从持久工具调用
+ *  身份派生，同键异 payload 拒绝；深度由服务端解析。
  *
  *  队列语义（spec §8.1）：每根 Task 最多 3 并发、全局最多 6；根间轮转、
  *  根内 FIFO——防某任务占满全部额度。 */
@@ -23,35 +29,107 @@ export type SpawnInput = {
   description: string;
   prompt: string;
   subagentType: string;
-  /** 幂等键（工具层透传 requestId）；同键返回既有 child。 */
+  /** 幂等键（工具层从 toolCallId 派生或模型显式提供）；同键返回既有 child，
+   *  同键异 payload 抛 SPAWN_PAYLOAD_MISMATCH（spec §4.1）。 */
   spawnRequestId?: string;
   mode?: "read_only" | "workspace_write";
 };
 
+/** 统一子会话工厂（spec §4.1 唯一创建入口的契约）。宿主可注入自定义工厂，
+ *  默认实现见 createDefaultChildSessionFactory。 */
+export type ChildSessionFactory = (input: {
+  parent: SessionInfo;
+  agentType: string;
+  prompt: string;
+  description: string;
+  mode: "read_only" | "workspace_write";
+  spawnRequestId: string;
+}) => Promise<SessionInfo>;
+
+/** spawn payload 指纹：同 spawnRequestId 重试时校验 payload 一致性。
+ *  SpawnInput（subagentType）与 ChildSessionFactory 输入（agentType）是同一
+ *  字段的两种形态，归一后取 hash——协调器与工厂两侧必须得到相同指纹。 */
+function spawnPayloadHashOf(input: { description: string; prompt: string; subagentType?: string; agentType?: string; mode?: "read_only" | "workspace_write" }): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ description: input.description, prompt: input.prompt, subagentType: input.subagentType ?? input.agentType, mode: input.mode ?? "read_only" }))
+    .digest("hex");
+}
+
+/** 确定性子会话 id：同 spawnRequestId 的创建中断重试落到同一 id（PC04 崩溃窗口）。 */
+export function childSessionIdFor(spawnRequestId: string): string {
+  return `ses_sub_${createHash("sha256").update(spawnRequestId).digest("hex").slice(0, 20)}`;
+}
+
+/** 框架默认 ChildSessionFactory：真实 registry + 父 Session 派生创建。
+ *  - 权限上限：read_only 继承父权限（空集圈禁写路径）；workspace_write 追加
+ *    preset writePaths 圈禁（白名单 allow + 全局 deny 兜底）。
+ *  - 模型/身份继承：preset model ?? 父会话模型；userId/workspaceId 继承父
+ *    （凭据引用随父用户，不复制凭据内容）。
+ *  - 幂等：子 id 与 creationRequestId 均从 spawnRequestId 派生——创建中断后
+ *    重试命中 store 的既有会话（同键同 hash no-op），不产生第二个 childSession。 */
+export function createDefaultChildSessionFactory(deps: {
+  store: SessionStore;
+  registryFor: (session: SessionInfo) => Promise<AgentRegistry>;
+}): ChildSessionFactory {
+  return async (input) => {
+    const registry = await deps.registryFor(input.parent);
+    const subagent = registry.get(input.agentType);
+    if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) {
+      throw new Error(`未知或非子代理类型：${input.agentType}`);
+    }
+    const guard = input.mode === "read_only" ? [] : writePathGuardRules(subagent.writePaths ?? []);
+    return createFrameworkSession({
+      store: deps.store,
+      userId: input.parent.userId,
+      workspaceId: input.parent.workspaceId,
+      id: childSessionIdFor(input.spawnRequestId),
+      agent: input.agentType,
+      model: subagent.model ?? input.parent.model,
+      prompt: input.prompt,
+      parentId: input.parent.id,
+      title: input.description,
+      permission: [...input.parent.permission, ...guard],
+      ...(input.mode !== "read_only" && subagent.writePaths?.length ? { writePaths: subagent.writePaths } : {}),
+      creationRequestId: input.spawnRequestId,
+      creationPayloadHash: spawnPayloadHashOf(input),
+    });
+  };
+}
+
 export type SubagentCoordinatorDeps = {
-  store: { subagents?: SubagentStore };
-  registry: AgentRegistry;
-  /** 子会话创建（caller 负责 permission stamp/writePath 圈禁——S20）；
-   *  幂等：同 spawnRequestId 已有 child 时不会被调用。 */
-  createChildSession(input: { parent: SessionInfo; agentType: string; prompt: string; description: string; mode: "read_only" | "workspace_write" }): Promise<SessionInfo>;
+  store: SessionStore;
+  /** 直连构造时的静态 registry 基线。经 createServer 装配时由 bindRuntimeServices
+   *  绑定 runner 同源的会话级解析（含 .zmzai/agents 工作区自定义 Agent），
+   *  绑定后优先于本字段。 */
+  registry?: AgentRegistry;
+  /** 会话级 registry 解析（宿主直连构造时注入）。 */
+  registryFor?: (session: SessionInfo) => Promise<AgentRegistry>;
+  /** 子会话创建工厂；缺省用框架默认实现（见 createDefaultChildSessionFactory）。 */
+  createChildSession?: ChildSessionFactory;
   /** 子 run 执行（SessionRunner.prompt 或 runAttempt）；返回终态。 */
   runChild(childSessionId: string, prompt: string): Promise<WorkflowState>;
   /** 取消子 run（runner.abort）。 */
   abortChild(childSessionId: string): Promise<void>;
   limits?: CoordinatorLimits;
+  /** 嵌套深度上限（默认 1）；createServer 装配时与 runner 同源绑定。 */
+  subagentDepth?: number;
 };
 
 export class SubagentCoordinator {
   private readonly limits: CoordinatorLimits;
-  /** 排队等待额度的 childId（FIFO per root 由 pickNext 实现）。 */
   private readonly queue: { childId: string; rootTaskId: string; prompt: string }[] = [];
   /** 活跃子 run 的取消句柄（childId → abort）。 */
   private readonly active = new Map<string, { abort(): void; done: Promise<void> }>();
   /** wait 的轮询唤醒（子终态时 resolve）。 */
   private readonly waiters = new Set<() => void>();
+  /** createServer 绑定的运行期服务（会话级 registry + 深度）。 */
+  private bound: { registryFor: (session: SessionInfo) => Promise<AgentRegistry>; subagentDepth: number } | null = null;
+  private readonly createChildSession: ChildSessionFactory;
 
   constructor(private readonly deps: SubagentCoordinatorDeps) {
     this.limits = deps.limits ?? DEFAULT_LIMITS;
+    this.createChildSession = deps.createChildSession
+      ?? createDefaultChildSessionFactory({ store: deps.store, registryFor: (session) => this.resolveRegistry(session) });
   }
 
   private get store(): SubagentStore {
@@ -59,47 +137,113 @@ export class SubagentCoordinator {
     return this.deps.store.subagents;
   }
 
-  /** agent_spawn：登记（幂等）→ 入队 → 立即返回 childId（不等待执行）。 */
-  async spawn(parent: SessionInfo, parentTaskId: string, rootTaskId: string, input: SpawnInput & { childSessionId?: string }): Promise<SubagentRecord> {
-    const spawnRequestId = input.spawnRequestId ?? randomUUID();
-    const prior = await this.store.findSubagentBySpawnRequest(parent.id, spawnRequestId);
-    if (prior) return prior; // A14：重试返回同一 child
+  private get subagentDepth(): number {
+    return this.bound?.subagentDepth ?? this.deps.subagentDepth ?? 1;
+  }
 
-    // runner 协调路径预建了权限 stamp 的子会话（registry/engine 在 runner 侧）——
-    // 直接采用，不再自建（自建会绕过 stamp 造成第二个孤儿会话）
-    const child = input.childSessionId
-      ? ({ id: input.childSessionId, userId: parent.userId, workspaceId: parent.workspaceId } as SessionInfo)
-      : await this.resolveViaRegistry(parent, input);
-    const mode = input.mode ?? "read_only";
-    const record: SubagentRecord = {
-      childId: child.id,
-      childSessionId: child.id,
-      parentSessionId: parent.id,
-      rootTaskId,
-      parentTaskId,
-      spawnRequestId,
+  /** 会话级 registry 解析：绑定（createServer，含 workspace Agent）> 宿主注入 >
+   *  静态基线 > 空注册表。 */
+  private async resolveRegistry(session: SessionInfo): Promise<AgentRegistry> {
+    if (this.bound) return this.bound.registryFor(session);
+    if (this.deps.registryFor) return this.deps.registryFor(session);
+    if (this.deps.registry) return this.deps.registry;
+    return new AgentRegistry();
+  }
+
+  /** createServer 装配时绑定 runner 同源的运行期服务。重复绑定拒绝——
+   *  多 runner 场景共享一个协调器时换源必须显式，不能悄悄生效。 */
+  bindRuntimeServices(services: { registryFor: (session: SessionInfo) => Promise<AgentRegistry>; subagentDepth: number }): void {
+    if (this.bound) throw new Error("SUBAGENT_SERVICES_ALREADY_BOUND：协调器运行期服务已绑定");
+    this.bound = { registryFor: services.registryFor, subagentDepth: services.subagentDepth };
+  }
+
+  /** 父身份解析（spec §4.1：禁止只有 id 的伪 Session 抵达创建工厂）。
+   *  工具层只带 { id }（ToolContext 没有 SessionInfo 全量）；缺失身份时从
+   *  store 解析完整父会话——userId 为 undefined 的伪 Session 会让 SQLite
+   *  参数绑定直接崩（实测 "Provided value cannot be bound to SQLite parameter"）。 */
+  private async resolveParent(parentRef: SessionInfo | { id: string }): Promise<SessionInfo> {
+    const ref = parentRef as Partial<SessionInfo>;
+    if (ref.userId != null && ref.workspaceId != null) return parentRef as SessionInfo;
+    const stored = await this.deps.store.getSession(parentRef.id);
+    if (!stored) throw new Error(`父会话不存在或不可解析：${parentRef.id}`);
+    return stored;
+  }
+
+  /** 父链深度：服务端从 store 解析（不信任调用方声明，spec §4.1）。 */
+  private async parentDepth(session: SessionInfo): Promise<number> {
+    let depth = 0;
+    let current: SessionInfo | null = session;
+    while (current?.parentId) {
+      depth += 1;
+      current = await this.deps.store.getSession(current.parentId);
+    }
+    return depth;
+  }
+
+  /** agent_spawn：父身份解析 → 幂等校验 → 深度/类型检查 → 唯一工厂创建 →
+   *  登记（幂等）→ 入队 → 立即返回 childId（不等待执行）。 */
+  async spawn(parentRef: SessionInfo | { id: string }, parentTaskId: string, rootTaskId: string, input: SpawnInput): Promise<SubagentRecord> {
+    const parent = await this.resolveParent(parentRef);
+    const spawnRequestId = input.spawnRequestId ?? `spawn:${randomUUID()}`;
+    const spawnPayloadHash = spawnPayloadHashOf(input);
+    const prior = await this.store.findSubagentBySpawnRequest(parent.id, spawnRequestId);
+    if (prior) {
+      if (prior.spawnPayloadHash && prior.spawnPayloadHash !== spawnPayloadHash) {
+        throw new Error(`SPAWN_PAYLOAD_MISMATCH：spawnRequestId=${spawnRequestId} 已用于不同 payload 的派生，拒绝重放`);
+      }
+      return prior; // A14：重试返回同一 child
+    }
+
+    const depth = await this.parentDepth(parent);
+    if (depth >= this.subagentDepth) throw new Error(`子代理嵌套深度超过限制（${this.subagentDepth}）`);
+
+    // 类型守卫（对所有工厂生效）：agentType 必须是 registry 声明的子代理类型，
+    // 模型编造的类型在这里拒绝（spec §4.1 不能信任模型给任意 childId/类型）。
+    const registry = await this.resolveRegistry(parent);
+    const subagent = registry.get(input.subagentType);
+    if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) {
+      throw new Error(`未知或非子代理类型：${input.subagentType}`);
+    }
+
+    const child = await this.createChildSession({
+      parent,
       agentType: input.subagentType,
-      goal: input.description,
-      mode,
-      workspaceId: child.workspaceId,
-      status: "queued",
-      revision: 1,
-      traceId: randomUUID(),
-      times: { spawnedAt: new Date().toISOString() },
+      prompt: input.prompt,
+      description: input.description,
+      mode: input.mode ?? "read_only",
+      spawnRequestId,
+    });
+    const record: SubagentRecord = {
+      ...newSubagentRecord({
+        childSessionId: child.id,
+        parentSessionId: parent.id,
+        rootTaskId,
+        parentTaskId,
+        spawnRequestId,
+        agentType: input.subagentType,
+        goal: input.description,
+        mode: input.mode ?? "read_only",
+        workspaceId: child.workspaceId,
+        traceId: randomUUID(),
+      }),
+      spawnPayloadHash,
     };
-    const created = await this.store.createSubagent(record);
+    const created = await this.createSubagentIdempotent(record);
     this.queue.push({ childId: created.childId, rootTaskId, prompt: input.prompt });
     this.pump();
     return created;
   }
 
-  /** 无预建会话时的原路径：registry 类型检查 + deps.createChildSession。 */
-  private async resolveViaRegistry(parent: SessionInfo, input: SpawnInput): Promise<SessionInfo> {
-    const subagent = this.deps.registry.get(input.subagentType);
-    if (!subagent || (subagent.mode !== "subagent" && subagent.mode !== "all")) {
-      throw new Error(`未知或非子代理类型：${input.subagentType}`);
+  /** 登记幂等：并发同键 spawn 撞唯一索引（parent_session_id, spawn_request_id）
+   *  时回落到既有记录，不重复入队。 */
+  private async createSubagentIdempotent(record: SubagentRecord): Promise<SubagentRecord> {
+    try {
+      return await this.store.createSubagent(record);
+    } catch (error) {
+      const prior = await this.store.findSubagentBySpawnRequest(record.parentSessionId, record.spawnRequestId).catch(() => null);
+      if (prior) return prior;
+      throw error;
     }
-    return this.deps.createChildSession({ parent, agentType: input.subagentType, prompt: input.prompt, description: input.description, mode: input.mode ?? "read_only" });
   }
 
   /** agent_list：当前树内子代理 + 最近进度。 */
