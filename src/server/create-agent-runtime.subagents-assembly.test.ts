@@ -41,20 +41,18 @@ function toolPartsOf(parts: Part[]): Part[] {
 
 /** prompt() 是提交收据语义（异步经 workflow 驱动链推进），不等待运行完成；
  *  轮询直到出现 agent_spawn 工具 part 或超时。 */
+type ToolPart = Extract<Part, { type: "tool" }>;
 async function waitForSpawnPart(
   store: ReturnType<typeof createSqliteSessionStore>,
   sessionId: string,
   timeoutMs = 10_000,
-): Promise<Part[]> {
+): Promise<ToolPart[]> {
   const start = Date.now();
   for (;;) {
-    const snapshot = await store.getMessageSnapshot(sessionId, { limit: 50 });
-    const spawnParts = toolPartsOf(snapshot.messages.flatMap((m) => m.parts)).filter((p) => p.type === "tool" && p.tool === "agent_spawn");
+    const snapshot = await store.getMessageSnapshot!(sessionId, { limit: 50 });
+    const spawnParts = toolPartsOf(snapshot.messages.flatMap((m) => m.parts)).filter((p): p is Extract<Part, { type: "tool" }> => p.type === "tool" && p.tool === "agent_spawn");
     // 工具 part 需落到终态（error/completed）才算可断言
-    const settled = spawnParts.filter((p) => {
-      const s = (p as { state: { status: string } }).state;
-      return s.status === "error" || s.status === "completed";
-    });
+    const settled = spawnParts.filter((p) => p.state.status === "error" || p.state.status === "completed");
     if (settled.length > 0) return settled;
     if (Date.now() - start > timeoutMs) return spawnParts;
     await new Promise((r) => setTimeout(r, 50));
@@ -106,9 +104,9 @@ describe("T01/F01：createAgentRuntime 的 subagentCoordinator 在 createServer 
       const spawnParts = await waitForSpawnPart(store, session.id);
       // 工具确实被模型调用了（不是「未注册」——那会是另一种错误）
       expect(spawnParts).toHaveLength(1);
-      const state = spawnParts[0]!.state as { status: string; error?: string };
+      const state = spawnParts[0]!.state;
       expect(state.status).toBe("error");
-      expect(state.error).toContain("SUBAGENTS_UNSUPPORTED");
+      expect((state as { error?: string }).error).toContain("SUBAGENTS_UNSUPPORTED");
       // 协调器全程未被触达：没有子代理记录
       expect(await store.subagents!.listSubagents({ parentSessionId: session.id })).toHaveLength(0);
       expect(launches).toHaveLength(0);
@@ -169,7 +167,7 @@ describe("T01/F01：createAgentRuntime 的 subagentCoordinator 在 createServer 
 
       const spawnParts = await waitForSpawnPart(store, session.id);
       expect(spawnParts).toHaveLength(1);
-      const state = spawnParts[0]!.state as { status: string; output?: string };
+      const state = spawnParts[0]!.state;
       expect(state.status).toBe("completed");
       // 子代理经协调器登记并真正执行
       const records = await store.subagents!.listSubagents({ parentSessionId: session.id });
