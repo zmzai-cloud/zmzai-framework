@@ -352,15 +352,20 @@ export class SubagentCoordinator {
     }
   }
 
-  /** 启动对账（T04，spec §4.2）：内存队列/活跃表只是缓存，进程重启后凭 store
-   *  重建——queued（从未开始）凭记录里的 prompt 重新入队执行；running/cancelling
-   *  是上个进程的在途执行、结果未知 → 落 blocked 进恢复审查（cancelling 补收
-   *  cancelled），不自动重放副作用；waiting_* 无活跃 run、重启安全，保持原状
-   *  （waiting_permission 的重启审计随 T06 恢复场景收口）。 */
+  /** 启动对账（T04/T06，spec §4.2）：内存队列/活跃表只是缓存，进程重启后凭
+   *  store 重建——queued（从未开始）凭记录里的 prompt 重新入队执行；
+   *  running/cancelling 是上个进程的在途执行、结果未知 → 落 blocked 进恢复
+   *  审查（cancelling 补收 cancelled），不自动重放副作用；waiting_* 无活跃
+   *  run、重启安全，保持原状。
+   *  另外（PC06 持久唤醒）：in-process 唤醒 Set 随进程消失——「parked 父任务
+   *  + 未消费 to_parent 结果」就是持久唤醒状态；终态子 + 未消费邮件 + 父任务
+   *  running（parkedReason=children）时经 onChildTerminal 通道重建唤醒；父
+   *  任务终态/等待态不复活（§8.4/A29）。 */
   private recover(): void {
     void (async () => {
       const stale = await this.store.listSubagents({}).catch(() => [] as SubagentRecord[]);
       let requeued = 0;
+      const wakeCandidates = new Map<string, SubagentRecord>();
       for (const rec of stale) {
         if (rec.status === "queued") {
           this.queue.push({ childId: rec.childId, rootTaskId: rec.rootTaskId, prompt: rec.prompt ?? rec.goal });
@@ -370,9 +375,26 @@ export class SubagentCoordinator {
             ? { status: "cancelled", times: { ...rec.times, endedAt: new Date().toISOString() } }
             : { status: "blocked", blockerReason: "宿主重启：子运行中断，结果未知，需恢复核对（不自动重放副作用）", times: { ...rec.times, endedAt: new Date().toISOString() } })
             .catch(() => undefined);
+        } else if (isSubagentTerminal(rec.status)) {
+          wakeCandidates.set(rec.parentSessionId, rec);
         }
       }
       if (requeued > 0) this.pump();
+      // 持久唤醒对账：构造异步起步（首个 store 读即挂起），此处 holder/runner
+      // 已由宿主回填完成（Lectern 在 createAgentRuntime 返回后同步赋值）。
+      const taskStore = this.deps.store.task;
+      if (taskStore && this.deps.onChildTerminal) {
+        for (const [parentSessionId, child] of wakeCandidates) {
+          const task = await taskStore.getActiveTask(parentSessionId).catch(() => null);
+          if (!task || task.status !== "running") continue; // 终态/等待态父不复活
+          const messages = await this.store.listMessages(child.childId).catch(() => []);
+          if (messages.some((m) => m.direction === "to_parent" && m.kind === "result" && !m.consumedByParent)) {
+            try {
+              this.deps.onChildTerminal!(child, parentSessionId);
+            } catch { /* 对账唤醒失败不影响其余恢复 */ }
+          }
+        }
+      }
     })().catch(() => undefined);
   }
 

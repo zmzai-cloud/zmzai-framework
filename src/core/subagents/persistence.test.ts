@@ -68,8 +68,7 @@ async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 5_000): 
   }
 }
 
-describe("T04：持久队列与断点恢复（PC06 存储接口）", () => {
-  it("重启（同 store 重建协调器）：queued 凭 prompt 恢复执行，running 落 blocked 恢复审查，不重放", async () => {
+describe("T04：持久队列与断点恢复（PC06 存储接口）", () => {  it("重启（同 store 重建协调器）：queued 凭 prompt 恢复执行，running 落 blocked 恢复审查，不重放", async () => {
     const first = await bootCoordinator({ runMs: 10_000, limits: { perRoot: 1, global: 1 } });
     try {
       // 两个子：一个启动（running，卡住），一个排队（queued，从未开始）
@@ -190,6 +189,61 @@ describe("T04：agent_send 进入子上下文（PC07 存储与调度接口）", 
       await rm(ctx2.dataDir, { recursive: true, force: true });
     } finally {
       await rm(ctx.dataDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+describe("T06：持久唤醒对账（PC06——重启后 parked 父任务的唤醒重建）", () => {
+  it("终态子 + 未消费结果 + 父任务 running(parked) → 重启重建唤醒；父终态不复活", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "t06-wake-"));
+    try {
+      const store = createSqliteSessionStore({ dataDir });
+      const session = await createFrameworkSession({ store, userId: "u", workspaceId: "ws", model: { providerId: "faux", modelId: "m" }, prompt: "根任务" });
+      const task = await store.task!.createTask({ sessionId: session.id, rootRequestId: "req_wake", rootUserMessageId: "m0", goal: "G" });
+      // 父任务 park（running + parkedReason=children）
+      await store.task!.updateTask(task.id, task.revision, { status: "running", parkedReason: "children" });
+      // 终态子 + 未消费结果邮件（进程死亡前的完整落库，唤醒 Set 已随进程消失）
+      const child = await store.subagents!.createSubagent({
+        childId: "ses_wake_child", childSessionId: "ses_wake_child", parentSessionId: session.id,
+        rootTaskId: task.rootRequestId, parentTaskId: task.id, spawnRequestId: "t06-wake", agentType: "explorer",
+        goal: "探索", mode: "read_only", workspaceId: "ws", status: "completed", revision: 2, traceId: "t",
+        result: { outcome: "completed", summary: "结论已产出" }, times: { spawnedAt: new Date().toISOString(), endedAt: new Date().toISOString() },
+      });
+      await store.subagents!.appendMessage({
+        messageId: "result_ses_wake_child_2", childId: child.childId, direction: "to_parent", kind: "result",
+        payload: JSON.stringify({ outcome: "completed", summary: "结论已产出", childId: child.childId }),
+        createdAt: new Date().toISOString(),
+      });
+
+      // 重启：同 store 重建协调器——持久唤醒状态（parked + 未消费）重建唤醒
+      const wakes: { childId: string; parentSessionId: string }[] = [];
+      const deps: SubagentCoordinatorDeps = {
+        store,
+        registry: registryWith(),
+        runChild: async () => ({ state: "completed" }),
+        abortChild: async () => {},
+        onChildTerminal: (c, parentSessionId) => wakes.push({ childId: c.childId, parentSessionId }),
+      };
+      void new SubagentCoordinator(deps);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(wakes).toEqual([{ childId: "ses_wake_child", parentSessionId: session.id }]);
+
+      // 对照：父任务终态（delivered）后同样的持久状态不产生唤醒（不复活）
+      const finalTask = await store.task!.getTask(task.id);
+      await store.task!.updateTask(task.id, finalTask!.revision, { status: "delivered" });
+      const wakes2: { childId: string; parentSessionId: string }[] = [];
+      const deps2: SubagentCoordinatorDeps = {
+        store,
+        registry: registryWith(),
+        runChild: async () => ({ state: "completed" }),
+        abortChild: async () => {},
+        onChildTerminal: (c, parentSessionId) => wakes2.push({ childId: c.childId, parentSessionId }),
+      };
+      void new SubagentCoordinator(deps2);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(wakes2).toEqual([]);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
     }
   }, 15_000);
 });
