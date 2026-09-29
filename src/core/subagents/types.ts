@@ -51,6 +51,18 @@ export type SubagentRecord = {
   };
   /** 父验证状态（§9.4）：消费 ≠ 接受。 */
   consumeState?: SubagentConsumeState;
+  /** 返工替代关系（T05，§9.4）：本子代理取代的被否决子代理（replacesChildId）。
+   *  被否决的必要子任务只有被显式替代或复核改判后才不再阻塞父交付。 */
+  replacesChildId?: string;
+  /** 验收记录（T05，PC08）：父执行器对子结果的复核结论，绑定子结果版本
+   *  （childRevision=验收时的记录 revision——子结果后续变化使验收过期）。 */
+  review?: {
+    decision: SubagentConsumeState;
+    note?: string;
+    evidenceRefs?: string[];
+    reviewedAt: string;
+    childRevision: number;
+  };
   /** 取消/阻塞原因（blocked 时必填，spec：不伪装完成）。 */
   blockerReason?: string;
 };

@@ -19,6 +19,8 @@ import { advanceProgress } from "../task/progress.js";
 import { appendEvidence, applyDelivery, pruneEvidenceRefs, projectTodos } from "../task/plan.js";
 import { fallbackResult, renderResult } from "../task/contract.js";
 import { isTerminalStatus, isWaitingStatus, type TaskBlocker, type TaskEvidenceKind, type TaskPatch, type TaskRecord, type TaskStep } from "../task/types.js";
+import { drainParentMailbox } from "../subagents/parked.js";
+import { isSubagentTerminal } from "../subagents/types.js";
 
 /** 单次 Attempt（内部运行）的完整结果。
  *
@@ -207,7 +209,7 @@ export class TaskLifecycle {
    *  「你需要去登录」，而不是「我已完成」。前者是事实的输入（只有模型知道自己在
    *  等什么），后者才是不能采信的东西——完成与否始终由 Completion Gate 按步骤、
    *  验收条件与证据独立判定，模型无法用 task_block 换来一个 delivered。 */
-  completionStateOf(outcome: RunOutcome, session: SessionInfo): CompletionRuntimeState {
+  completionStateOf(outcome: RunOutcome, session: SessionInfo, subagentPending?: string[] | null): CompletionRuntimeState {
     // 只有「重试已经耗尽、且错误不是上游抖动」才算真的没救（规格 §10.2）。
     // runLoop 内部已对可重试错误做过 5 次退避重试，能走到这里说明它没救回来。
     const fatal = outcome.state === "failed" && !!outcome.errorMessage && !isRetryableError(outcome.errorMessage);
@@ -221,7 +223,9 @@ export class TaskLifecycle {
       unknownSideEffect: outcome.unknownSideEffect ? (outcome.sideEffectDetail ?? "存在结果不确定的操作") : null,
       pendingPermissions: isSessionAwaitingPermission(session.id) ? 1 : 0,
       unsafeReplay: null,
-      subagentPending: null, // M3-S22：无协调器时无子代理门禁
+      // T05/F03 修复（spec §9.4/§8.4）：查询真实子记录（见 subagentPendingOf），
+      // 不再恒 null——必要子代理未收尾/结果未纳入/复核未通过时阻塞交付。
+      subagentPending: subagentPending ?? null,
       budgetExhausted: null,
       externalAuthRequired: block?.kind === "external_auth" ? { message: block.message, requiredAction: block.requiredAction } : null,
       inputRequired: block?.kind === "input" ? { message: block.message, requiredAction: block.requiredAction } : null,
@@ -230,6 +234,59 @@ export class TaskLifecycle {
       finalTextPresent: outcome.finalText.trim().length > 0,
       cancelled: outcome.aborted,
     };
+  }
+
+  /** 必要子代理的交付门禁事实（T05/F03，spec §9.4/§8.4）。
+   *
+   *  阻塞项：一、非终态（queued、running、waiting_*、cancelling、blocked、recovering）；
+   *  二、终态但 to_parent 结果未被父消费（drain 水位未推进——消费是「看到了」，
+   *  还不是「接受了」，但没看到就交付等于无视子结果）；三、needs_revision/
+   *  rejected 且未被替代（replacesChildId 关联的替代子代理自身须终态且结果
+   *  已消费）或改判 accepted。
+   *  无 subagents 面或树下无记录时返回 null（不影响无子代理的任务）。 */
+  private async subagentPendingOf(task: TaskRecord): Promise<string[] | null> {
+    const subagents = this.deps.store.subagents;
+    if (!subagents) return null;
+    const children = await subagents.listSubagents({ rootTaskId: task.rootRequestId ?? task.id }).catch(() => []);
+    if (children.length === 0) return null;
+    const pending: string[] = [];
+    for (const child of children) {
+      if (!isSubagentTerminal(child.status)) {
+        pending.push(`${child.childId}(${child.status})`);
+        continue;
+      }
+      const consumeState = child.consumeState ?? "pending_review";
+      if (consumeState === "pending_review") {
+        const messages = await subagents.listMessages(child.childId).catch(() => []);
+        if (messages.some((m) => m.direction === "to_parent" && m.kind === "result" && !m.consumedByParent)) {
+          pending.push(`${child.childId}(结果未纳入)`);
+        }
+        continue;
+      }
+      if (consumeState === "needs_revision" || consumeState === "rejected") {
+        // 被否决的必要子任务：显式替代（替代者终态且结果已消费）或改判 accepted
+        const replacement = children.find((c) => c.replacesChildId === child.childId);
+        const replacementSettled = replacement && isSubagentTerminal(replacement.status)
+          && !(await subagents.listMessages(replacement.childId).catch(() => [])).some((m) => m.direction === "to_parent" && m.kind === "result" && !m.consumedByParent);
+        if (!replacementSettled) pending.push(`${child.childId}(${consumeState}，待替代或改判)`);
+      }
+    }
+    return pending.length > 0 ? pending : null;
+  }
+
+  /** 必要子代理未收尾 → park（T05，PC05，spec §8.2 调度状态）：TaskRecord 保持
+   *  running + parkedReason=children（CAS），结束本次驱动——释放父模型并发槽，
+   *  不靠空转模型轮次轮询，也不要求用户发「继续」。唤醒链路：子终态（同事务
+   *  结算+结果邮件）→ onChildTerminal → requestInternalResume → driveResumedTask
+   *  → runTask 续跑（drain 邮箱并入 advisory）。 */
+  private async parkIfChildrenPending(task: TaskRecord): Promise<boolean> {
+    const taskStore = this.deps.store.task;
+    if (!taskStore || !this.deps.store.subagents) return false;
+    if (!(await this.subagentPendingOf(task))) return false;
+    const fresh = await taskStore.getTask(task.id);
+    if (!fresh || isTerminalStatus(fresh.status)) return false;
+    await this.casTask(fresh, { parkedReason: "children" });
+    return true;
   }
 
   /** 步骤变化 → 事件。粒度按「状态真的变了」算，重放时不会重复累计。 */
@@ -472,6 +529,9 @@ export class TaskLifecycle {
     // 整个任务共用一个循环防护实例（规格 §16 阶段 D「loop-guard 扩展为跨 Attempt」）
     const loopGuard = new LoopGuard();
     let stats = { filesEdited: [] as string[], toolCalls: 0, durationMs: 0 };
+    /** T05（PC05/PC06）：本轮注入的子结果邮箱水位——Attempt 真正跑完（结果已
+     *  进入模型上下文并持久化）后才 commit；中途崩溃只会重读不丢结果。 */
+    let mailboxCommit: (() => Promise<void>) | null = null;
 
     while (true) {
       const attemptNumber = task.attemptCount + 1;
@@ -490,6 +550,21 @@ export class TaskLifecycle {
             resumable: true,
           },
         }, session, stats);
+      }
+
+      // T05（PC05）：续跑/内部续跑时 drain 父邮箱——子结果并入本轮 advisory
+      // （系统指令注入，不落用户消息，spec §18.2/§19）；全部终态且结果已消费
+      // 时清 parked 标记（park 是调度状态，不是第二套生命周期）。
+      if ((input.resume || continuation) && this.deps.store.subagents) {
+        const drain = await drainParentMailbox({ subagents: this.deps.store.subagents }, task.rootRequestId ?? task.id);
+        if (drain.results.length > 0) {
+          const resultsBlock = `【子代理结果】\n${drain.results.map((r) => `- ${r.childId}: ${r.outcome} — ${r.summary}`).join("\n")}`;
+          advisory = advisory ? `${advisory}\n\n${resultsBlock}` : resultsBlock;
+          mailboxCommit = drain.commit;
+        }
+        if (drain.clearedPark && task.parkedReason) {
+          task = await this.casTask(task, { parkedReason: undefined });
+        }
       }
 
       task = await this.casTask(task, { status: "running", attemptCount: attemptNumber, blocker: undefined });
@@ -511,6 +586,12 @@ export class TaskLifecycle {
 
       task = await this.syncTaskFromAttempt(task, outcome, session.id);
 
+      // T05（PC06）：本轮子结果已随 Attempt 注入上下文并持久化——推进邮箱水位。
+      if (mailboxCommit) {
+        await mailboxCommit().catch(() => undefined);
+        mailboxCommit = null;
+      }
+
       // 一次 Attempt 结束——**不是**任务完成（规格 §8.3）。UI 只能拿它画轨迹。
       await this.deps.publish(
         {
@@ -528,8 +609,15 @@ export class TaskLifecycle {
         session.id,
       );
 
-      const verdict = evaluateTaskCompletion(task, this.completionStateOf(outcome, session), noProgressPolicy);
+      // T05/F03：交付门禁查询真实子代理记录（非终态/结果未纳入/复核未通过）
+      const subagentPending = await this.subagentPendingOf(task);
+      const verdict = evaluateTaskCompletion(task, this.completionStateOf(outcome, session, subagentPending), noProgressPolicy);
       if (verdict.status !== "continue") return await this.settleTask(task, verdict, session, stats);
+
+      // T05（PC05）：必要子代理未收尾 → park（保持 running + parkedReason=children，
+      // 释放父并发槽，不空转轮次）。子终态钩子唤醒后经 driveResumedTask 续跑，
+      // drain 邮箱把结果并入下轮 advisory。
+      if (await this.parkIfChildrenPending(task)) return "running";
 
       // ---- 内部续跑：不创建用户消息，不新建 workflow run ----
       advisory = verdict.advisory;

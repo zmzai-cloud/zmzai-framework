@@ -69,8 +69,9 @@ export async function onChildTerminal(deps: ParkControllerDeps, child: SubagentR
 /** 父唤醒时的未消费结果读取（T04 两段式，PC06）：**投递水位在实际 Attempt
  *  上下文持久登记后才能推进**（spec §4.2）——读取阶段不动水位；消费方把
  *  results 注入父上下文并持久化后调用 commit() 推进水位。读取与 commit 之间
- *  崩溃只会导致重读（幂等），不会丢结果；重复 commit 也是幂等 no-op。 */
-export async function drainParentMailbox(deps: ParkControllerDeps, rootTaskId: string): Promise<{
+ *  崩溃只会导致重读（幂等），不会丢结果；重复 commit 也是幂等 no-op。
+ *  只依赖 subagents 面（TaskLifecycle 等调用方无须拼装无关依赖）。 */
+export async function drainParentMailbox(deps: Pick<ParkControllerDeps, "subagents">, rootTaskId: string): Promise<{
   results: { childId: string; outcome: string; summary: string }[];
   /** 水位推进：results 已持久进父上下文后调用。 */
   commit: () => Promise<void>;

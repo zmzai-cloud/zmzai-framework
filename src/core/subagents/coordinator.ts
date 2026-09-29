@@ -32,6 +32,8 @@ export type SpawnInput = {
    *  同键异 payload 抛 SPAWN_PAYLOAD_MISMATCH（spec §4.1）。 */
   spawnRequestId?: string;
   mode?: "read_only" | "workspace_write";
+  /** 返工替代（T05，§9.4）：本派生取代的被否决子代理。 */
+  replacesChildId?: string;
 };
 
 /** 统一子会话工厂（spec §4.1 唯一创建入口的契约）。宿主可注入自定义工厂，
@@ -216,6 +218,9 @@ export class SubagentCoordinator {
   /** createServer 绑定的运行期服务（会话级 registry + 深度）。 */
   private bound: { registryFor: (session: SessionInfo) => Promise<AgentRegistry>; subagentDepth: number } | null = null;
   private readonly createChildSession: ChildSessionFactory;
+  /** 根取消的 admission 截止（T05，PC09/spec §4.2）：cancelTree 先关闸，
+   *  pump/launch 不再启动该根的排队者；根终态不复活，截止随协调器生命周期。 */
+  private readonly admissionCutoff = new Set<string>();
 
   constructor(private readonly deps: SubagentCoordinatorDeps) {
     this.limits = deps.limits ?? DEFAULT_LIMITS;
@@ -327,6 +332,7 @@ export class SubagentCoordinator {
       // T04（spec §4.2 持久队列）：执行输入落记录——宿主重启后凭此恢复
       // queued 子代理，不依赖进程内存。
       prompt: input.prompt,
+      ...(input.replacesChildId ? { replacesChildId: input.replacesChildId } : {}),
     };
     const created = await this.createSubagentIdempotent(record);
     this.queue.push({ childId: created.childId, rootTaskId, prompt: input.prompt });
@@ -368,6 +374,30 @@ export class SubagentCoordinator {
       }
       if (requeued > 0) this.pump();
     })().catch(() => undefined);
+  }
+
+  /** 结果验收（T05，PC08/§9.4）：父执行器记录 accepted / needs_revision /
+   *  rejected，绑定子结果版本（childRevision=验收时的记录 revision）。
+   *  消费 ≠ 接受——drain 只代表看到了结果；验收是显式动作。needs_revision/
+   *  rejected 不解除交付门禁：须 re-spawn（replacesChildId 关联替代）或复核
+   *  改判 accepted。仅终态子可验收；scope 树外拒绝。 */
+  async reviewChild(childId: string, decision: "accepted" | "needs_revision" | "rejected", input: { note?: string; evidenceRefs?: string[] } = {}, scope?: { rootTaskId: string }): Promise<SubagentRecord> {
+    for (;;) {
+      const rec = await this.store.getSubagent(childId);
+      if (!rec) throw new Error(`子代理不存在：${childId}`);
+      if (scope && rec.rootTaskId !== scope.rootTaskId) throw new Error(`SCOPE_VIOLATION：childId 不在当前任务树内：${childId}`);
+      if (!isSubagentTerminal(rec.status)) throw new Error(`子代理尚未终态（${rec.status}），不能验收`);
+      const reviewedAt = new Date().toISOString();
+      try {
+        return await this.store.updateSubagent(childId, rec.revision, {
+          consumeState: decision,
+          review: { decision, ...(input.note ? { note: input.note } : {}), ...(input.evidenceRefs?.length ? { evidenceRefs: input.evidenceRefs } : {}), reviewedAt, childRevision: rec.revision },
+        });
+      } catch (error) {
+        if (/SUBAGENT_REVISION_CONFLICT/.test(String(error))) continue; // CAS 重试
+        throw error;
+      }
+    }
   }
 
   /** agent_list：当前树内子代理 + 最近进度。 */
@@ -481,8 +511,10 @@ export class SubagentCoordinator {
     return { cancelling: true };
   }
 
-  /** 根 Task 取消（§8.4 父取消→全部后代）：递归取消树。 */
+  /** 根 Task 取消（§8.4 父取消→全部后代）：先关 admission 闸（该根的排队者
+   *  不再被 pump 启动——「取消瞬间被 pump 抢跑」是实测竞态），再递归收尾。 */
   async cancelTree(rootTaskId: string): Promise<void> {
+    this.admissionCutoff.add(rootTaskId);
     const children = await this.store.listSubagents({ rootTaskId });
     for (const child of children) {
       if (!isSubagentTerminal(child.status) && child.status !== "cancelling") {
@@ -530,6 +562,9 @@ export class SubagentCoordinator {
     let settle: (() => void) | null = null;
     let done: Promise<void> | null = null;
     try {
+      // T05（PC09）：根取消截止的二次检查——pump 认领与 launch 之间取消可能
+      // 恰好落闸；命中即放弃启动（finally 释放许可）。
+      if (this.admissionCutoff.has(item.rootTaskId)) return;
       let rec = await this.store.getSubagent(item.childId);
       if (!rec || isSubagentTerminal(rec.status) || rec.status === "cancelling") return;
       rec = await this.store.updateSubagent(item.childId, rec.revision, { status: "running", times: { ...rec.times, startedAt: new Date().toISOString() } });

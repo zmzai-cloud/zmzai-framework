@@ -350,8 +350,14 @@ export class SessionRunner {
     if (!store) return;
     const task = await store.getActiveTask(sessionId);
     if (!task || isTerminalStatus(task.status)) return;
+    // T05（PC09，spec §4.2）：先落终态（admission 截止——后续子终态唤醒经
+    // driveResumedTask 的终态检查被拒，任务不复活；晚到的子结果只留在邮箱作
+    // 审计），再递归取消任务树的子代理（排队出队、活跃 abort、等待落终态）。
     const updated = await this.lifecycle.casTask(task, { status: "cancelled", blocker: undefined });
     await this.publish({ type: "task.cancelled", data: { taskId: updated.id, revision: updated.revision, reason: "用户已停止任务。" } }, sessionId);
+    if (this.deps.subagentCoordinator) {
+      await this.deps.subagentCoordinator.cancelTree(task.rootRequestId ?? task.id).catch(() => undefined);
+    }
   }
 
   /** 手动触发一次上下文压缩（UI「压缩当前会话」）：无条件对当前历史跑一次
