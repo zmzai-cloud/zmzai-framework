@@ -154,3 +154,9 @@
 ### Patch Changes
 
 - dc7c85d: runner 增加流空闲看门狗：上游 120s 无任何 agent 事件时发布 session.error（StreamIdleTimeout）并中止本次运行，避免对不支持该输入的模型（如非视觉模型收到图片）发送消息时 runLoop 无限挂起、UI 表现为「卡住」无反馈。
+
+## 0.17.1
+
+### Patch Changes
+
+- **fs-workspace `list()` 符号链接健壮性（生产事故修复）**：把 home 目录快照当本地项目打开时，快照里的坏符号链接（`agent -> /mnt/...`，目标在本机不存在）让 `readdir` 列得出、`readFile` 打不开，无守卫的遍历直接 ENOENT，`glob`/`grep` 每次调用整体失败。修复后遍历对符号链接先 `stat` 跟随归型（坏链接静默跳过）；目录链接仅当解析后仍在工作区根内才跟随（保证 list 出的路径都能被 `safeJoin`+read 读到）；`realpath` 去重防自环；单条目读取失败不再炸整个列表。回归测试覆盖坏链接/根内链接/越界链接/自环/文件链接与 list↔read 一致性。

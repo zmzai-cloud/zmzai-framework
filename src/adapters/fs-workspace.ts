@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile, readdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, unlink, stat, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import path from "node:path";
 
 import { createUnifiedDiff } from "./workspace-edit.js";
@@ -41,14 +42,58 @@ export function createFsWorkspaceFiles(input: { root: string }): WorkspaceFiles 
   return {
     async list() {
       if (!existsSync(root)) return [];
+      // readdir 的 Dirent 不跟随符号链接：坏链接（目标不存在，快照/迁移来的
+      // 目录里常见）会让无守卫的 readFile 直接 ENOENT、glob/grep 整体失败，
+      // 必须跳过；目录链接只走解析后仍在 root 内的（否则 list 出的相对路径
+      // 逃逸 safeJoin——glob 列得出来、read 却读不到），realpath 去重防自环。
+      let realRoot = root;
+      try {
+        realRoot = await realpath(root);
+      } catch {
+        /* root 存在性已由 existsSync 保证，此处置信度足够 */
+      }
+      const walkedDirs = new Set<string>([realRoot]);
       const walk = async (dir: string): Promise<{ path: string; bytes: number }[]> => {
-        const entries = await readdir(dir, { withFileTypes: true });
         const out: { path: string; bytes: number }[] = [];
+        let entries: Dirent[];
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return out;
+        }
         for (const entry of entries) {
           if (entry.name === ".fw-revisions.json" || entry.name.startsWith(".git")) continue;
           const full = path.join(dir, entry.name);
-          if (entry.isDirectory()) out.push(...(await walk(full)));
-          else out.push({ path: path.relative(root, full), bytes: (await readFile(full)).length });
+          let isDirectory = entry.isDirectory();
+          if (entry.isSymbolicLink()) {
+            let info: Stats;
+            try {
+              info = await stat(full);
+            } catch {
+              continue;
+            }
+            isDirectory = info.isDirectory();
+            if (isDirectory) {
+              let real: string;
+              try {
+                real = await realpath(full);
+              } catch {
+                continue;
+              }
+              if (real !== realRoot && !real.startsWith(realRoot + path.sep)) continue;
+              if (walkedDirs.has(real)) continue;
+              walkedDirs.add(real);
+            }
+          }
+          if (isDirectory) {
+            out.push(...(await walk(full)));
+          } else {
+            try {
+              out.push({ path: path.relative(root, full), bytes: (await readFile(full)).length });
+            } catch {
+              continue;
+            }
+          }
         }
         return out;
       };
