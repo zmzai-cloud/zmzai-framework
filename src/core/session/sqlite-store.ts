@@ -617,6 +617,8 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
         const rewoundAt = (db.prepare("SELECT COALESCE(MAX(seq),0) AS n FROM events WHERE session_id=? AND type='session.rewound'").get(sessionId) as { n: number }).n;
         // Keep the latest completed run's artifacts and the current run's artifacts.
         const previousSummary = db.prepare("SELECT seq FROM events WHERE session_id=? AND type='session.summary' AND seq>? ORDER BY seq DESC LIMIT 1 OFFSET 1").get(sessionId,rewoundAt) as { seq: number } | undefined;
+        // subagent.* 是增量追加型活动（step 逐条累积，不能像 status 那样取 MAX）：
+        // 恢复快照必须整段带回，前端投影器才能重建子任务的步骤流与终态。
         const stateRows = db.prepare(`SELECT json FROM events WHERE session_id=? AND (
           seq IN (SELECT MAX(seq) FROM events WHERE session_id=? AND seq>? AND type IN ('session.status','todo.updated','session.summary','session.checkpoint') GROUP BY type)
           OR (type='artifact.created' AND seq>?)
@@ -624,7 +626,8 @@ export function createSqliteSessionStore(options: SqliteStoreOptions): SqliteSes
             SELECT 1 FROM events replies WHERE replies.session_id=events.session_id AND replies.type='permission.replied' AND replies.seq>events.seq
               AND json_extract(replies.json,'$.data.id')=json_extract(events.json,'$.data.request.id')
           ))
-        ) ORDER BY seq`).all(sessionId,sessionId,rewoundAt,previousSummary?.seq ?? rewoundAt,rewoundAt) as { json: string }[];
+          OR (type IN ('subagent.started','subagent.step','subagent.finished') AND seq>?)
+        ) ORDER BY seq`).all(sessionId,sessionId,rewoundAt,previousSummary?.seq ?? rewoundAt,rewoundAt,rewoundAt) as { json: string }[];
         const stateEvents = stateRows.map(row => JSON.parse(row.json) as PersistedFrameworkEvent);
         const runs = db.prepare("SELECT run_id AS runId,status,revision FROM workflow_runs WHERE session_id=? ORDER BY ordinal").all(sessionId) as { runId: string; status: WorkflowRun["status"]; revision: number }[];
         // 任务状态随快照一起给出（规格 3 §13.3）：断线重连后 UI 必须能从持久存储
