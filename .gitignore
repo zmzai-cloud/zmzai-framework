@@ -1,2 +1,5 @@
 node_modules/
 dist/
+
+# npm pack artifacts (vendored into zmzai-lectern/vendor, never committed here)
+*.tgz
