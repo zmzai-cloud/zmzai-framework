@@ -37,6 +37,22 @@ export type FrameworkDeps = {
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api> | null };
   leaseStore?: { stamp(sessionId: string, owner: string, expiresAt: Date): Promise<void>; clear(sessionId: string): Promise<void> };
   resolveMandatorySkill?: import("../core/runtime/runner.js").MandatorySkillResolver;
+  /** 以下为 RunnerDeps 尚未收敛进 preset 的字段。此前宿主（zmzai-agent）经
+   *  createAgentRuntime 的 runnerOptions 条件 spread 传入时，因不在本类型上
+   *  被本边界静默丢弃（同 F01 一类缺陷）——agentResolver（workspace=智能体）
+   *  与 memoryContextFor（长期记忆召回）在真实运行中从未生效。显式声明并
+   *  转发，回归测试见 create-agent-runtime.test.ts。 */
+  sessionRuleTtlMs?: number;
+  agentResolver?: import("../core/agent/resolver.js").AgentResolver;
+  /** 长期记忆召回：run 开始时查询，返回文本则前插为 in-memory user 消息。 */
+  memoryContextFor?: (session: SessionInfo, text: string) => Promise<string | undefined>;
+  /** 附件正文读取器（规格 2 §9.2）。 */
+  attachments?: import("../core/runtime/attachments.js").AttachmentProvider;
+  /** 持续任务执行的保护阈值（规格 3 §10.1）。 */
+  taskPolicy?: NonNullable<import("../core/runtime/runner.js").RunnerDeps["taskPolicy"]>;
+  buildToolContext?: import("../core/runtime/runner.js").RunnerDeps["buildToolContext"];
+  /** 直接注入的顶层工具集（一般走 localTools / agentResolver.tools）。 */
+  tools?: import("../core/tools/def.js").AnyToolDef[];
 };
 
 export type AgentFramework = {
@@ -72,6 +88,13 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),
     ...(deps.resolveMandatorySkill ? { resolveMandatorySkill: deps.resolveMandatorySkill } : {}),
     ...(deps.subagentCoordinator ? { subagentCoordinator: deps.subagentCoordinator } : {}),
+    ...(deps.sessionRuleTtlMs !== undefined ? { sessionRuleTtlMs: deps.sessionRuleTtlMs } : {}),
+    ...(deps.agentResolver ? { agentResolver: deps.agentResolver } : {}),
+    ...(deps.memoryContextFor ? { memoryContextFor: deps.memoryContextFor } : {}),
+    ...(deps.attachments ? { attachments: deps.attachments } : {}),
+    ...(deps.taskPolicy ? { taskPolicy: deps.taskPolicy } : {}),
+    ...(deps.buildToolContext ? { buildToolContext: deps.buildToolContext } : {}),
+    ...(deps.tools ? { tools: deps.tools } : {}),
   });
   // T02：绑定 runner 同源的运行期服务——协调器的类型检查/默认子会话工厂解析
   // 到与 runner 相同的 registry（含 workspace 自定义 Agent），深度上限同源。

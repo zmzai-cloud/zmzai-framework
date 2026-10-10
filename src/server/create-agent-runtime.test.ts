@@ -79,4 +79,15 @@ describe("createAgentRuntime", () => {
     // 闭包已捕获——runner run 时会调用；这里仅断言引用被接受不抛错
     expect(loadWorkspaceAgents).not.toHaveBeenCalled();
   });
+
+  it("agentResolver / memoryContextFor / sessionRuleTtlMs 不再被 createServer 静默丢弃（F02）", () => {
+    const agentResolver = { resolve: vi.fn(async () => null) };
+    const memoryContextFor = vi.fn(async () => undefined);
+    const runtime = createAgentRuntime(basePreset({ runnerOptions: { agentResolver, memoryContextFor, sessionRuleTtlMs: 42_000 } }));
+    // SessionRunner 的 deps 是私有的；经受控读取验证字段确实进入 runner 装配。
+    const deps = (runtime.runner as unknown as { deps: Record<string, unknown> }).deps;
+    expect(deps.agentResolver).toBe(agentResolver);
+    expect(deps.memoryContextFor).toBe(memoryContextFor);
+    expect(deps.sessionRuleTtlMs).toBe(42_000);
+  });
 });
