@@ -5,14 +5,29 @@ import { newMessageId, newPartId } from "../session/ids.js";
 import type { MessageInfo, ModelRef, Part, SelectedSkill, ToolState } from "../session/types.js";
 
 /** Part-projector (spec §8.2): folds PI agent events into the persisted
- *  Message/Part graph and the framework events to publish. Pure and sync —
- *  the runner feeds PI events one by one and drains the output queue. */
+ *  Message/Part graph and the framework events to publish. Sync in the hot
+ *  path — the runner feeds PI events one by one and drains the output queue.
+ *  0.18 起带一个 80ms 补发定时器（见 scheduleFlushTimer），慢速流按时间步进；
+ *  它只会在 PI 事件之间触发，边界 flush 清空 buffer 后回调自然 no-op。 */
 
 export type BridgeIdentity = { sessionId: string; agent: string; model: ModelRef };
 
 type Emit = (event: FrameworkEvent) => void;
 
-type TextTrack = { partId: string; buffer: string };
+type TextTrack = { partId: string; buffer: string; pendingBytes: number; lastCheckpointAt: number };
+
+/** 流式步进阈值（0.18）：delta 攒到 64B 或首字节后 80ms 就发一批。旧值 2KB 会把
+ *  一段两三百字的回复攒成「零 delta、assistant 结束一次性弹出」——中文回复永远
+ *  看不到流式。64B/80ms 后事件量约 2–6 条/秒/会话，durable append 与 SSE 都在
+ *  安全区内。 */
+const FLUSH_MIN_BYTES = 64;
+const FLUSH_MAX_WAIT_MS = 80;
+/** part.updated checkpoint 阈值：delta 事件高频之后，携带全量文本的
+ *  message.part.updated 若仍逐批配对，写放大随消息长度平方增长（10KB 消息 ×
+ *  80 批 ≈ 数百 KB）。改为 2KB/1.5s 才落一次快照，边界（工具切换/消息结束）
+ *  恒强制落——崩溃恢复的丢文本窗口最多 1.5s 的生成量。 */
+const CHECKPOINT_MIN_BYTES = 2 * 1024;
+const CHECKPOINT_MIN_INTERVAL_MS = 1_500;
 
 /** The part variants a projector can create, minus the base fields it fills in. */
 type ProjectablePart =
@@ -70,18 +85,58 @@ export class PartProjector {
     this.emitPart(emit, patch(current));
   }
 
-  private flushText(emit: Emit, track: TextTrack | undefined, kind: "text" | "reasoning"): void {
-    if (!track || !track.buffer) return;
-    const delta = track.buffer;
-    track.buffer = "";
-    emit({ type: "message.part.delta", data: { messageId: this.assistantMessageId ?? "", partId: track.partId, field: "text", delta } });
-    this.patchPart(emit, track.partId, (part) => (part.type === kind ? { ...part, text: part.text + delta } : part));
+  private flushText(emit: Emit, track: TextTrack | undefined, kind: "text" | "reasoning", forceCheckpoint = false): void {
+    if (!track) return;
+    if (track.buffer) {
+      const delta = track.buffer;
+      track.buffer = "";
+      track.pendingBytes += Buffer.byteLength(delta, "utf8");
+      emit({ type: "message.part.delta", data: { messageId: this.assistantMessageId ?? "", partId: track.partId, field: "text", delta } });
+      // 内部 parts 映射每次 flush 都推进（不对外发事件），checkpoint 时才有干净的全量可发。
+      const current = this.parts.get(track.partId);
+      if (current && current.type === kind) this.parts.set(track.partId, { ...current, text: current.text + delta });
+    }
+    // buffer 可能已被大小阈值冲掉而还没落过快照：checkpoint 看 pendingBytes，
+    // 不看 buffer——边界（工具切换/消息结束）必须把已流出的文本落成全量快照。
+    const now = Date.now();
+    if (track.pendingBytes > 0 && (forceCheckpoint || track.pendingBytes >= CHECKPOINT_MIN_BYTES || now - track.lastCheckpointAt >= CHECKPOINT_MIN_INTERVAL_MS)) {
+      const part = this.parts.get(track.partId);
+      if (part) this.emitPart(emit, part);
+      track.pendingBytes = 0;
+      track.lastCheckpointAt = now;
+    }
   }
 
-  private flushAllText(emit: Emit): void {
-    for (const track of this.textByContent.values()) this.flushText(emit, track, "text");
-    for (const track of this.reasoningByContent.values()) this.flushText(emit, track, "reasoning");
+  private flushAllText(emit: Emit, forceCheckpoint = false): void {
+    for (const track of this.textByContent.values()) this.flushText(emit, track, "text", forceCheckpoint);
+    for (const track of this.reasoningByContent.values()) this.flushText(emit, track, "reasoning", forceCheckpoint);
+    if (this.flushTimer && !this.hasBufferedText()) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
   }
+
+  private hasBufferedText(): boolean {
+    for (const track of this.textByContent.values()) if (track.buffer) return true;
+    for (const track of this.reasoningByContent.values()) if (track.buffer) return true;
+    return false;
+  }
+
+  /** 到期补发（0.18）：慢速流按时间步进，否则只有攒满 64B 才动，慢模型的体验
+   *  仍是「一卡一卡」。定时器在 JS 单线程里只会在 PI 事件之间触发；边界处的
+   *  flushAllText 已清空 buffer，晚到的回调面对空 buffer 自然 no-op，不会与
+   *  onToolExecutionStart / onAssistantEnd 交错出错序。 */
+  private scheduleFlushTimer(emit: Emit): void {
+    this.emitRef = emit;
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      if (this.hasBufferedText() && this.emitRef) this.flushAllText(this.emitRef);
+    }, FLUSH_MAX_WAIT_MS);
+  }
+
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private emitRef: Emit | null = null;
 
   private assistantPart(emit: Emit, extra: ProjectablePart, messageIdOverride?: string): Part {
     const part = {
@@ -183,29 +238,31 @@ export class PartProjector {
   }
 
   onTextDelta(emit: Emit, contentIndex: number, delta: string): void {
-    const track = this.textByContent.get(contentIndex) ?? { partId: "", buffer: "" };
-    if (!track.partId) {
+    let track = this.textByContent.get(contentIndex);
+    if (!track) {
       const part = this.assistantPart(emit, { type: "text", text: "" });
-      track.partId = part.id;
+      track = { partId: part.id, buffer: "", pendingBytes: 0, lastCheckpointAt: Date.now() };
+      this.textByContent.set(contentIndex, track);
     }
     track.buffer += delta;
-    this.textByContent.set(contentIndex, track);
-    if (Buffer.byteLength(track.buffer, "utf8") >= 2 * 1024) this.flushText(emit, track, "text");
+    if (Buffer.byteLength(track.buffer, "utf8") >= FLUSH_MIN_BYTES) this.flushText(emit, track, "text");
+    else this.scheduleFlushTimer(emit);
   }
 
   onThinkingDelta(emit: Emit, contentIndex: number, delta: string): void {
-    const track = this.reasoningByContent.get(contentIndex) ?? { partId: "", buffer: "" };
-    if (!track.partId) {
+    let track = this.reasoningByContent.get(contentIndex);
+    if (!track) {
       const part = this.assistantPart(emit, { type: "reasoning", text: "" });
-      track.partId = part.id;
+      track = { partId: part.id, buffer: "", pendingBytes: 0, lastCheckpointAt: Date.now() };
+      this.reasoningByContent.set(contentIndex, track);
     }
     track.buffer += delta;
-    this.reasoningByContent.set(contentIndex, track);
-    if (Buffer.byteLength(track.buffer, "utf8") >= 2 * 1024) this.flushText(emit, track, "reasoning");
+    if (Buffer.byteLength(track.buffer, "utf8") >= FLUSH_MIN_BYTES) this.flushText(emit, track, "reasoning");
+    else this.scheduleFlushTimer(emit);
   }
 
   onToolExecutionStart(emit: Emit, toolCallId: string, toolName: string, args: unknown, label?: string): void {
-    this.flushAllText(emit);
+    this.flushAllText(emit, true);
     const part = this.assistantPart(
       emit,
       {
@@ -253,7 +310,7 @@ export class PartProjector {
   }
 
   onAssistantEnd(emit: Emit, message: AgentMessage): void {
-    this.flushAllText(emit);
+    this.flushAllText(emit, true);
     if (!this.assistantMessageId) return;
     if (this.stepOpen) {
       this.stepOpen = false;

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:crypto", () => {
   let counter = 0;
@@ -171,15 +171,14 @@ describe("PartProjector assistant lifecycle", () => {
     expect(textPart).toBeDefined();
   });
 
-  it("onTextDelta flushes when buffer exceeds 2KB", () => {
+  it("onTextDelta flushes once the buffer reaches 64B", () => {
     const proj = new PartProjector(identity);
     const { emit } = collect();
     proj.onUserPrompt(emit, "hi");
     const { events, emit: aEmit } = collect();
     proj.onAssistantStart(aEmit);
-    // Send a large delta (> 2KB)
-    const largeDelta = "x".repeat(3000);
-    proj.onTextDelta(aEmit, 0, largeDelta);
+    // Send a delta past the flush threshold in one chunk
+    proj.onTextDelta(aEmit, 0, "x".repeat(3000));
     // Should have a delta event (flush)
     const deltaEvents = events.filter((e) => e.type === "message.part.delta");
     expect(deltaEvents.length).toBeGreaterThanOrEqual(1);
@@ -198,6 +197,80 @@ describe("PartProjector assistant lifecycle", () => {
       return p.type === "reasoning";
     });
     expect(reasoningPart).toBeDefined();
+  });
+});
+
+// ---- PartProjector: streaming flush policy (0.18) ----
+
+describe("PartProjector streaming flush policy", () => {
+  interface TextEventShape { data: { partId: string; delta: string } }
+  interface PartEventShape { data: { part: { type: string; id: string; text: string } } }
+
+  function startAssistant() {
+    const proj = new PartProjector(identity);
+    const { emit } = collect();
+    proj.onUserPrompt(emit, "hi");
+    const collector = collect();
+    proj.onAssistantStart(collector.emit);
+    return { proj, ...collector };
+  }
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("小 delta 攒到 64B 立即成批发（不再等 2KB）", () => {
+    const { proj, events, emit } = startAssistant();
+    proj.onTextDelta(emit, 0, "你好，"); // 12B — 只建 part，不 flush
+    expect(events.filter((e) => e.type === "message.part.delta")).toHaveLength(0);
+    proj.onTextDelta(emit, 0, "x".repeat(60)); // 累计超 64B — 立即 flush
+    const deltas = events.filter((e) => e.type === "message.part.delta") as unknown as TextEventShape[];
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0]!.data.delta).toBe("你好，" + "x".repeat(60));
+  });
+
+  it("慢速流由 80ms 定时器补发，不用等攒满", () => {
+    vi.useFakeTimers();
+    const { proj, events, emit } = startAssistant();
+    proj.onTextDelta(emit, 0, "第一小段"); // <64B，走定时器
+    expect(events.filter((e) => e.type === "message.part.delta")).toHaveLength(0);
+    vi.advanceTimersByTime(80);
+    const deltas = events.filter((e) => e.type === "message.part.delta") as unknown as TextEventShape[];
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0]!.data.delta).toBe("第一小段");
+  });
+
+  it("中途 flush 不再逐批配发全量 part.updated（checkpoint 节流），assistant 结束强制落快照", () => {
+    vi.useFakeTimers();
+    const { proj, events, emit } = startAssistant();
+    for (let round = 0; round < 5; round++) {
+      proj.onTextDelta(emit, 0, `第${round}段，`.padEnd(80, "字"));
+      vi.advanceTimersByTime(80);
+    }
+    const textPartEvents = events.filter((e) => e.type === "message.part.updated")
+      .map((e) => (e as unknown as PartEventShape).data.part)
+      .filter((part) => part.type === "text");
+    // 只有 part 创建那一刻的空快照，中途全是纯 delta
+    expect(textPartEvents).toHaveLength(1);
+    expect(textPartEvents[0]!.text).toBe("");
+    proj.onAssistantEnd(emit, { role: "assistant" } as never);
+    const finalSnapshots = events.filter((e) => e.type === "message.part.updated")
+      .map((e) => (e as unknown as PartEventShape).data.part)
+      .filter((part) => part.type === "text");
+    expect(finalSnapshots).toHaveLength(2);
+    expect(finalSnapshots[1]!.text).toContain("第0段");
+    expect(finalSnapshots[1]!.text).toContain("第4段");
+  });
+
+  it("工具切换边界强制 checkpoint，之后的文本继续累计在同一 part", () => {
+    vi.useFakeTimers();
+    const { proj, events, emit } = startAssistant();
+    proj.onTextDelta(emit, 0, "工具前的话，".padEnd(80, "。"));
+    vi.advanceTimersByTime(80);
+    proj.onToolExecutionStart(emit, "call_1", "bash", { command: "ls" });
+    const snapshots = events.filter((e) => e.type === "message.part.updated")
+      .map((e) => (e as unknown as PartEventShape).data.part)
+      .filter((part) => part.type === "text");
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[1]!.text).toContain("工具前的话");
   });
 });
 
