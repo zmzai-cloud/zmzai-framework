@@ -1,6 +1,6 @@
 import type { ModelProvider } from "./index.js";
 import type { ModelRef, SessionInfo } from "../core/session/types.js";
-import type { Api, Context, Model, SimpleStreamOptions, AssistantMessageEventStream, AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { Api, Model, SimpleStreamOptions, TranscriptContext, AssistantMessageEventStream, AssistantMessageEvent } from "@earendil-works/pi-ai";
 
 /** 动态额外请求头（如登录态 cookie）。函数形式每次请求前求值，支持异步。 */
 export type ProviderHeaders =
@@ -143,7 +143,7 @@ export function createOpenAiModelProvider(input?: {
     streamFor(session: SessionInfo) {
       void session;
       // streamFn built per call; auth cookie injected by the custom fetch below.
-      return (async (model: Model<Api>, context: Context, options?: SimpleStreamOptions): Promise<AssistantMessageEventStream> => {
+      return (async (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): Promise<AssistantMessageEventStream> => {
         const { streamSimple } = await import("@earendil-works/pi-ai/api/openai-completions");
         const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai");
         const dynamicHeaders = await resolveHeaders();

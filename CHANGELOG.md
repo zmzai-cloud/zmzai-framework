@@ -1,5 +1,14 @@
 # @zmzai/agent-framework
 
+## 0.19.0
+
+### Minor Changes
+
+- **升级 PI 运行时：`@earendil-works/pi-agent-core` / `pi-ai` 0.84.1 → 1.5.0**（跨上游 1.0）。随升级获得：流式工具参数 O(n²)→线性（大 write/edit 的 CPU/内存）、网关/瞬时错误自动重试大扫除（server_busy/upstream_error/stream disconnected 等，Zhipu 1308 用量超限不再无限重试）、消息与工具结果的真实 `durationMs`、`Usage.cost.totalFromProvider` 计费真值标记、输出预算按 15% 预留与 3.5 chars/token 估算防误压缩、MCP 外部工具参数统一 JSON Schema coerce、agent-core 瘦身（删实验 harness，1.8MB→0.27MB）。
+- **迁移**（对宿主 API 无变化）：`shouldStopAfterTurn` → `finishTurn`（按上游迁移守卫保持「仅正常响应计数」语义，steps 上限不变）；自定义 streamFn 入参 `Context` → `TranscriptContext`；systemPrompt 观测改经 `getCurrentSystemPrompt`。
+- **修复升级引入的基准偏移**：pi ≥0.86 把 systemPrompt+工具声明 unshift 成前导系统消息，run 收尾按 `agent.state.messages` 实际前导 system 条数补偿 baseline——否则切片左移一条，记忆注入段（内存态首条 user 消息）会混进 onRunEnd 的 newMessages 与总结素材。
+- 含 0.18.1：repomap wasm 目录按依赖布局解析（pnpm 同级/npm 提升），加载失败不再伪装空地图。
+
 ## 0.18.1
 
 ### Patch Changes

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall, type FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 import { AgentRegistry } from "../agent/registry.js";
 import { SessionRunner, createFrameworkSession, type RunnerDeps } from "../runtime/runner.js";
@@ -764,7 +765,8 @@ describe("任务运行时：预算与上下文存续（§10.2 / §16 阶段 D / 
       // 第三条起（也就是续跑那一轮）换成工厂，好把这一次真正发给模型的
       // systemPrompt 抓下来——它不落库、不进事件流，只能在这里观测。
       (context) => {
-        prompts.push(context.systemPrompt ?? "");
+        // pi 0.86.0 起 systemPrompt 移入 transcript 系统消息（不再挂 context 字段）
+        prompts.push(getCurrentSystemPrompt(context.messages) ?? "");
         return fauxAssistantMessage("还在迁移。");
       },
     ]);

@@ -92,6 +92,18 @@ export type AttemptCollaborators = {
   spawnSubagent: (session: SessionInfo, input: { description: string; prompt: string; subagentType: string; spawnRequestId?: string }, registry: AgentRegistry, parentEngine: PermissionEngine) => Promise<{ childSessionId: string; summary: string; state: "completed" | "error" }>;
 };
 
+/** pi ≥0.86 会把 systemPrompt+工具声明 unshift 成前导系统消息（我们的 history
+ *  不含 system）——run 收尾按 state.messages 实际前导 system 条数右移 baseline，
+ *  否则切片左移一条，记忆注入段等上下文尾部会混进「本轮新增」。 */
+function effectiveRunBaseline(agent: { state: { messages: { role: string }[] } }, baseline: number): number {
+  let n = 0;
+  for (const message of agent.state.messages) {
+    if (message.role === "system") n += 1;
+    else break;
+  }
+  return baseline + n;
+}
+
 export class AttemptExecutor {
   #hooks: LifecycleHook[] = [];
   /** 供 runLoop 取归一化钩子数组（lazy：constructor 后仍可由 deps 引用共享）。 */
@@ -266,6 +278,12 @@ export class AttemptExecutor {
 
     // 上下文组装唯一入口（W7-S6）：压缩 transform、同拍快照重建、记忆召回。
     const { compactionTransform, history, baseline } = await this.collabs.contextBuilder.buildAttemptContext(session, input, emit);
+    // pi ≥0.86 把 systemPrompt+工具声明作为前导系统消息放进 agent.state.messages
+    // （我们的 history 不含 system 角色）——不补偿的话切片整体左移，最后的上下文
+    // 消息（如记忆注入段）会被误算进「本轮新增」并泄漏进 onRunEnd/总结素材。
+    // 按前导 system 条数右移基准；run 中途出现的 system（工具变更声明）不受影响。
+    const leadingSystemCount = (() => { let n = 0; for (const m of history) { if (m.role === "system") n += 1; else break; } return n; })();
+    const effectiveBaseline = baseline - leadingSystemCount; // history 内前导 system 不是 pi 加的，不能重复计
     const agent = new Agent({
       initialState: {
         systemPrompt: [
@@ -286,7 +304,15 @@ export class AttemptExecutor {
       streamFn: this.deps.streamFnFor(session),
       toolExecution: "sequential",
       ...(compactionTransform ? { transformContext: compactionTransform } : {}),
-      shouldStopAfterTurn: ({ newMessages }) => newMessages.filter((message) => message.role === "assistant").length >= (agentInfo?.steps ?? 12),
+      // 0.19.0（pi 0.87.0 迁移）：finishTurn 在 error/aborted 也会跑，旧钩子只在
+      // 正常响应跑——保持旧语义需先挡硬退出；steps 上限语义不变（本轮 assistant
+      // 消息数达到上限即收）
+      finishTurn: (turn) => {
+        if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+        return turn.newMessages.filter((message) => message.role === "assistant").length >= (agentInfo?.steps ?? 12)
+          ? { action: "end" }
+          : undefined;
+      },
     });
 
     const abortController = new AbortController();
@@ -596,7 +622,7 @@ export class AttemptExecutor {
       engine.dispose();
       // Workflow settlement clears its lease atomically with the terminal run state.
       if (!acceptedUserId) await this.collabs.scheduler.clearLease(session.id);
-      const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, baseline);
+      const newMessages: RunTranscriptMessage[] = extractRunTranscript(agent.state.messages, effectiveRunBaseline(agent, baseline));
       attemptFinalText = [...newMessages].reverse().find((message) => message.role === "assistant")?.text ?? "";
       // 任务终态小结（N5）：终态 status 已发布后补一条 session.summary，
       // 让「任务完成」有明确收尾（AI 一句总结 + 结构化统计）。await 保证
@@ -604,7 +630,7 @@ export class AttemptExecutor {
       const summaryKind = abortController.signal.aborted ? "aborted" : runErrored ? "error" : "completed";
       await this.summarizeRun(session, {
         agent,
-        baseline,
+        baseline: effectiveRunBaseline(agent, baseline),
         startedAt: runStartedAt,
         kind: summaryKind,
         stats: { toolCalls: summaryToolCalls, editedFiles: [...summaryEditedFiles] },
