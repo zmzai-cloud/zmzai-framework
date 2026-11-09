@@ -278,12 +278,8 @@ export class AttemptExecutor {
 
     // 上下文组装唯一入口（W7-S6）：压缩 transform、同拍快照重建、记忆召回。
     const { compactionTransform, history, baseline } = await this.collabs.contextBuilder.buildAttemptContext(session, input, emit);
-    // pi ≥0.86 把 systemPrompt+工具声明作为前导系统消息放进 agent.state.messages
-    // （我们的 history 不含 system 角色）——不补偿的话切片整体左移，最后的上下文
-    // 消息（如记忆注入段）会被误算进「本轮新增」并泄漏进 onRunEnd/总结素材。
-    // 按前导 system 条数右移基准；run 中途出现的 system（工具变更声明）不受影响。
-    const leadingSystemCount = (() => { let n = 0; for (const m of history) { if (m.role === "system") n += 1; else break; } return n; })();
-    const effectiveBaseline = baseline - leadingSystemCount; // history 内前导 system 不是 pi 加的，不能重复计
+    // baseline 按我们的 history 计数；pi ≥0.86 构造 Agent 时会再 unshift 一条前导
+    // 系统消息，收尾消费 baseline 处统一经 effectiveRunBaseline 补偿（见函数说明）
     const agent = new Agent({
       initialState: {
         systemPrompt: [
