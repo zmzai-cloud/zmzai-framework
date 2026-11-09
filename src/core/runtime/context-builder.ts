@@ -129,7 +129,7 @@ export class ContextBuilder {
         const streamFn = this.deps.streamFnFor(session);
         return streamOneText(
           async (m, ctx) => {
-            const stream = await streamFn(m, ctx as never);
+            const stream = await streamFn(m, ctx);
             return stream;
           },
           model,

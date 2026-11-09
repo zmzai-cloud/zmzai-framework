@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -188,5 +189,21 @@ describe("streamOneText", () => {
   it("handles string content", async () => {
     const text = await streamOneText(async () => ({ result: async () => ({ content: "直接文本" }) }), fakeModel, "sys", []);
     expect(text).toBe("直接文本");
+  });
+
+  // 0.19.0 回归：pi ≥0.86 的 provider 从 transcript 前导系统消息读系统提示；旧实现
+  // 传 { systemPrompt } 字段被硬转后静默丢失——总结/标题生成失去指令
+  it("系统提示作为 transcript 前导系统消息送达流函数（pi ≥0.86 契约）", async () => {
+    let seen = "";
+    await streamOneText(
+      async (_model, context) => {
+        seen = getCurrentSystemPrompt(context.messages);
+        return { result: async () => ({ content: "ok" }) };
+      },
+      fakeModel,
+      "只输出结构化摘要",
+      [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 } as never],
+    );
+    expect(seen).toBe("只输出结构化摘要");
   });
 });

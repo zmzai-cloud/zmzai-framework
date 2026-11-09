@@ -735,7 +735,7 @@ export class AttemptExecutor {
         // 15s 超时兜底：summary 是收尾的锦上添花，不能因为上游慢而卡住 run 收尾。
         text = await Promise.race([
           streamOneText(
-            async (m, ctx) => streamFn(m, ctx as never),
+            async (m, ctx) => streamFn(m, ctx),
             summaryModel,
             systemPrompt,
             textMessages,

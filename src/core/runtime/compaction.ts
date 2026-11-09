@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type Message, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 
 /** Framework compaction (spec §8.3) — projection style (tutorial-advanced 06):
  *  canonical history (PI state.messages) is never mutated; the transform keeps
@@ -144,14 +144,19 @@ export function createCompactionTransform(options: CompactionOptions): (messages
 
 /** One-shot completion via an AssistantMessageEventStream (relay streamFn
  *  shape): drives the stream to completion and returns its full text. Used for
- *  summary generation and async title generation (spec §13.2). */
+ *  summary generation and async title generation (spec §13.2).
+ *
+ *  0.19.0（pi ≥0.86）：provider 流函数只认 TranscriptContext——系统提示是前导
+ *  系统消息而不是 context 字段。旧实现传 `{ systemPrompt, messages }` 并在调用方
+ *  `as never` 硬转，pi 1.x 下系统提示被静默丢弃（总结/标题失去指令）。现经
+ *  normalizeContext 折叠成正规 transcript 再调用。 */
 export async function streamOneText(
-  streamFn: (model: Model<Api>, context: { systemPrompt: string; messages: AgentMessage[] }) => Promise<{ result(): Promise<{ content?: unknown }> }> | { result(): Promise<{ content?: unknown }> },
+  streamFn: (model: Model<Api>, context: TranscriptContext) => Promise<{ result(): Promise<{ content?: unknown }> }> | { result(): Promise<{ content?: unknown }> },
   model: Model<Api>,
   systemPrompt: string,
   messages: AgentMessage[],
 ): Promise<string> {
-  const stream = await streamFn(model, { systemPrompt, messages });
+  const stream = await streamFn(model, normalizeContext({ systemPrompt, messages: messages as Message[] }));
   const final = await stream.result();
   const content = final.content;
   if (typeof content === "string") return content;
