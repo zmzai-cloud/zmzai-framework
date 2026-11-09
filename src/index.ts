@@ -57,7 +57,8 @@ export { TerminalManager, createTerminalTools } from "./core/tools/terminal.js";
 export type { TerminalBackend, TerminalHandle, TerminalSessionInfo, TerminalSessionStatus } from "./core/tools/terminal.js";
 export { createHostTerminalBackend } from "./adapters/terminal-backend.js";
 export { createRepoMapTool } from "./core/tools/repomap.js";
-export { renderRepoMap, resolveFrameworkVendorDirs, setWasmDirs, type RepoMapOptions, type RepoMapResult } from "./core/repomap/repomap.js";
+export { renderRepoMap, resolveFrameworkVendorDirs, resolveVendorDirsFrom, setWasmDirs, type RepoMapOptions, type RepoMapResult } from "./core/repomap/repomap.js";
+export { WasmUnavailableError, isWasmUnavailable } from "./core/repomap/tags.js";
 
 // core: runtime
 export { SessionRunner, createFrameworkSession, isSessionActive, isSessionAwaitingPermission, listActiveSessions, type RunnerDeps, type PromptInput } from "./core/runtime/runner.js";

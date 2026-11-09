@@ -11,6 +11,7 @@ import type { RunnerDeps } from "../core/runtime/runner.js";
 import type { SessionInfo } from "../core/session/types.js";
 import type { SessionStore } from "../core/session/store.js";
 import { createServer, type AgentFramework } from "./create-server.js";
+import { resolveFrameworkVendorDirs } from "../core/repomap/repomap.js";
 
 /**
  * createAgentRuntime (spec D2 装配收敛)：createServer 之上的高层工厂。
@@ -106,7 +107,14 @@ export function createAgentRuntime(preset: AgentRuntimePreset): AgentFramework {
   } else if (repoMap != null) {
     repoMapRoot = repoMap.workspaceRoot ?? (preset.workspace.kind === "fs" ? preset.workspace.root : undefined);
   } else if (preset.workspace.kind === "fs") {
-    repoMapRoot = preset.workspace.root;
+    // 默认开启前先探测 wasm 资源（0.18.1）：不可用的环境注册一个必然失败的工具
+    // 只会让模型白费一次调用；显式对象形式不拦——用户明确要的，报错也如实
+    try {
+      resolveFrameworkVendorDirs();
+      repoMapRoot = preset.workspace.root;
+    } catch {
+      /* wasm 资源不可用：默认不注册 repo_map */
+    }
   }
   if (repoMapRoot !== undefined) {
     capabilityTools.push(createRepoMapTool({ workspaceRoot: asFactory(repoMapRoot) }));

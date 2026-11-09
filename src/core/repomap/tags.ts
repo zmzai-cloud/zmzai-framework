@@ -61,6 +61,32 @@ let parserInit: Promise<void> | null = null;
 const languageCache = new Map<string, Promise<Language>>();
 const parserByLang = new Map<string, Parser>();
 
+/** wasm 环境错误标记（0.18.1）：wasm 目录错/文件缺失时 Parser.init 会抛
+ *  FileNotFoundError（绝对路径里含 tree-sitter .wasm）；消费方用它区分「环境不可用」
+ *  与「单文件解析失败」，前者必须如实上抛（renderRepoMap 用来避免伪装成空地图）。 */
+export class WasmUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super(`tree-sitter wasm 资源不可用：${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "WasmUnavailableError";
+  }
+}
+
+export function isWasmUnavailable(error: unknown): boolean {
+  if (error instanceof WasmUnavailableError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /tree-sitter[\w.-]*\.wasm|wasm 资源不可用|ENOENT.*tree-sitter/i.test(message);
+}
+
+async function initOrLoad<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    // ENOENT 之外（wasm 损坏/版本不符等）同样属于环境不可用；一旦标记，后续调用
+    // 不再重试加载（parserInit/languageCache 缓存的是 pending promise，失败不会缓存）
+    throw new WasmUnavailableError(error);
+  }
+}
+
 function pkgDir(moduleName: string): string {
   // 包 exports 各有缺口（web-tree-sitter 不暴露 wasm/package.json 子路径，
   // tree-sitter-wasms 的 main 坏了），双策略：先 package.json 锚点，fallback 主入口
@@ -81,22 +107,22 @@ function grammarWasmDir(): string {
 }
 
 function ensureParserInit(): Promise<void> {
-  parserInit ??= Parser.init({
+  parserInit ??= initOrLoad(() => Parser.init({
     locateFile(scriptName: string) {
       // web-tree-sitter 的运行时 wasm（tree-sitter.wasm）随包分发
       return path.join(runtimeWasmDir(), scriptName);
     },
-  });
+  }));
   return parserInit;
 }
 
 async function languageFor(wasmFile: string): Promise<Language> {
   const cached = languageCache.get(wasmFile);
   if (cached) return cached;
-  const pending = (async () => {
+  const pending = initOrLoad(async () => {
     await ensureParserInit();
     return Language.load(path.join(grammarWasmDir(), wasmFile));
-  })();
+  });
   languageCache.set(wasmFile, pending);
   return pending;
 }

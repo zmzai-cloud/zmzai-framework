@@ -1,5 +1,13 @@
 # @zmzai/agent-framework
 
+## 0.18.1
+
+### Patch Changes
+
+- **修复 `resolveFrameworkVendorDirs` 在 pnpm / npm 去重布局下返回不存在的 wasm 目录**：旧实现只拼「framework 包内嵌套 node_modules」路径，而 pnpm 把依赖放在包同级（`.pnpm/<entry>/node_modules/`）、npm 去重会提升到祖先 node_modules——两种主流布局都会命中不存在的目录。消费方经 `setWasmDirs` 写入后，emscripten 加载失败会直接结束进程（Lectern Host 一次 `/api/repomap` 即崩）。现按 Node 依赖查找顺序（嵌套 → scope 同级 → 逐级祖先）逐候选并核对 wasm 文件真实存在；找不到仍按原契约抛错，签名不变。新增导出 `resolveVendorDirsFrom(frameworkRoot)` 便于宿主按自有锚点解析。
+- **wasm 不可用不再伪装成空地图**：Parser/Language 加载失败统一包为 `WasmUnavailableError`；`renderRepoMap` 遇到它如实上抛，不再按「单文件解析失败」跳过后返回「工作区没有可索引的代码文件」。
+- **repo_map 默认开启前探测资源**：fs 工作区默认注册 repo_map 时先确认 wasm 可用，不可用的环境不再注册一个必然失败的工具；显式对象形式（`capabilities.repoMap: { workspaceRoot }`）照常注册。
+
 ## 0.11.0
 
 ### Minor Changes

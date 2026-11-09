@@ -1,10 +1,10 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { loadTagCache, saveTagCache, splitByFreshness, statFiles } from "./cache.js";
 import { buildGraph, pagerank } from "./graph.js";
 import { renderMapText } from "./render.js";
-import { extractTags, listCodeFiles, setWasmDirs, type Tag } from "./tags.js";
+import { extractTags, isWasmUnavailable, listCodeFiles, setWasmDirs, type Tag } from "./tags.js";
 
 export { setWasmDirs } from "./tags.js";
 
@@ -32,7 +32,13 @@ export type RepoMapResult = {
 
 /** bundler 环境（Next 等）下定位 framework 依赖的 wasm 资源目录：从 framework
  *  包真实磁盘位置出发（穿透 symlink），只需 Node 运行时，不依赖 bundler 的模块
- *  解析。非 Node 运行时或无法定位时抛错——调用方应捕获并 fallback setWasmDirs。 */
+ *  解析。非 Node 运行时或无法定位时抛错——调用方应捕获并 fallback setWasmDirs。
+ *
+ *  0.18.1：依赖不一定嵌套在 framework 包自己的 node_modules 下——pnpm 把它们放在
+ *  包的同级（.pnpm/<entry>/node_modules/），npm 去重会提升到祖先 node_modules。
+ *  旧实现只拼嵌套路径，在这两种布局下返回不存在的目录；消费方经 setWasmDirs 写入后，
+ *  emscripten 加载失败会直接结束进程（Lectern Host 实测）。现按 Node 依赖查找顺序
+ *  逐个候选并核对 wasm 文件真实存在，绝不返回不存在的路径。 */
 export function resolveFrameworkVendorDirs(): { runtime: string; grammar: string } {
   const mod = (process as NodeJS.Process).getBuiltinModule?.("node:module");
   const createRequireFn = mod?.createRequire;
@@ -50,12 +56,46 @@ export function resolveFrameworkVendorDirs(): { runtime: string; grammar: string
       entry = path.join(process.cwd(), "node_modules", "@zmzai", "agent-framework", "package.json");
     }
   }
-  const real = realpathSync(entry);
-  const frameworkRoot = real.endsWith("package.json") ? path.dirname(real) : path.dirname(path.dirname(real));
-  return {
-    runtime: path.join(frameworkRoot, "node_modules", "web-tree-sitter"),
-    grammar: path.join(frameworkRoot, "node_modules", "tree-sitter-wasms", "out"),
-  };
+  let frameworkRoot: string;
+  try {
+    const real = realpathSync(entry);
+    frameworkRoot = real.endsWith("package.json") ? path.dirname(real) : path.dirname(path.dirname(real));
+  } catch {
+    // framework 包本身定位不到（如在 framework 源码仓内运行）：从 cwd 起找依赖
+    frameworkRoot = process.cwd();
+  }
+  return resolveVendorDirsFrom(frameworkRoot);
+}
+
+/** 运行时 wasm 与一个代表性语法 wasm 都在才算可用目录（与 tags.ts 的文件名一致）。 */
+const RUNTIME_WASM = "tree-sitter.wasm";
+const GRAMMAR_PROBE = "tree-sitter-javascript.wasm";
+
+/** 从 framework 包根出发按 Node 依赖查找顺序找 wasm 目录（导出供测试用固定布局验证）：
+ *  ① 包内嵌套 node_modules（npm 未去重）→ ② 包同级 node_modules（pnpm：
+ *  .pnpm/<entry>/node_modules/@zmzai/agent-framework 的依赖与 @zmzai 同级）→
+ *  ③ 逐级向上各祖先的 node_modules（npm/yarn 提升、monorepo 根）。
+ *  都找不到抛错并给出已试数量与起点。 */
+export function resolveVendorDirsFrom(frameworkRoot: string): { runtime: string; grammar: string } {
+  const candidates: string[] = [path.join(frameworkRoot, "node_modules")];
+  // 包名带 scope（@zmzai/agent-framework）时，同级 node_modules 是 scope 目录的父级
+  const parent = path.dirname(frameworkRoot);
+  if (path.basename(parent).startsWith("@")) candidates.push(path.dirname(parent));
+  for (let dir = frameworkRoot; ; ) {
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+    candidates.push(path.basename(dir) === "node_modules" ? dir : path.join(dir, "node_modules"));
+  }
+  const unique = [...new Set(candidates)];
+  for (const base of unique) {
+    const runtime = path.join(base, "web-tree-sitter");
+    const grammar = path.join(base, "tree-sitter-wasms", "out");
+    if (existsSync(path.join(runtime, RUNTIME_WASM)) && existsSync(path.join(grammar, GRAMMAR_PROBE))) {
+      return { runtime: realpathSync(runtime), grammar: realpathSync(grammar) };
+    }
+  }
+  throw new Error(`找不到 tree-sitter wasm 资源（已试 ${unique.length} 个 node_modules，起点 ${frameworkRoot}）`);
 }
 
 const STOPWORDS = new Set([
@@ -93,7 +133,10 @@ export async function renderRepoMap(opts: RepoMapOptions): Promise<RepoMapResult
     let tags: Tag[];
     try {
       tags = await extractTags(file, path.join(root, file));
-    } catch {
+    } catch (error) {
+      // wasm 资源不可用是环境错误，不是单文件解析失败：如实抛出，不伪装成
+      // 「工作区没有可索引的代码文件」的空地图
+      if (isWasmUnavailable(error)) throw error;
       continue;
     }
     staleTags.push(...tags);
