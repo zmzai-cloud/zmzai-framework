@@ -286,6 +286,19 @@ export class PartProjector {
     );
   }
 
+  /** 0.19.1 强制收尾：把仍在 running 的工具部件落为 error(outcome=unknown)——
+   *  停止请求在不可中止工具（MCP/挂起 bash）上耗尽宽限后的兜底展示，晚到的
+   *  tool_execution_end 会被 status!=="running" 守卫拒绝，不会覆盖。 */
+  cancelRunningTools(emit: Emit, reason: string): void {
+    for (const [toolCallId, partId] of this.toolPartByCallId) {
+      this.patchPart(emit, partId, (part) => {
+        if (part.type !== "tool" || part.state.status !== "running") return part;
+        void toolCallId;
+        return { ...part, state: { status: "error", input: part.state.input, error: reason, metadata: { outcome: "unknown" }, time: { start: part.state.time.start, end: new Date().toISOString() } } };
+      });
+    }
+  }
+
   onToolExecutionEnd(emit: Emit, toolCallId: string, result: unknown, isError: boolean): void {
     const partId = this.toolPartByCallId.get(toolCallId);
     if (!partId) return;

@@ -51,6 +51,8 @@ function defaultToolContext(input: { session: SessionInfo; engine: PermissionEng
     userId: session.userId,
     workspaceId: session.workspaceId,
     agent: session.agent,
+    // 0.19.1 前这里是一个永不触发的哑信号（工具层收不到停止）；runLoop 建立
+    // abortController 后会回填真实信号（见 runLoop 内 toolContext.abort 赋值）
     abort: new AbortController().signal,
     ask: engine.ask.bind(engine),
     workspace,
@@ -239,6 +241,10 @@ export class AttemptExecutor {
       await this.collabs.publish(event,session.id);
     };
     const toolContext = (this.deps.buildToolContext ?? defaultToolContext)({ session, engine, workspace, sandbox, emit: emitAsync });
+    // 0.19.1：把 run 的真实中止信号接进工具上下文（defaultToolContext 的占位信号
+    // 永不触发）。adaptTool 持有本对象引用、execute 时读取——运行期回填即生效。
+    const runAbort = new AbortController();
+    toolContext.abort = runAbort.signal;
     // Subagent spawning is only available to primary (non-child) sessions, and
     // only when the runner can host a nested run (spec §6.4).
     if (!session.parentId) {
@@ -312,7 +318,7 @@ export class AttemptExecutor {
       },
     });
 
-    const abortController = new AbortController();
+    const abortController = runAbort;
     const abort = () => {
       abortController.abort();
       agent.abort();
@@ -558,9 +564,23 @@ export class AttemptExecutor {
         : taskContext?.continuation
           ? "[继续执行任务] 上一轮结束时任务还没有完成。按上面的任务契约继续推进，不要中途把控制权交回用户。"
           : input.text;
-      await agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() });
-      await settled();
-      let failed = agent.state.errorMessage;
+      // 0.19.1 强制收尾兜底：agent.prompt 会等待全部工具落地——不可中止的工具
+      // （MCP/挂起的 bash）在停止后可能永远不返回（用户实测卡死）。给 abort 后
+      // 5s 宽限（正常取消路径足够），耗尽后不再等待：在飞工具由 projector 标为
+      // 「已停止·结果未知」，attempt 按取消走完收尾（租约/事件/onRunEnd 照常）。
+      // 工具 promise 若日后自行落地，事件只会晚到，不会再卡死会话。
+      const FORCE_SETTLE_GRACE_MS = 5_000;
+      let forceSettled = false;
+      const abortGrace = new Promise<void>((resolve) => {
+        abortController.signal.addEventListener("abort", () => {
+          setTimeout(() => { forceSettled = true; resolve(); }, FORCE_SETTLE_GRACE_MS);
+        }, { once: true });
+      });
+      const withForceSettle = <T,>(run: Promise<T>): Promise<T | undefined> =>
+        Promise.race([run, abortGrace.then(() => undefined as T | undefined)]).catch(() => undefined as T | undefined);
+      await withForceSettle(agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() }));
+      if (forceSettled) projector.cancelRunningTools(emit, "运行已停止：工具在途，结果未知");
+      let failed = forceSettled ? null : agent.state.errorMessage;
       if (unknownSideEffect) {
         await this.collabs.publish({ type: "session.status", data: { status: "waiting_input" } }, session.id);
       } else {
@@ -588,9 +608,10 @@ export class AttemptExecutor {
           ];
         }
         try {
-          await agent.continue();
+          await withForceSettle(agent.continue());
           await settled();
-          failed = agent.state.errorMessage;
+          failed = forceSettled ? null : agent.state.errorMessage;
+          if (forceSettled) projector.cancelRunningTools(emit, "运行已停止：工具在途，结果未知");
         } catch (retryError) {
           failed = retryError instanceof Error ? retryError.message : "Agent 重试失败";
         }

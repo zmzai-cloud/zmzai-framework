@@ -1,5 +1,13 @@
 # @zmzai/agent-framework
 
+## 0.19.1
+
+### Patch Changes
+
+- **修复停止请求到不了工具层（用户实测卡死）**：`ToolContext.abort` 此前挂着一个永不触发的占位信号，run 的真实中止信号从未接入——大工作区上的 grep 等长扫描工具无法中断（实测 15GB/20 万文件工作区 `grep spec/**` 无界挂死，停止无效）。现在 runLoop 建立的 `AbortController` 直接回填进工具上下文。
+- **grep 扫描预算与逐文件中止**：最多读 2000 个文件、超 1MB 的文件跳过，逐文件检查中止信号；触顶如实报 `truncated`（此前无界逐文件全文读取，结果集上限之外的扫描永不停止）。
+- **abort 强制收尾兜底**：不可中止的工具（MCP/挂起 bash）在停止后 5s 宽限耗尽时不再等待——attempt 按 cancelled 走完收尾（租约/事件/onRunEnd 照常），在飞工具部件标 `error(outcome=unknown)`；晚到的工具结果只追加审计事件，不再卡死会话。
+
 ## 0.19.0
 
 ### Minor Changes

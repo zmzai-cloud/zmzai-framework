@@ -30,6 +30,7 @@ export const globTool: ToolDef = {
   parameters: z.object({ pattern: z.string().max(256).optional() }),
   permission: () => ({ permission: "glob", patterns: ["*"] }),
   async execute(args, ctx) {
+    ctx.abort?.throwIfAborted();
     const files = await ctx.workspace.list();
     const matched = args.pattern ? files.filter((file) => wildcardMatch(args.pattern!, file.path)) : files;
     const limited = matched.slice(0, 200);
@@ -52,13 +53,27 @@ export const grepTool: ToolDef = {
   }),
   permission: (args) => ({ permission: "grep", patterns: [args.query] }),
   async execute(args, ctx) {
+    ctx.abort?.throwIfAborted();
     const files = await ctx.workspace.list();
     const candidates = args.pathPattern ? files.filter((file) => wildcardMatch(args.pathPattern!, file.path)) : files;
     const matches: { path: string; line: number; text: string }[] = [];
+    // 0.19.1 扫描预算（实测事故：15GB/20 万文件工作区上逐文件全文读取无界挂死）：
+    // 最多读 2000 个文件、单文件超 1MB 跳过（先按 list 的 bytes 粗筛）；触顶如实
+    // 报 truncated，不装作搜完了。逐文件检查中止信号——停止请求即时生效。
+    const MAX_FILES = 2000;
+    const MAX_FILE_BYTES = 1024 * 1024;
+    let scanned = 0;
+    let skippedLarge = 0;
+    let hitBudget = false;
     for (const candidate of candidates) {
       if (matches.length >= 50) break;
+      if (scanned >= MAX_FILES) { hitBudget = true; break; }
+      ctx.abort?.throwIfAborted();
+      if (typeof candidate.bytes === "number" && candidate.bytes > MAX_FILE_BYTES) { skippedLarge += 1; continue; }
+      scanned += 1;
       const file = await ctx.workspace.read(candidate.path);
       if (!file) continue;
+      if (Buffer.byteLength(file.content, "utf8") > MAX_FILE_BYTES) { skippedLarge += 1; continue; }
       const lines = file.content.split("\n");
       for (let index = 0; index < lines.length && matches.length < 50; index++) {
         if (lines[index]!.includes(args.query)) {
@@ -66,10 +81,14 @@ export const grepTool: ToolDef = {
         }
       }
     }
+    hitBudget = hitBudget || scanned >= MAX_FILES && matches.length < 50 && scanned < candidates.length;
+    const note = hitBudget
+      ? `\n（扫描预算：已读 ${scanned}/${candidates.length} 个文件后停止；${skippedLarge} 个超过 1MB 的文件被跳过。需要更全的结果请收窄 pathPattern 或分目录搜索。）`
+      : skippedLarge > 0 ? `\n（${skippedLarge} 个超过 1MB 的文件被跳过。）` : "";
     return {
-      title: `搜索 "${args.query}"：${matches.length} 条命中`,
-      output: matches.length ? matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") : "没有命中。",
-      metadata: { count: matches.length, truncated: matches.length >= 50 },
+      title: `搜索 "${args.query}"：${matches.length} 条命中${hitBudget ? "（预算截断）" : ""}`,
+      output: (matches.length ? matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") : "没有命中。") + note,
+      metadata: { count: matches.length, truncated: matches.length >= 50 || hitBudget, scanned, skippedLarge, total: candidates.length },
     };
   },
 };

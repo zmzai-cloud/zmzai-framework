@@ -242,3 +242,45 @@ describe("bash tool", () => {
     expect(result.output).toContain("沙箱错误：无法连接 Sandbox 服务");
   });
 });
+
+describe("grep 0.19.1：中止信号与扫描预算", () => {
+  const bigWorkspace = (count: number, content = "plain") => ({
+    list: vi.fn().mockResolvedValue(Array.from({ length: count }, (_, i) => ({ path: `f/${i}.txt`, bytes: 10 }))),
+    read: vi.fn().mockImplementation(async (path: string) => ({ path, content })),
+  });
+
+  it("中止信号触发时立即停止并抛 AbortError（不再无界扫描）", async () => {
+    const controller = new AbortController();
+    let reads = 0;
+    const ctx = fakeContext({
+      abort: controller.signal,
+      workspace: {
+        ...({} as never),
+        list: vi.fn().mockResolvedValue(Array.from({ length: 3000 }, (_, i) => ({ path: `f/${i}.txt`, bytes: 10 }))),
+        read: vi.fn().mockImplementation(async (path: string) => { reads += 1; if (reads === 5) controller.abort(); return { path, content: "needle" }; }),
+      } as never,
+    });
+    await expect(grepTool.execute({ query: "needle" }, ctx)).rejects.toMatchObject({ name: "AbortError" });
+    expect(reads).toBeLessThan(10);
+  });
+
+  it("扫描预算触顶：读满 2000 个文件即停，如实报 truncated 与已扫描数", async () => {
+    const ws = bigWorkspace(5000);
+    const ctx = fakeContext({ workspace: ws as never });
+    const result = await grepTool.execute({ query: "needle" }, ctx); // 无命中：预算才可能触顶
+    expect(ws.read).toHaveBeenCalledTimes(2000);
+    expect(result.metadata).toMatchObject({ truncated: true, scanned: 2000, total: 5000 });
+    expect(result.output).toContain("扫描预算");
+  });
+
+  it("超过 1MB 的文件被跳过并计数", async () => {
+    const ctx = fakeContext({
+      workspace: {
+        list: vi.fn().mockResolvedValue([{ path: "big.bin", bytes: 2 * 1024 * 1024 }, { path: "ok.txt", bytes: 10 }]),
+        read: vi.fn().mockImplementation(async (path: string) => ({ path, content: path === "ok.txt" ? "needle here" : "" })),
+      } as never,
+    });
+    const result = await grepTool.execute({ query: "needle" }, ctx);
+    expect(result.metadata).toMatchObject({ skippedLarge: 1, count: 1 });
+  });
+});

@@ -907,3 +907,63 @@ describe("onProviderStreamEvent 透传（deps → Agent → 流函数 options）
     }
   }, 25_000);
 });
+
+describe("0.19.1 强制收尾：挂死工具上停止不再永久卡死", () => {
+  it("abort 后 5s 宽限耗尽 → attempt 落 cancelled、在飞工具标「结果未知」", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "runner-force-"));
+    try {
+      const h = makeHarness([
+        fauxAssistantMessage([fauxToolCall("hang", { forever: true })]),
+        fauxAssistantMessage("不该到达"),
+      ]);
+      const store = createSqliteSessionStore({ dataDir });
+      // 永不落地的工具（模拟 MCP 挂起/无界扫描）——即便收到 abort 也不返回
+      const hangTool: ToolDef = {
+        id: "hang",
+        label: "挂起",
+        description: "test",
+        parameters: z.object({ forever: z.boolean().optional() }),
+        permission: () => null,
+        async execute() {
+          return await new Promise(() => undefined);
+        },
+      };
+      const runner = new SessionRunner({ ...h.deps, store, eventLog: createSqliteEventLog({ dataDir }), tools: [hangTool] });
+      const session = await createFrameworkSession({ store, userId: "u", workspaceId: "w", model: { providerId: "faux", modelId: "test-model" }, prompt: "go" });
+      await runner.prompt(session.id, { requestId: "force_1", text: "跑挂起工具" });
+      // 等工具真正进入执行（事件流出现 hang 的 running 态）
+      const runningDeadline = Date.now() + 8_000;
+      while (Date.now() < runningDeadline) {
+        const parts = (await store.getMessages(session.id)).flatMap((m) => m.parts);
+        if (parts.some((p) => p.type === "tool" && p.tool === "hang" && (p as { state?: { status?: string } }).state?.status === "running")) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const started = Date.now();
+      await runner.abort(session.id);
+      const waitDone = (async () => { while (Date.now() - started < 12_000) { const s = await store.getSession(session.id); await new Promise((r) => setTimeout(r, 100)); void s; } })();
+      void waitDone;
+      // abort 应回执；随后会话在宽限内退出 running
+      const deadline = Date.now() + 8_000;
+      let latest: { running: boolean } | undefined;
+      while (Date.now() < deadline) {
+        const task = await store.task!.getLatestTask(session.id).catch(() => null);
+        const done = task && !["queued", "running", "recovering", "verifying"].includes(task.status);
+        if (done) { latest = { running: false }; break; }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      expect(latest?.running).toBe(false);
+      const task = await store.task!.getLatestTask(session.id);
+      expect(task?.status).toBe("cancelled");
+      // 宽限确实等了 ~5s（证明走的是强制收尾路径而不是正常取消）
+      expect(Date.now() - started).toBeGreaterThanOrEqual(4_500);
+      // 在飞工具部件被标 error(outcome=unknown)
+      const msgs = await store.getMessages(session.id);
+      const hangPart = msgs.flatMap((m) => m.parts).find((p) => p.type === "tool" && p.tool === "hang");
+      const st = (hangPart as { state?: { status?: string; metadata?: { outcome?: string } } } | undefined)?.state;
+      expect(st?.status).toBe("error");
+      expect(st?.metadata?.outcome).toBe("unknown");
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }, 25_000);
+});
