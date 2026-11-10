@@ -83,6 +83,13 @@ export type MessageInfo =
       model: ModelRef;
       error?: { name: string; message: string };
       tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+      /** 本条响应的耗时（pi 单调时钟，从请求开始到终态消息）。 */
+      durationMs?: number;
+      /** 本次请求实际生效的推理档位（pi 0.99+ 记录；上游钳制时与请求值不同）。 */
+      thinkingLevel?: string;
+      /** 本次请求费用：total 为最优可得值，totalFromProvider=true 表示 provider
+       *  计费真值（false/缺省 = 目录估算）。pi 1.5+。 */
+      cost?: { total: number; totalFromProvider: boolean };
       time: { created: string; completed?: string };
     };
 
@@ -95,6 +102,8 @@ export type ToolState =
       output: string;
       title: string;
       metadata?: Record<string, unknown>;
+      /** 工具执行耗时（pi 单调时钟，不含钩子；缺省时用 time 差值兜底）。 */
+      durationMs?: number;
       time: { start: string; end: string };
     }
   | { status: "error"; input: unknown; error: string; metadata?: Record<string, unknown>; time: { start: string; end: string } };
@@ -126,7 +135,12 @@ export type Part =
   | (PartBase & { type: "reasoning"; text: string })
   | (PartBase & { type: "tool"; callId: string; tool: string; state: ToolState })
   | (PartBase & { type: "step-start" })
-  | (PartBase & { type: "step-finish"; tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } })
+  | (PartBase & {
+      type: "step-finish";
+      tokens?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+      /** 供会话级费用聚合：每步最优可得费用与是否 provider 计费真值。 */
+      cost?: { total: number; totalFromProvider: boolean };
+    })
   | (PartBase & { type: "subtask"; prompt: string; description: string; agent: string; childSessionId: string })
   | FilePart
   | (PartBase & { type: "image"; url: string; mediaType: string; alt?: string })

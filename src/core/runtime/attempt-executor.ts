@@ -22,7 +22,7 @@ import { fireRunStart, firstToolBlock, fireAfterToolCall, fireRunEnd, type Lifec
 import { extractRunTranscript, RETRY_PLACEHOLDER_TEXT, type RunTranscriptMessage } from "./run-transcript.js";
 import type { SandboxExecutor } from "../../adapters/index.js";
 import { noopSandboxExecutor } from "../../adapters/index.js";
-import { isRetryableError, type RunOutcome, type TaskLifecycle } from "./task-lifecycle.js";
+import { isRetryableError, upstreamRetryable, type RunOutcome, type TaskLifecycle } from "./task-lifecycle.js";
 import type { RunScheduler } from "./run-scheduler.js";
 import type { ContextBuilder } from "./context-builder.js";
 import { defaultActiveRunRegistry } from "./active-run-registry.js";
@@ -298,6 +298,7 @@ export class AttemptExecutor {
         messages: history,
       },
       streamFn: this.deps.streamFnFor(session),
+      ...(this.deps.onProviderStreamEvent ? { onProviderStreamEvent: this.deps.onProviderStreamEvent } : {}),
       toolExecution: "sequential",
       ...(compactionTransform ? { transformContext: compactionTransform } : {}),
       // 0.19.0（pi 0.87.0 迁移）：finishTurn 在 error/aborted 也会跑，旧钩子只在
@@ -570,7 +571,13 @@ export class AttemptExecutor {
       // "出错了"有诊断价值）。退避 500ms→1s→2s→4s→8s 避免对上游施压。
       // P1：3→5 次——限流（429）场景退避窗口需要更长才有机会恢复。
       const MAX_RETRIES = 5;
-      for (let attempt = 0; attempt < MAX_RETRIES && failed && isRetryableError(failed); attempt += 1) {
+      // 判定优先走 pi-ai 的 isRetryableAssistantError（精度更高，见 upstreamRetryable
+      //  注释）；拿不到结构化错误时回落本地字符串列表
+      const retryDecided = (errorMessage: string): boolean => {
+        const lastAssistant = [...agent.state.messages].reverse().find((m) => m.role === "assistant");
+        return upstreamRetryable(lastAssistant) ?? isRetryableError(errorMessage);
+      };
+      for (let attempt = 0; attempt < MAX_RETRIES && failed && retryDecided(failed); attempt += 1) {
         if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
         const messages = agent.state.messages;
         const last = messages[messages.length - 1];

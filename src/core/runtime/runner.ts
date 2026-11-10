@@ -115,6 +115,9 @@ export type RunnerDeps = {
   compaction?: { enabled: boolean; contextWindow: number; summaryModel: Model<Api> | null };
   /** 生命周期钩子（P0）：observe/block。抛错只告警不中断运行。 */
   hooks?: LifecycleHook[];
+  /** 归一化前的 provider 原始流事件观测（pi 0.99+）：经 Agent 传入流函数
+   *  options.onProviderStreamEvent。只读旁路，抛错由 pi 吞掉不影响主链路。 */
+  onProviderStreamEvent?: import("@earendil-works/pi-ai").SimpleStreamOptions["onProviderStreamEvent"];
   /** 长期记忆召回（spec §记忆）：run 开始时按当前 prompt 查询，返回文本
    *  则作为首条 in-memory user 消息前插（不落 store）。抛错/返回空时零影响。 */
   memoryContextFor?: (session: SessionInfo, text: string) => Promise<string | undefined>;

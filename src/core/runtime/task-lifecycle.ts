@@ -1,4 +1,5 @@
 import type { FrameworkEvent, TodoItem } from "../events/manifest.js";
+import { isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { SessionStore } from "../session/store.js";
 import type { SessionInfo } from "../session/types.js";
 import type { PromptInput, WorkflowState } from "../session/workflow.js";
@@ -88,6 +89,21 @@ export const RESET_GUARDS_ON_RESUME = { noProgressCount: 0, attemptCount: 0, act
  *  "upstream_http2_stream_error" 等）。余额/鉴权等确定性错误不重试。
  *  P1 增强：限流/网关类（429/5xx）也按可重试处理——这类错误本质是上游
  *  暂时不可用，与 terminated 同属"等等就好"，自动退避重试比直接报错体验好。 */
+/** 上游分类器（pi-ai 1.5）：识别 provider 错误 AssistantMessage 是否值得自动重试。
+ *  覆盖了本地字符串列表追不上的精度（如：请求 id 里的数字不再被当状态码、
+ *  Zhipu 1308 用量超限判为不可重试、server_busy/upstream_error 等网关瞬断判为可重试）。
+ *  非 AssistantMessage 或无法判定时返回 null，回落本地列表。 */
+export function upstreamRetryable(message: unknown): boolean | null {
+  if (typeof message !== "object" || message === null) return null;
+  const candidate = message as { role?: string; errorMessage?: string; stopReason?: string };
+  if (candidate.role !== "assistant" || !candidate.errorMessage) return null;
+  try {
+    return isRetryableAssistantError(candidate as AssistantMessage);
+  } catch {
+    return null;
+  }
+}
+
 export function isRetryableError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (

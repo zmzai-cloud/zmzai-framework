@@ -27,6 +27,8 @@ export type FrameworkDeps = {
   localTools?: import("../core/tools/def.js").AnyToolDef[];
   /** 生命周期钩子（P0）：observe/block，见 core/runtime/lifecycle.ts。 */
   hooks?: import("../core/runtime/lifecycle.js").LifecycleHook[];
+  /** 归一化前的 provider 原始流事件观测（透传给 runner 的流函数 options）。 */
+  onProviderStreamEvent?: import("@earendil-works/pi-ai").SimpleStreamOptions["onProviderStreamEvent"];
   subagentDepth?: number;
   /** 子代理协调器（T02，spec 2026-09-28 §4.1）：宿主注入执行服务
    *  （runChild/abortChild/限额，可选自定义子会话工厂）；本函数把它透传给
@@ -83,6 +85,7 @@ export function createServer(deps: FrameworkDeps): AgentFramework {
     ...(deps.loadWorkspaceAgents ? { loadWorkspaceAgents: deps.loadWorkspaceAgents } : {}),
     ...(deps.localTools ? { localTools: deps.localTools } : {}),
     ...(deps.hooks ? { hooks: deps.hooks } : {}),
+    ...(deps.onProviderStreamEvent ? { onProviderStreamEvent: deps.onProviderStreamEvent } : {}),
     subagentDepth: deps.subagentDepth ?? 1,
     ...(deps.compaction ? { compaction: deps.compaction } : {}),
     ...(deps.leaseStore ? { leaseStore: deps.leaseStore } : {}),

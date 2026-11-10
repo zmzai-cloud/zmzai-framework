@@ -290,21 +290,25 @@ export class PartProjector {
     const partId = this.toolPartByCallId.get(toolCallId);
     if (!partId) return;
     const { output, title, metadata } = extractResult(result);
+    // pi 1.1+ 的单调时钟执行耗时（不含钩子）；比 time 差值准（时钟回拨/挂起不扰）
+    const toolDurationMs = (result as { durationMs?: number } | null)?.durationMs;
+    const withDuration = <T extends object>(state: T): T =>
+      typeof toolDurationMs === "number" && Number.isFinite(toolDurationMs) ? { ...state, durationMs: toolDurationMs } : state;
     this.patchPart(emit, partId, (part) => {
       if (part.type !== "tool" || part.state.status !== "running") return part;
       const unknown = metadata?.outcome === "unknown";
       const state: ToolState = unknown
-        ? { status: "error", input: part.state.input, error: output, metadata: { ...(metadata ?? {}), outcome: "unknown" }, time: { start: part.state.time.start, end: new Date().toISOString() } }
+        ? withDuration({ status: "error", input: part.state.input, error: output, metadata: { ...(metadata ?? {}), outcome: "unknown" }, time: { start: part.state.time.start, end: new Date().toISOString() } })
         : isError
-        ? { status: "error", input: part.state.input, error: output, ...(metadata ? { metadata } : {}), time: { start: part.state.time.start, end: new Date().toISOString() } }
-        : {
+        ? withDuration({ status: "error", input: part.state.input, error: output, ...(metadata ? { metadata } : {}), time: { start: part.state.time.start, end: new Date().toISOString() } })
+        : withDuration({
             status: "completed",
             input: part.state.input,
             output,
             title: title ?? part.state.title ?? "完成",
             ...(metadata ? { metadata } : {}),
             time: { start: part.state.time.start, end: new Date().toISOString() },
-          };
+          });
       return { ...part, state };
     });
   }
@@ -312,13 +316,16 @@ export class PartProjector {
   onAssistantEnd(emit: Emit, message: AgentMessage): void {
     this.flushAllText(emit, true);
     if (!this.assistantMessageId) return;
+    const cost = extractCost(message);
     if (this.stepOpen) {
       this.stepOpen = false;
       const usage = extractUsage(message);
-      this.assistantPart(emit, { type: "step-finish", ...(usage ? { tokens: usage } : {}) });
+      this.assistantPart(emit, { type: "step-finish", ...(usage ? { tokens: usage } : {}), ...(cost ? { cost } : {}) });
     }
     const usage = extractUsage(message);
     const error = extractError(message);
+    const durationMs = (message as { durationMs?: number }).durationMs;
+    const thinkingLevel = (message as { thinkingLevel?: string }).thinkingLevel;
     const info: MessageInfo = {
       id: this.assistantMessageId,
       sessionId: this.identity.sessionId,
@@ -327,6 +334,9 @@ export class PartProjector {
       agent: this.identity.agent,
       model: this.identity.model,
       ...(usage ? { tokens: usage } : {}),
+      ...(typeof durationMs === "number" && Number.isFinite(durationMs) ? { durationMs } : {}),
+      ...(typeof thinkingLevel === "string" && thinkingLevel ? { thinkingLevel } : {}),
+      ...(cost ? { cost } : {}),
       ...(error ? { error } : {}),
       time: { created: this.parts.size ? new Date().toISOString() : new Date().toISOString(), completed: new Date().toISOString() },
     };
@@ -363,6 +373,14 @@ function extractResult(result: unknown): { output: string; title: string | null;
   const title = details && typeof details.title === "string" ? details.title : null;
   const metadata = details ? Object.fromEntries(Object.entries(details).filter(([key]) => key !== "title")) : null;
   return { output: output || "（无输出）", title, metadata: metadata && Object.keys(metadata).length ? metadata : null };
+}
+
+/** pi 1.5+ 的费用（catalog 估算或 provider 计费真值；字段缺失 = 不可得）。 */
+function extractCost(message: AgentMessage): { total: number; totalFromProvider: boolean } | null {
+  if (message.role !== "assistant") return null;
+  const cost = (message as { usage?: { cost?: { total?: number; totalFromProvider?: boolean } } }).usage?.cost;
+  if (typeof cost?.total !== "number" || !Number.isFinite(cost.total)) return null;
+  return { total: cost.total, totalFromProvider: cost.totalFromProvider === true };
 }
 
 function extractUsage(message: AgentMessage): { input: number; output: number; cacheRead?: number; cacheWrite?: number } | null {

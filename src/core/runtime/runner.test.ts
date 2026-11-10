@@ -870,3 +870,40 @@ describe("SessionRunner", () => {
     });
   });
 });
+
+
+describe("onProviderStreamEvent 透传（deps → Agent → 流函数 options）", () => {
+  it("主循环调用流函数时宿主回调可达（总结链路的两参调用不受影响）", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "runner-prov-"));
+    try {
+      const h = makeHarness([fauxAssistantMessage("done")]);
+      const store = createSqliteSessionStore({ dataDir });
+      const fauxStream = h.deps.streamFnFor({ id: "s" } as never) as (m: unknown, c: unknown, o?: { onProviderStreamEvent?: (data: unknown, model: unknown) => void }) => Promise<unknown>;
+      let loopOptions: { onProviderStreamEvent?: (data: unknown, model: unknown) => void } | undefined;
+      const seen: unknown[] = [];
+      const runner = new SessionRunner({
+        ...h.deps,
+        store,
+        eventLog: createSqliteEventLog({ dataDir }),
+        streamFnFor: () => (async (model: unknown, context: unknown, options?: { onProviderStreamEvent?: (data: unknown, model: unknown) => void }) => {
+          if (options) {
+            loopOptions = options;
+            options.onProviderStreamEvent?.({ type: "raw.provider.event", body: "upstream 502 detail" }, model);
+          }
+          return fauxStream(model, context, options);
+        }) as never,
+        onProviderStreamEvent: (data: unknown) => { seen.push(data); },
+      });
+      const session = await createFrameworkSession({ store, userId: "u", workspaceId: "w", model: { providerId: "faux", modelId: "test-model" }, prompt: "go" });
+      await runner.prompt(session.id, { requestId: "t1_prov_2", text: "go" });
+      const deadline = Date.now() + 15_000;
+      while (loopOptions === undefined && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      expect(loopOptions?.onProviderStreamEvent).toBeTypeOf("function");
+      // 断言可达与负载，不钉调用次数（重试/总结等路径可能复用同一流函数多次）
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      expect(seen[0]).toEqual({ type: "raw.provider.event", body: "upstream 502 detail" });
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }, 25_000);
+});

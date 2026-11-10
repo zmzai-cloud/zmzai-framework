@@ -6,6 +6,8 @@
 
 - **升级 PI 运行时：`@earendil-works/pi-agent-core` / `pi-ai` 0.84.1 → 1.5.0**（跨上游 1.0）。随升级获得：流式工具参数 O(n²)→线性（大 write/edit 的 CPU/内存）、网关/瞬时错误自动重试大扫除（server_busy/upstream_error/stream disconnected 等，Zhipu 1308 用量超限不再无限重试）、消息与工具结果的真实 `durationMs`、`Usage.cost.totalFromProvider` 计费真值标记、输出预算按 15% 预留与 3.5 chars/token 估算防误压缩、MCP 外部工具参数统一 JSON Schema coerce、agent-core 瘦身（删实验 harness，1.8MB→0.27MB）。
 - **迁移**（对宿主 API 无变化）：`shouldStopAfterTurn` → `finishTurn`（按上游迁移守卫保持「仅正常响应计数」语义，steps 上限不变）；自定义 streamFn 入参 `Context` → `TranscriptContext`；systemPrompt 观测改经 `getCurrentSystemPrompt`。
+- **PI 1.5 能力接入（第一/二档）**：①assistant 消息投影 `durationMs`（响应耗时）、`thinkingLevel`（实际生效档位）、`cost{total,totalFromProvider}`（provider 计费真值 vs 目录估算），step-finish part 带费用，工具完成态带单调时钟执行耗时；②外层重试判定优先 pi-ai `isRetryableAssistantError`（server_busy 等网关瞬断判可重试、Zhipu 1308 用量超限判不可重试——本地字符串列表追不上的精度），本地列表保留为兜底；③新增 `RunnerDeps.onProviderStreamEvent`（createServer 同名透传）：归一化前的 provider 原始流事件观测，经 Agent 进流函数 options。
+- **排队/steering 不迁移 pi 内存队列（决策）**：框架排队经 WorkflowStore 持久化（spec §4.2「内存队列仅缓存」），pi steering/followUp 是进程内 PendingMessageQueue 且语义为 run 中注入（框架为 run 间 drain 续跑）——迁移丢持久化契约。已采纳的官方钩子：finishTurn（本升级）。
 - **修复 `streamOneText` 在 pi 1.x 下静默丢失系统提示**：旧实现给 provider 流函数传 `{ systemPrompt, messages }`、调用方 `as never` 硬转，pi ≥0.86 的 provider 只从 transcript 前导系统消息读系统提示——总结与标题生成会失去指令。现经 `normalizeContext` 折叠成正规 TranscriptContext，参数类型对齐 pi `StreamFn`（宿主侧强转可去）。
 - **修复升级引入的基准偏移**：pi ≥0.86 把 systemPrompt+工具声明 unshift 成前导系统消息，run 收尾按 `agent.state.messages` 实际前导 system 条数补偿 baseline——否则切片左移一条，记忆注入段（内存态首条 user 消息）会混进 onRunEnd 的 newMessages 与总结素材。
 - 含 0.18.1：repomap wasm 目录按依赖布局解析（pnpm 同级/npm 提升），加载失败不再伪装空地图。
