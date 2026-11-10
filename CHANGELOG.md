@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.2
+
+### Patch Changes
+
+- **修复 glob/list 在大工作区上 "Maximum call stack size exceeded"**：`createFsWorkspaceFiles().list()` 的目录遍历是递归 walk——深目录（node_modules 嵌套）爆调用栈；且逐文件 `readFile` 拿 bytes 把全部文件内容读进内存（用户实测 20 万文件工作区）。改为显式栈迭代 + `stat` 取大小（不读内容）+ 5 万条硬上限。符号链接去环语义不变。
+
 ## 0.19.1
 
 ### Patch Changes

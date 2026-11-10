@@ -255,7 +255,6 @@ describe("grep 0.19.1：中止信号与扫描预算", () => {
     const ctx = fakeContext({
       abort: controller.signal,
       workspace: {
-        ...({} as never),
         list: vi.fn().mockResolvedValue(Array.from({ length: 3000 }, (_, i) => ({ path: `f/${i}.txt`, bytes: 10 }))),
         read: vi.fn().mockImplementation(async (path: string) => { reads += 1; if (reads === 5) controller.abort(); return { path, content: "needle" }; }),
       } as never,

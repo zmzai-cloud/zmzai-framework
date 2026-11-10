@@ -53,15 +53,23 @@ export function createFsWorkspaceFiles(input: { root: string }): WorkspaceFiles 
         /* root 存在性已由 existsSync 保证，此处置信度足够 */
       }
       const walkedDirs = new Set<string>([realRoot]);
-      const walk = async (dir: string): Promise<{ path: string; bytes: number }[]> => {
-        const out: { path: string; bytes: number }[] = [];
+      // 0.19.2：递归 walk 在深目录（node_modules 嵌套）上会爆调用栈（用户实测
+      // glob 在大工作区 "Maximum call stack size exceeded"）；且逐文件 readFile
+      // 拿 bytes 把 20 万文件全读进内存。改显式栈迭代 + stat 拿大小（不读内容），
+      // 并给 list 一个硬上限（超过即止——glob/grep 上层有更细的预算与提示）。
+      const MAX_LIST_ENTRIES = 50_000;
+      const out: { path: string; bytes: number }[] = [];
+      const stack: string[] = [root];
+      while (stack.length > 0 && out.length < MAX_LIST_ENTRIES) {
+        const dir = stack.pop()!;
         let entries: Dirent[];
         try {
           entries = await readdir(dir, { withFileTypes: true });
         } catch {
-          return out;
+          continue;
         }
         for (const entry of entries) {
+          if (out.length >= MAX_LIST_ENTRIES) break;
           if (entry.name === ".fw-revisions.json" || entry.name.startsWith(".git")) continue;
           const full = path.join(dir, entry.name);
           let isDirectory = entry.isDirectory();
@@ -86,18 +94,18 @@ export function createFsWorkspaceFiles(input: { root: string }): WorkspaceFiles 
             }
           }
           if (isDirectory) {
-            out.push(...(await walk(full)));
+            stack.push(full);
           } else {
             try {
-              out.push({ path: path.relative(root, full), bytes: (await readFile(full)).length });
+              const info = await stat(full);
+              out.push({ path: path.relative(root, full), bytes: Number(info.size) });
             } catch {
               continue;
             }
           }
         }
-        return out;
-      };
-      return walk(root);
+      }
+      return out;
     },
     async read(rel) {
       const full = safeJoin(root, rel);
