@@ -283,9 +283,14 @@ export class AttemptExecutor {
     let delivery: TaskDeliverInput | null = null;
 
     // 上下文组装唯一入口（W7-S6）：压缩 transform、同拍快照重建、记忆召回。
+    const __t0 = Date.now();
+    const __phase = (name: string) => { if (Date.now() - __t0 > 2_000) console.error(`[runloop-phase] ses=${session.id.slice(0, 12)} ${name} +${((Date.now() - __t0) / 1000).toFixed(1)}s`); };
+    __phase("runLoop-entry");
     const { compactionTransform, history, baseline } = await this.collabs.contextBuilder.buildAttemptContext(session, input, emit);
+    __phase("buildAttemptContext");
     // baseline 按我们的 history 计数；pi ≥0.86 构造 Agent 时会再 unshift 一条前导
     // 系统消息，收尾消费 baseline 处统一经 effectiveRunBaseline 补偿（见函数说明）
+    __phase("pre-Agent");
     const agent = new Agent({
       initialState: {
         systemPrompt: [
@@ -578,7 +583,9 @@ export class AttemptExecutor {
       });
       const withForceSettle = <T,>(run: Promise<T>): Promise<T | undefined> =>
         Promise.race([run, abortGrace.then(() => undefined as T | undefined)]).catch(() => undefined as T | undefined);
-      await withForceSettle(agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() }));
+    __phase("pre-prompt");
+    await withForceSettle(agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() }));
+    __phase("post-prompt");
       if (forceSettled) projector.cancelRunningTools(emit, "运行已停止：工具在途，结果未知");
       let failed = forceSettled ? null : agent.state.errorMessage;
       if (unknownSideEffect) {
