@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.6
+
+### Patch Changes
+
+- **推理档位 off 档映射为 minimal 下发**：pi 会把 thinkingLevel=off 折叠成「不带 reasoning_effort」，GLM 系上游收不到字段=默认开思考——off 的关闭语义必须以 minimal 形式到达 relay，由渠道侧（relay thinkingFormat=zai 翻译，2026-11-12 同步上线）转成 thinking:{type:"disabled"}。
+
 ## 0.19.5
 
 ### Patch Changes

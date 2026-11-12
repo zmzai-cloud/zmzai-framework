@@ -303,8 +303,12 @@ export class AttemptExecutor {
         ].filter(Boolean).join("\n\n"),
         model: this.deps.modelFor(model),
         // 推理力度（P1-8 复活）：relay 现已按模型白名单接受 reasoning_effort；
-        // 仅当调用方显式选择且非 off 时下发（默认不设 = 完全不带该字段）。
-        ...(input.effort && input.effort !== "off" ? { thinkingLevel: input.effort } : {}),
+        // 仅当调用方显式选择时下发（默认不设 = 完全不带该字段）。
+        // off 映射为 minimal 下发（2026-11-12 档位事故）：pi 会把 off 折叠成
+        // 「不带 reasoning_effort」，GLM 系上游收不到字段=默认开思考——off 的
+        // 「关闭思考」语义必须以 minimal 的形式到达 relay，由渠道侧翻译成
+        // thinking:{type:"disabled"}。
+        ...(input.effort ? { thinkingLevel: input.effort === "off" ? "minimal" : input.effort } : {}),
         tools: piTools,
         messages: history,
       },
