@@ -1,5 +1,13 @@
 # @zmzai/agent-framework
 
+## 0.19.4
+
+### Patch Changes
+
+- **纯问答轮「回答即交付」（Completion Gate 4.5）**：整轮零工作工具（不含 task_deliver/todo/task_block 簿记）= 零副作用 = 无可验收的工作项——正常跑完且写出最终回答即 delivered，不再被「必须显式 task_deliver」的单行道推进续跑循环（模型被迫为一句 hello 编造交付仪式，三轮后落 no_progress）。安全边界五条：零工作工具、正常跑完、有最终回答、无未收尾子代理、无未完成步骤（立了 todo 计划即宣告工作，必须做完或显式交付）。有过任何工作工具的轮次不变——显式交付不变量（条件 6）照旧。delivered verdict 新增可选 `result`（纯问答轮带干净四问结果，避免 fallback 的「0 个步骤、0 次工具调用」空话）。
+- **任务契约提示词双通道**：工作轮必须显式交付（原文保留）；纯问答轮明确指示「直接把回答写完整即可，不要调用 task_deliver、不要提验收/交付——回答本身就是交付」。
+- RunOutcome 新增 `workToolCalls`（attempt-executor 在 tool_execution_start 按工具名排除簿记累加），CompletionRuntimeState 透传同名字段。
+
 ## 0.19.2
 
 ### Patch Changes

@@ -1,4 +1,4 @@
-import type { TaskBlocker, TaskRecord } from "./types.js";
+import type { TaskBlocker, TaskRecord, TaskResult } from "./types.js";
 
 /** Completion Gate：可信完成判定（规格 3 §9）。
  *
@@ -66,6 +66,10 @@ export type CompletionRuntimeState = {
   unresolvedToolErrors: string[];
   /** 最终交付文本是否已经生成（§9 条件 5）。 */
   finalTextPresent: boolean;
+  /** 本轮**工作**工具调用数（不含 task_deliver/todo/task_block 簿记）。
+   *  零 = 纯问答轮：无副作用、无可验收的工作项——「回答即交付」分支（4.5）
+   *  的判定输入。做过任何实际工作的轮次照旧要求显式交付。 */
+  workToolCalls: number;
   /** 用户主动停止。 */
   cancelled: boolean;
 };
@@ -75,7 +79,10 @@ export type CompletionRuntimeState = {
  *  `continue` 是内部续跑的指令，**不创建用户消息**（规格 §8.2）。它携带
  *  `advisory` 时会被拼进下一个 Attempt 的恢复上下文。 */
 export type CompletionVerdict =
-  | { status: "delivered"; reason: string }
+  /** `result` 供「回答即交付」的纯问答轮带上一份干净的四问结果（否则
+   *  settleTask 的 fallback 会写出「0 个步骤、0 次工具调用」这类用户
+   *  抓过的空话）；显式交付轮不填，走 `task.result`。 */
+  | { status: "delivered"; reason: string; result?: TaskResult }
   | { status: "continue"; reason: string; advisory?: string }
   | { status: "blocked"; blocker: TaskBlocker }
   | { status: "failed"; reason: string }
@@ -351,6 +358,31 @@ export function evaluateTaskCompletion(
         (state.lastError ? `上一轮运行中断了：${state.lastError}\n` : "上一轮运行中断了。") +
         "先确认工作区当前的实际状态（哪些文件已经改过、外部系统处于什么状态），" +
         "再从中断的地方继续——不要从头再做一遍，那会产生重复副作用。",
+    };
+  }
+
+  // 4.5) 纯问答轮「回答即交付」（2026-11-12）：整轮零工作工具 = 零副作用 =
+  //  没有可验收的工作项，回答本身就是交付。此前这类轮次被「必须显式
+  //  task_deliver」的单行道推进续跑循环：模型被迫为一句 hello 编造交付
+  //  仪式（验收通过/证据 1 条），三轮后落进 no_progress 阻塞——实测用户
+  //  体验不可接受（规格 §3.1 防的是「做了工作却谎称完成」，这里防的是反面：
+  //  没有工作却被迫宣称交付）。
+  //  安全边界五条：零工作工具、正常跑完、有最终回答、无未收尾子代理、
+  //  **无未完成步骤**（模型立了 todo 计划就是宣告了工作，哪怕还没动工——
+  //  必须做完或显式交付，不许借问答通道溜过）。
+  //  有过任何工作工具的轮次不走此分支——显式交付不变量（条件 6）照旧。
+  if (
+    task.result === undefined
+    && state.attemptSettled
+    && state.workToolCalls === 0
+    && state.finalTextPresent
+    && openSteps(task).length === 0
+    && !(state.subagentPending && state.subagentPending.length > 0)
+  ) {
+    return {
+      status: "delivered",
+      reason: "纯问答轮：零工作工具、零副作用，回答即交付。",
+      result: { outcome: "已直接回答（本轮没有产生工作项）。", changes: [], verification: [], remaining: [] },
     };
   }
 

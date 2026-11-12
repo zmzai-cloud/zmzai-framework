@@ -22,6 +22,7 @@ function baseState() {
     choiceRequired: null,
     unresolvedToolErrors: [],
     finalTextPresent: true,
+    workToolCalls: 1, // 默认「做过工作」的轮次；纯问答轮用例显式传 0
     cancelled: false,
   };
 }

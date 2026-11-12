@@ -65,6 +65,17 @@ describe("taskContractText", () => {
     expect(text).toContain("不要在中途把控制权交回用户");
   });
 
+  // 2026-11-12 双通道：工作轮必须显式交付（不变量照旧），纯问答轮禁止编造交付仪式
+  // ——此前单行道逼模型为一句 hello 硬凑「验收通过」的交付声明。
+  it("交付指令双通道：工作轮必须 task_deliver，纯问答轮禁止提验收/交付", () => {
+    const text = taskContractText(taskOf());
+    expect(text).toContain("做了任何实际工作");
+    expect(text).toContain("必须调用 `task_deliver`");
+    expect(text).toContain("没有这次声明，任务不会交付");
+    expect(text).toContain("不要**调用 `task_deliver`");
+    expect(text).toContain("回答本身就是交付");
+  });
+
   it("advisory 追加在契约末尾，与契约同源", () => {
     const text = taskContractText(taskOf(), "[任务未推进] 先做诊断");
     expect(text).toContain("[任务未推进] 先做诊断");

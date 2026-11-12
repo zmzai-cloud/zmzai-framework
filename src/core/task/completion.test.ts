@@ -72,6 +72,9 @@ function stateOf(overrides: Partial<CompletionRuntimeState> = {}): CompletionRun
     choiceRequired: null,
     unresolvedToolErrors: [],
     finalTextPresent: true,
+    // 默认按「做过工作」的轮次给（绝大多数用例的工作任务语义）；
+    // 纯问答轮用例显式传 0。
+    workToolCalls: 1,
     subagentPending: null,
     cancelled: false,
     ...overrides,
@@ -429,6 +432,74 @@ describe("evaluateTaskCompletion", () => {
       );
       expect(verdict.status).toBe("delivered");
       if (verdict.status === "delivered") expect(verdict.reason).toContain("显式声明");
+    });
+
+    // ── 4.5 纯问答轮「回答即交付」（2026-11-12）──
+    // 背景：单行道「必须显式 task_deliver」逼模型为一句 hello 编造交付仪式
+    // （验收通过/证据 1 条），三轮后续跑落进 no_progress。零工作工具 = 零副作用
+    // = 无可验收的工作项，回答本身就是交付。
+    describe("纯问答轮 · 回答即交付（4.5）", () => {
+      it("零工作工具 + 正常跑完 + 有回答 → delivered（带干净 result，不走 fallback 空话）", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({ result: undefined }), // 验收条件未通过、无证据——纯问答轮全部忽略
+          stateOf({ workToolCalls: 0 }),
+        );
+        expect(verdict.status).toBe("delivered");
+        if (verdict.status === "delivered") {
+          expect(verdict.reason).toContain("纯问答");
+          expect(verdict.result?.outcome).toContain("已直接回答");
+          expect(verdict.result?.changes).toEqual([]);
+        }
+      });
+
+      it("有过工作工具的轮次不走 4.5——显式交付不变量照旧", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({ result: undefined }),
+          stateOf({ workToolCalls: 2 }),
+        );
+        expect(verdict.status).toBe("continue");
+        if (verdict.status === "continue") expect(verdict.reason).toContain("尚未提交交付声明");
+      });
+
+      it("零工作工具但没写出回答 → 不交付（回答才是交付物）", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({ result: undefined }),
+          stateOf({ workToolCalls: 0, finalTextPresent: false }),
+        );
+        expect(verdict.status).not.toBe("delivered");
+      });
+
+      it("零工作工具但立了未完成计划（todo）→ 不借 4.5 溜过（计划即宣告工作）", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({ result: undefined, steps: [step({ status: "in_progress", title: "解析 PDF" })] }),
+          stateOf({ workToolCalls: 0 }),
+        );
+        expect(verdict.status).toBe("continue");
+        if (verdict.status === "continue") expect(verdict.reason).toContain("未完成的步骤");
+      });
+
+      it("零工作工具但有未收尾子代理 → 不借 4.5 溜过（交回第 5 节常规判定）", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({ result: undefined }),
+          stateOf({ workToolCalls: 0, subagentPending: ["child_a"] }),
+        );
+        // subagentPending 是第 5 节的 reason 而非第 1 节的 blocker——正确预期
+        // 是 continue（带着「子代理未收尾」续跑提示），绝不能 delivered。
+        expect(verdict.status).toBe("continue");
+        if (verdict.status === "continue") expect(verdict.reason).toContain("子代理未收尾");
+      });
+
+      it("已显式交付的轮次不受 4.5 影响（result 已在，走条件 5 正常判定）", () => {
+        const verdict = evaluateTaskCompletion(
+          taskOf({
+            acceptanceCriteria: [criterion({ status: "passed", evidenceIds: ["evd_1"] })],
+            evidence: [evidence()],
+          }),
+          stateOf({ workToolCalls: 0 }),
+        );
+        expect(verdict.status).toBe("delivered");
+        if (verdict.status === "delivered") expect(verdict.reason).toContain("显式声明");
+      });
     });
   });
 });

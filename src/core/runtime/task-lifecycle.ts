@@ -40,6 +40,9 @@ export type RunOutcome = {
   sideEffectDetail: string | null;
   filesEdited: string[];
   toolCalls: number;
+  /** 工作工具调用数（不含 task_deliver/todo/task_block 簿记）——纯问答轮
+   *  「回答即交付」（Completion Gate 4.5）的判定输入。 */
+  workToolCalls: number;
   durationMs: number;
   /** 以 error 结束的工具调用摘要（只用于续跑提示，不单独构成阻塞）。 */
   toolErrors: string[];
@@ -248,6 +251,7 @@ export class TaskLifecycle {
       choiceRequired: block?.kind === "choice" ? { message: block.message, requiredAction: block.requiredAction } : null,
       unresolvedToolErrors: outcome.toolErrors,
       finalTextPresent: outcome.finalText.trim().length > 0,
+      workToolCalls: outcome.workToolCalls,
       cancelled: outcome.aborted,
     };
   }
@@ -441,7 +445,9 @@ export class TaskLifecycle {
     const taskId = task.id;
 
     if (verdict.status === "delivered") {
-      const result = task.result ?? fallbackResult({ task, filesEdited: stats.filesEdited, toolCalls: stats.toolCalls });
+      // 优先级：纯问答轮 verdict 自带的干净 result（「已直接回答」）> 显式交付的
+      // task.result > fallback 统计话术（那句「0 个步骤、0 次工具调用」被用户抓过）。
+      const result = verdict.result ?? task.result ?? fallbackResult({ task, filesEdited: stats.filesEdited, toolCalls: stats.toolCalls });
       const updated = await this.casTask(task, { status: "delivered", deliveredAt: now, result });
       await this.deps.publish(
         {

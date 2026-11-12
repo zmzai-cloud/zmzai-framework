@@ -476,6 +476,9 @@ export class AttemptExecutor {
     // 在 tool_execution_start 累加（比事后解析 agent.state.messages 更稳——
     // 那里 toolCall 是 AssistantMessage.content 里的块，结构复杂易漏）。
     let summaryToolCalls = 0;
+    // 工作工具调用数（不含 task_deliver/todo/task_block 簿记）——纯问答轮
+    // 「回答即交付」（Completion Gate 4.5）的判定输入：零 = 无副作用轮次。
+    let summaryWorkToolCalls = 0;
     const summaryEditedFiles = new Set<string>();
     // N6 长任务 checkpoint：记录最后一个工具名（中途快照用）
     let summaryLastTool: string | undefined;
@@ -497,6 +500,7 @@ export class AttemptExecutor {
           break;
         case "tool_execution_start":
           summaryToolCalls += 1;
+          if (event.toolName !== "task_deliver" && event.toolName !== "todo" && event.toolName !== "task_block") summaryWorkToolCalls += 1;
           summaryLastTool = event.toolName;
           if (event.toolName === "edit" || event.toolName === "write") {
             const path = (event.args as { path?: unknown } | undefined)?.path;
@@ -679,6 +683,7 @@ export class AttemptExecutor {
       sideEffectDetail,
       filesEdited: [...summaryEditedFiles],
       toolCalls: summaryToolCalls,
+      workToolCalls: summaryWorkToolCalls,
       durationMs: Date.now() - runStartedAt,
       toolErrors: [...toolErrors],
       finalText: attemptFinalText,
