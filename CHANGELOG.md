@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.5
+
+### Patch Changes
+
+- **纯问答轮跳过收尾 AI 总结**：summarizeRun 在 finally 里被 await，其 LLM 调用（15s 超时兜底）直接拖住 resolveDone → 任务交付判定（实测 hello 收尾多 3.4s）。零工作轮（Gate 4.5 回答即交付）答案正文就在消息流里、whisper 只消费 meta——stats 新增 workToolCalls，completed 且零工作轮不再调总结模型，兜底文案「本轮已直接回答。」。
+
 ## 0.19.4
 
 ### Patch Changes

@@ -668,7 +668,7 @@ export class AttemptExecutor {
         baseline: effectiveRunBaseline(agent, baseline),
         startedAt: runStartedAt,
         kind: summaryKind,
-        stats: { toolCalls: summaryToolCalls, editedFiles: [...summaryEditedFiles] },
+        stats: { toolCalls: summaryToolCalls, workToolCalls: summaryWorkToolCalls, editedFiles: [...summaryEditedFiles] },
       });
       void Promise.all(fireRunEnd(this.hooks, { sessionId: session.id, agent: session.agent, ok: !runErrored, aborted: abortController.signal.aborted, workspaceId: session.workspaceId, newMessages }));
       resolveDone();
@@ -723,7 +723,7 @@ export class AttemptExecutor {
       baseline: number;
       startedAt: number;
       kind: "completed" | "aborted" | "error";
-      stats: { toolCalls: number; editedFiles: string[] };
+      stats: { toolCalls: number; workToolCalls: number; editedFiles: string[] };
     },
   ): Promise<void> {
     // 终态先落 session 记录（列表三态用，N5）——即使 summaryModel 缺失或生成
@@ -747,8 +747,13 @@ export class AttemptExecutor {
     // 总结（否则落到兜底文案），但模型来源与会话模型解耦。modelFor 抛错
     // （宿主 provider 不认识该 ref）时回落 compaction.summaryModel，再不行
     // 落到下方兜底文案。
+    // 【2026-11-12 纯问答轮跳过 AI 总结】summarizeRun 在 finally 里被 await，
+    // 它的 LLM 调用（15s 超时兜底）直接拖住 resolveDone → 任务交付判定。零工作
+    // 轮（Gate 4.5 回答即交付）的答案正文就在消息流里，whisper 只消费 meta——
+    // 再花一次模型往返写总结纯属浪费（实测 hello 收尾多 3.4s）。
+    const isPureChatTurn = input.kind === "completed" && input.stats.workToolCalls === 0;
     let summaryModel: Model<Api> | null = null;
-    if (this.deps.compaction?.enabled) {
+    if (this.deps.compaction?.enabled && !isPureChatTurn) {
       try {
         summaryModel = this.deps.modelFor(session.model);
       } catch {
@@ -784,8 +789,10 @@ export class AttemptExecutor {
     }
 
     const trimmed = text.trim();
+    // 纯问答轮的兜底文案不说「0 次工具调用」——回答就是本轮的全部内容
+    const finalText = trimmed || (isPureChatTurn ? "本轮已直接回答。" : fallbackText);
     await this.collabs.publish(
-      { type: "session.summary", data: { text: trimmed || fallbackText, kind: input.kind, meta } },
+      { type: "session.summary", data: { text: finalText, kind: input.kind, meta } },
       session.id,
     ).catch(() => undefined);
   }
