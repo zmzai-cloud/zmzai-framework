@@ -662,8 +662,10 @@ export class AttemptExecutor {
       clearInterval(checkpointTimer);
       // [runloop-timing]（0.19.7）：ctx=上下文组装(含记忆召回) agent=Agent 构造
       // firstEvent=模型流首个事件（含请求+TTFT） total=runLoop 总时长。
+      // t0=entry 的 epoch（0.19.8）：与 [prompt-enter] 的 at 相减即得
+      // prompt 受理→runLoop 启动之间的建档/租约/调度开销——此前这段是盲区。
       console.error(
-        `[runloop-timing] ses=${session.id.slice(0, 12)} ctx=${__mark.ctx}ms agent=${__mark.agent - __mark.ctx}ms firstEvent=${__mark.firstEvent - __mark.agent}ms total=${Date.now() - __t0}ms`,
+        `[runloop-timing] ses=${session.id.slice(0, 12)} t0=${__t0} ctx=${__mark.ctx}ms agent=${Math.max(0, __mark.agent - __mark.ctx)}ms firstEvent=${Math.max(0, __mark.firstEvent - __mark.agent)}ms total=${Date.now() - __t0}ms`,
       );
       defaultActiveRunRegistry.delete(session.id);
       engine.dispose();

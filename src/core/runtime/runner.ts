@@ -282,6 +282,9 @@ export class SessionRunner {
    *  的 await 恢复，实测足以翻转 prompt 提交与 drain 链之间的交错时序（FIFO
    *  用例的读偏斜）。委托层一律直通，不包 async。 */
   prompt(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
+    // [prompt-enter]（0.19.8）：与 [runloop-timing] 的 t0 相减 = 受理→runLoop 启动
+    // 的建档/租约/调度开销（装配延迟的最大盲区）。
+    console.error(`[prompt-enter] ses=${sessionId.slice(0, 12)} at=${Date.now()}`);
     return this.commandService.submit(sessionId, input);
   }
 

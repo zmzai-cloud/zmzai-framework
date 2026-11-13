@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.8
+
+### Patch Changes
+
+- Review 修正：runloop-timing 加 t0 epoch + runner.prompt 入口 [prompt-enter] epoch（受理→runLoop 启动的建档/租约开销此前是盲区）；firstEvent 无事件时不再打负数。
+
 ## 0.19.7
 
 ### Patch Changes
