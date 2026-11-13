@@ -116,6 +116,9 @@ export class CommandService {
 
   /** 原 SessionRunner.prompt() 主体（W6 S4 搬移）。 */
   async submit(sessionId: string, input: PromptInput): Promise<{ queued: boolean } & Partial<PromptReceipt>> {
+    // [submit-timing]（0.19.9）：与 [prompt-enter]/[runloop-timing] 串成完整链。
+    // task=任务建档/解析 accept=workflow 事务（消息+parts+run 落库+事件）。
+    const __s0 = Date.now();
     input = { ...input, attachments: validateAttachments(input.attachments), attachmentRefs: validateAttachmentRefs(input.attachmentRefs) };
     const session = await this.deps.store.getSession(sessionId);
     if (!session) throw new Error("SESSION_NOT_FOUND");
@@ -130,6 +133,7 @@ export class CommandService {
       // 先建消息再建任务：TaskRecord.rootUserMessageId 需要真实的消息 id，
       // 事后回填会多一次 CAS，也让「任务与首条消息同生」这条不变量出现空窗。
       const resolution = await this.resolveTaskForPrompt(session, input, message.id);
+      const __sTask = Date.now() - __s0;
       if (resolution) input = { ...input, taskId: resolution.task.id };
       let accepted: Awaited<ReturnType<typeof this.deps.store.workflow.acceptPrompt>>;
       try {
@@ -138,7 +142,7 @@ export class CommandService {
         // 提交被拒（最常见的是 RECOVERY_REQUIRED）。必须把任务改回原样：
         // resolveTaskForPrompt 可能已经清掉 blocker、把状态放回 queued，而这次
         // prompt 根本没被接受——没被接受就没有任何 run 会去推进它，任务会停在
-        // queued 上永远等不到，而用户看到的只是一个 409。
+        // queued 上永远等，而用户看到的只是一个 409。
         await this.rollbackTaskResolution(resolution);
         throw error;
       }
@@ -150,6 +154,7 @@ export class CommandService {
           sessionId,
         );
       }
+      console.error(`[submit-timing] ses=${sessionId.slice(0, 12)} task=${__sTask}ms accept=${Date.now() - __s0 - __sTask}ms`);
       if (accepted.events.length) this.deps.scheduler.drain(sessionId);
       return {
         ...accepted.receipt,

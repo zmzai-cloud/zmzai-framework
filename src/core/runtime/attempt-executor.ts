@@ -153,6 +153,9 @@ export class AttemptExecutor {
     acceptedUserId?: string,
     taskContext?: { task: TaskRecord; advisory?: string; continuation?: boolean; loopGuard?: LoopGuard } | null,
   ): Promise<RunOutcome> {
+    // [runloop-timing] 的 entry epoch（0.19.9）：与 [submit-timing] 日志时刻相减
+    // = drain 调度间隙；entry→t0 = registry/技能解析等前置体。
+    const __entry = Date.now();
     const registry = await this.registryFor(session);
     const resolved = await this.resolvedAgentFor(session);
     const agentName = resolved ? resolved.agent.name : input.agent ?? session.agent;
@@ -492,7 +495,12 @@ export class AttemptExecutor {
     let summaryLastTool: string | undefined;
 
     agent.subscribe((event) => {
-      if (!__firstEventMarked) { __firstEventMarked = true; __mark.firstEvent = Date.now() - __t0; }
+      // firstEvent 量「首个 provider 流事件」（assistant 首个 delta）——0.19.7
+      // 放在 subscribe 顶部量到的是 pi 本地事件（1ms），不含网络+TTFT。
+      if (!__firstEventMarked && (event.type === "message_update" || event.type === "message_end")) {
+        __firstEventMarked = true;
+        __mark.firstEvent = Date.now() - __t0;
+      }
       feedStreamWatchdog();
       switch (event.type) {
         case "message_start":
@@ -665,7 +673,7 @@ export class AttemptExecutor {
       // t0=entry 的 epoch（0.19.8）：与 [prompt-enter] 的 at 相减即得
       // prompt 受理→runLoop 启动之间的建档/租约/调度开销——此前这段是盲区。
       console.error(
-        `[runloop-timing] ses=${session.id.slice(0, 12)} t0=${__t0} ctx=${__mark.ctx}ms agent=${Math.max(0, __mark.agent - __mark.ctx)}ms firstEvent=${Math.max(0, __mark.firstEvent - __mark.agent)}ms total=${Date.now() - __t0}ms`,
+        `[runloop-timing] ses=${session.id.slice(0, 12)} entry=${__entry} t0=${__t0} pre=${__t0 - __entry}ms ctx=${__mark.ctx}ms agent=${Math.max(0, __mark.agent - __mark.ctx)}ms firstEvent=${Math.max(0, __mark.firstEvent - __mark.agent)}ms total=${Date.now() - __t0}ms`,
       );
       defaultActiveRunRegistry.delete(session.id);
       engine.dispose();

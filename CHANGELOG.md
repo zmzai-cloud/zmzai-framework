@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.9
+
+### Patch Changes
+
+- 埋点补全：submit-timing（task=任务建档 accept=workflow 事务）；runloop-timing 加 entry epoch 与 pre 段（registry/技能解析前置体）；firstEvent 改量首个 provider 流事件（原 subscribe 顶部量到本地事件，恒 1ms）。
+
 ## 0.19.8
 
 ### Patch Changes
