@@ -283,14 +283,17 @@ export class AttemptExecutor {
     let delivery: TaskDeliverInput | null = null;
 
     // 上下文组装唯一入口（W7-S6）：压缩 transform、同拍快照重建、记忆召回。
+    // 【0.19.7 全链计时】此前 __phase 只打 >2s 的段——装配开销分散在多个 <2s
+    // 步骤里时完全隐形（实测 send→模型请求 2-4.6s 无单点）。改为全阶段记录、
+    // 收尾一行输出：ctx（上下文组装）/ agent（Agent 构造）/ firstEvent（模型
+    // 流首个事件）/ total。写 console.error 与既有 [runloop-phase] 同通道。
     const __t0 = Date.now();
-    const __phase = (name: string) => { if (Date.now() - __t0 > 2_000) console.error(`[runloop-phase] ses=${session.id.slice(0, 12)} ${name} +${((Date.now() - __t0) / 1000).toFixed(1)}s`); };
-    __phase("runLoop-entry");
+    const __mark = { ctx: 0, agent: 0, firstEvent: 0 };
+    let __firstEventMarked = false;
     const { compactionTransform, history, baseline } = await this.collabs.contextBuilder.buildAttemptContext(session, input, emit);
-    __phase("buildAttemptContext");
+    __mark.ctx = Date.now() - __t0;
     // baseline 按我们的 history 计数；pi ≥0.86 构造 Agent 时会再 unshift 一条前导
     // 系统消息，收尾消费 baseline 处统一经 effectiveRunBaseline 补偿（见函数说明）
-    __phase("pre-Agent");
     const agent = new Agent({
       initialState: {
         systemPrompt: [
@@ -326,6 +329,7 @@ export class AttemptExecutor {
           : undefined;
       },
     });
+    __mark.agent = Date.now() - __t0;
 
     const abortController = runAbort;
     const abort = () => {
@@ -488,6 +492,7 @@ export class AttemptExecutor {
     let summaryLastTool: string | undefined;
 
     agent.subscribe((event) => {
+      if (!__firstEventMarked) { __firstEventMarked = true; __mark.firstEvent = Date.now() - __t0; }
       feedStreamWatchdog();
       switch (event.type) {
         case "message_start":
@@ -591,9 +596,7 @@ export class AttemptExecutor {
       });
       const withForceSettle = <T,>(run: Promise<T>): Promise<T | undefined> =>
         Promise.race([run, abortGrace.then(() => undefined as T | undefined)]).catch(() => undefined as T | undefined);
-    __phase("pre-prompt");
     await withForceSettle(agent.prompt({ role: "user", content: [{ type: "text", text: driveText }, ...attachmentContent(input.attachments ?? []), ...attachmentParts, ...(piImages ?? [])], timestamp: Date.now() }));
-    __phase("post-prompt");
       if (forceSettled) projector.cancelRunningTools(emit, "运行已停止：工具在途，结果未知");
       let failed = forceSettled ? null : agent.state.errorMessage;
       if (unknownSideEffect) {
@@ -657,6 +660,11 @@ export class AttemptExecutor {
     } finally {
       clearInterval(streamWatchdog);
       clearInterval(checkpointTimer);
+      // [runloop-timing]（0.19.7）：ctx=上下文组装(含记忆召回) agent=Agent 构造
+      // firstEvent=模型流首个事件（含请求+TTFT） total=runLoop 总时长。
+      console.error(
+        `[runloop-timing] ses=${session.id.slice(0, 12)} ctx=${__mark.ctx}ms agent=${__mark.agent - __mark.ctx}ms firstEvent=${__mark.firstEvent - __mark.agent}ms total=${Date.now() - __t0}ms`,
+      );
       defaultActiveRunRegistry.delete(session.id);
       engine.dispose();
       // Workflow settlement clears its lease atomically with the terminal run state.

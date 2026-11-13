@@ -1,5 +1,11 @@
 # @zmzai/agent-framework
 
+## 0.19.7
+
+### Patch Changes
+
+- **runLoop 全链计时埋点**：runloop-phase（只打 >2s 段）改为 runloop-timing——ctx（上下文组装，含记忆召回）/ agent（Agent 构造）/ firstEvent（模型流首事件，含请求+TTFT）/ total 收尾一行输出。装配开销分散在多个 <2s 步骤时不再隐形。
+
 ## 0.19.6
 
 ### Patch Changes
